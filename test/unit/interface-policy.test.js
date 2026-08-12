@@ -412,6 +412,27 @@ test("capture input and submit button share the medium-width row", async () => {
   ]);
 });
 
+test("index header aligns logout and wraps it on compact screens", async () => {
+  const repositories = parseCss(await asset("repositories.css"));
+  assertOwnRule(repositories, ".index-header", {
+    display: "flex",
+    "flex-wrap": "wrap",
+    "align-items": "flex-start",
+    "justify-content": "space-between",
+    gap: "var(--space-3)",
+  });
+  assertOwnRule(repositories, ".index-header > form", {
+    "margin-inline-start": "auto",
+  });
+  const compact = descendants(repositories).filter((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (max-width: 599px)"));
+  assert.equal(compact.length, 1);
+  assertOwnRule(compact[0].children, ".index-header > form", {
+    "flex-basis": "100%",
+    "justify-items": "end",
+  });
+});
+
 test("each standalone navigation selector owns its normalized 44px target declarations", async () => {
   assert.equal(
     normalizeSelector(String.raw`[ data-x = foo\]bar ]`),

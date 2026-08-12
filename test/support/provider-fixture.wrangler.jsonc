@@ -1,0 +1,6 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "provider-fixture",
+  "main": "./provider-fixture-worker.js",
+  "compatibility_date": "2026-07-29"
+}

@@ -1,0 +1,974 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      temporary_relaxation:
+        description: First-release-only exception for unavailable immutable snapshot and device evidence
+        required: true
+        default: false
+        type: boolean
+      safari_evidence_url:
+        description: HTTPS evidence for real macOS Safari
+        required: false
+        default: ""
+        type: string
+      ios_evidence_url:
+        description: HTTPS evidence for real iPhone/iOS Safari
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    environment: candidate
+    concurrency:
+      group: repo-atlas-candidate
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      archive_sha256: ${{ steps.identity.outputs.archive_sha256 }}
+      record_attestation_id: ${{ steps.identity.outputs.record_attestation_id }}
+      source_attestation_id: ${{ steps.identity.outputs.source_attestation_id }}
+      worker_version_id: ${{ steps.identity.outputs.worker_version_id }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      PRODUCTION_HOST: ${{ vars.PRODUCTION_HOST }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+      TRUSTED_TYPES_MODE: ${{ vars.TRUSTED_TYPES_MODE }}
+      SAFARI_EVIDENCE_URL: ${{ inputs.safari_evidence_url }}
+      IOS_EVIDENCE_URL: ${{ inputs.ios_evidence_url }}
+      TEMPORARY_RELAXATION: ${{ inputs.temporary_relaxation }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          package-manager-cache: false
+      - name: Validate dispatch and external prerequisites
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CLOUDFLARE_ENV:-}" ]]; then exit 1; fi
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST OPENAI_MODEL TRUSTED_TYPES_MODE OPENAI_API_KEY; do
+            [[ -n "${!name:-}" ]] || { echo "missing_external_prerequisite:$name" >&2; exit 1; }
+          done
+          [[ "$TEMPORARY_RELAXATION" = true || "$TEMPORARY_RELAXATION" = false ]] || { echo invalid_temporary_relaxation >&2; exit 1; }
+          node --input-type=module <<'NODE'
+          const httpsUrl = (name) => {
+            const value = process.env[name];
+            let url;
+            try { url = new URL(value); } catch { throw new Error(`invalid_${name}`); }
+            if (url.protocol !== "https:" || !url.hostname || url.username || url.password)
+              throw new Error(`invalid_${name}`);
+          };
+          if (process.env.PRODUCTION_HOST !== "gx.zra.workers.dev") throw new Error("invalid_hosts");
+          const relaxed = process.env.TEMPORARY_RELAXATION === "true";
+          if (relaxed) {
+            if (process.env.OPENAI_MODEL !== "gpt-5.6-terra" || process.env.SAFARI_EVIDENCE_URL || process.env.IOS_EVIDENCE_URL)
+              throw new Error("invalid_temporary_relaxation");
+          } else {
+            httpsUrl("SAFARI_EVIDENCE_URL");
+            httpsUrl("IOS_EVIDENCE_URL");
+            if (!/^gpt-5\.6-terra-[a-z0-9._-]*[a-z0-9]$/.test(process.env.OPENAI_MODEL))
+              throw new Error("mutable_or_invalid_model");
+          }
+          if (!["report-only", "enforce"].includes(process.env.TRUSTED_TYPES_MODE))
+            throw new Error("invalid_trusted_types_mode");
+          NODE
+      - name: Validate real production bindings
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+          if (config.name !== "gx" || config.workers_dev !== true || config.preview_urls !== false ||
+              Object.hasOwn(config, "route") || Object.hasOwn(config, "routes"))
+            throw new Error("invalid_worker_subdomain_config");
+          const testIds = new Set((config.env?.test?.d1_databases ?? []).map((db) => db.database_id));
+          const databases = config.d1_databases;
+          if (!Array.isArray(databases) || databases.length !== 1) throw new Error("missing_production_d1_bindings");
+          const bindings = new Set(databases.map((db) => db.binding));
+          const names = new Map([["PROD_DB", "gx-production"]]);
+          if (bindings.size !== 1 || !bindings.has("PROD_DB") ||
+              databases.some((db) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(db.database_id) ||
+                testIds.has(db.database_id) || db.database_name !== names.get(db.binding) || db.migrations_dir !== "migrations"))
+            throw new Error("missing_production_d1_bindings");
+          const limits = config.ratelimits;
+          const testNamespace = config.env?.test?.ratelimits?.[0]?.namespace_id;
+          if (!Array.isArray(limits) || limits.length !== 1 || limits[0].name !== "REPORT_RATE_LIMITER" ||
+              !/^[1-9][0-9]*$/.test(limits[0].namespace_id) || limits[0].namespace_id === testNamespace ||
+              limits[0].simple?.limit !== 60 || limits[0].simple?.period !== 60)
+            throw new Error("missing_production_rate_limit");
+          NODE
+      - run: npm ci
+      - name: Verify approved model exists
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(`https://api.openai.com/v1/models/${encodeURIComponent(process.env.OPENAI_MODEL)}`, {
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+          });
+          if (!response.ok) throw new Error("immutable_model_lookup_failed");
+          const body = await response.json();
+          if (!body || body.id !== process.env.OPENAI_MODEL) throw new Error("immutable_model_mismatch");
+          NODE
+      - name: Require immutable GitHub Releases
+        env:
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/immutable-releases`, {
+            headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.RELEASE_ADMIN_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.enabled !== true) throw new Error("immutable_releases_disabled");
+          NODE
+      - name: Run local release gates
+        run: |
+          npm run preloads
+          git diff --exit-code public/modulepreload.json
+          npm run check
+          npm run test:integration
+          npx playwright install --with-deps chromium firefox webkit chrome msedge
+          npm run test:e2e
+          node -e "const s=performance.now();crypto.subtle.importKey('raw',new TextEncoder().encode('123456'),'PBKDF2',false,['deriveBits']).then(k=>crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:new TextEncoder().encode('release-check'),iterations:100000},k,256)).then(()=>process.exit(performance.now()-s<1000?0:1))"
+      - name: Prove remote bindings and secrets exist
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          npx wrangler d1 info PROD_DB --json --env="" --config wrangler.jsonc > artifacts/prod-db.json
+          node --input-type=module <<'NODE'
+          import { writeFile } from "node:fs/promises";
+          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+          const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
+          const versionsUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/versions?deployable=true&per_page=100`;
+          const response = await fetch(versionsUrl, { headers });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          const items = body?.result?.items;
+          if (response.status !== 200 || body?.success !== true || !Array.isArray(body?.errors) || body.errors.length !== 0 ||
+              !Array.isArray(items) || items.length === 0 ||
+              items.some((item) => !uuid.test(item?.id) || !Number.isFinite(Date.parse(item?.metadata?.created_on))) ||
+              new Set(items.map((item) => item.id)).size !== items.length)
+            throw new Error("latest_version_list_readback_invalid");
+          const newestTimestamp = Math.max(...items.map((item) => Date.parse(item.metadata.created_on)));
+          const newest = items.filter((item) => Date.parse(item.metadata.created_on) === newestTimestamp);
+          if (newest.length !== 1 || newest[0].id !== items[0].id)
+            throw new Error("latest_version_list_readback_invalid");
+          const latestVersionId = newest[0].id;
+          const versionDetailUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/versions/${encodeURIComponent(latestVersionId)}`;
+          const detailResponse = await fetch(versionDetailUrl, { headers });
+          let detailBody;
+          try { detailBody = await detailResponse.json(); } catch { detailBody = null; }
+          const version = detailBody?.result;
+          const bindings = version?.resources?.bindings;
+          if (detailResponse.status !== 200 || detailBody?.success !== true || !Array.isArray(detailBody?.errors) ||
+              detailBody.errors.length !== 0 || version?.id !== latestVersionId || !Array.isArray(bindings))
+            throw new Error("latest_version_detail_readback_invalid");
+          const names = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding?.name).sort();
+          if (new Set(names).size !== names.length || JSON.stringify(names) !== JSON.stringify(required))
+            throw new Error("latest_version_secret_set_invalid");
+          await writeFile("artifacts/latest-version-secrets.json", `${JSON.stringify({ versionId: latestVersionId, secrets: names }, null, 2)}\n`);
+          NODE
+          npx wrangler versions upload --dry-run --strict --experimental-provision=false --experimental-auto-create=false --env="" --config wrangler.jsonc
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const [config, production, inventory] = await Promise.all([
+            readFile("wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile("artifacts/prod-db.json", "utf8").then(JSON.parse),
+            readFile("artifacts/latest-version-secrets.json", "utf8").then(JSON.parse),
+          ]);
+          const prod = config.d1_databases?.find((row) => row.binding === "PROD_DB");
+          if (!prod || config.d1_databases?.length !== 1 ||
+              production.uuid !== prod.database_id || production.name !== prod.database_name)
+            throw new Error("remote_d1_readback_mismatch");
+          const inventoryKeys = inventory && typeof inventory === "object" ? Object.keys(inventory).sort() : [];
+          const names = Array.isArray(inventory?.secrets) ? [...inventory.secrets].sort() : [];
+          if (JSON.stringify(inventoryKeys) !== JSON.stringify(["secrets","versionId"]) ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(inventory.versionId) ||
+              JSON.stringify(names) !== JSON.stringify(required))
+            throw new Error("latest_version_secret_set_invalid");
+          NODE
+      - name: Create verified candidate
+        run: |
+          node -e "const fs=require('node:fs');fs.mkdirSync('artifacts',{recursive:true});fs.writeFileSync('artifacts/test-summary.json',JSON.stringify({commit:process.env.GITHUB_SHA,gates:{types:'passed',css:'passed',sourcePolicy:'passed',unit:'passed',integration:'passed',browser:'passed',accessibility:'passed',noJavaScript:'passed'}},null,2)+'\n')"
+          create_args=()
+          [[ "$TEMPORARY_RELAXATION" = true ]] && create_args+=(--temporary-relaxation)
+          node scripts/release.mjs create --release-id "$GITHUB_SHA" --out .release --production-host "$PRODUCTION_HOST" --openai-model "$OPENAI_MODEL" --trusted-types-mode "$TRUSTED_TYPES_MODE" --test-summary artifacts/test-summary.json "${create_args[@]}"
+          node scripts/release.mjs verify --dir .release/payload
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [config, metadata] = await Promise.all([
+            readFile(".release/verify/wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".release/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const secrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const vars = ["ENVIRONMENT","OPENAI_MODEL","PRODUCTION_HOST","RELEASE_ID","TRUSTED_TYPES_MODE"];
+          if (metadata.schema !== 2 || config.name !== "gx" || config.workers_dev !== true || config.preview_urls !== false ||
+              JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              !Array.isArray(config.d1_databases) || config.d1_databases.length !== 1 ||
+              config.d1_databases[0]?.binding !== "PROD_DB" ||
+              JSON.stringify([...config.secrets.required].sort()) !== JSON.stringify(secrets) ||
+              JSON.stringify(Object.keys(config.vars).sort()) !== JSON.stringify(vars) ||
+              Object.hasOwn(config, "route") || Object.hasOwn(config, "routes"))
+            throw new Error("generated_worker_subdomain_config_invalid");
+          NODE
+      - id: attest-source
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            .release/repo-atlas-${{ github.sha }}.tar.gz
+            .release/payload/release-manifest.json
+      - name: Verify source attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ATTESTATION_BUNDLE: ${{ steps.attest-source.outputs.bundle-path }}
+          SOURCE_ATTESTATION_ID: ${{ steps.attest-source.outputs.attestation-id }}
+          SOURCE_ATTESTATION_URL: ${{ steps.attest-source.outputs.attestation-url }}
+        run: |
+          [[ "$SOURCE_ATTESTATION_ID" =~ ^[0-9]+$ ]] || { echo invalid_source_attestation_id >&2; exit 1; }
+          [[ -s "$SOURCE_ATTESTATION_BUNDLE" ]] || { echo missing_source_attestation_bundle >&2; exit 1; }
+          SOURCE_ATTESTATION_ID="$SOURCE_ATTESTATION_ID" SOURCE_ATTESTATION_URL="$SOURCE_ATTESTATION_URL" node --input-type=module <<'NODE'
+          const url = new URL(process.env.SOURCE_ATTESTATION_URL);
+          if (url.protocol !== "https:" || !url.pathname.endsWith(`/attestations/${process.env.SOURCE_ATTESTATION_ID}`))
+            throw new Error("source_attestation_output_mismatch");
+          NODE
+          cp "$SOURCE_ATTESTATION_BUNDLE" .release/source-attestation.json
+          ARCHIVE_SHA256="$(tr -d '\r\n' < .release/archive.sha256)"
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo invalid_archive_digest >&2; exit 1; }
+          for subject in ".release/repo-atlas-$GITHUB_SHA.tar.gz" .release/payload/release-manifest.json; do
+            gh attestation verify "$subject" --bundle .release/source-attestation.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+      - name: Prove candidate upload remains private
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/subdomain`, {
+            headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.success !== true || body.result?.enabled !== true ||
+              body.result?.previews_enabled !== false) throw new Error("candidate_subdomain_readback_invalid");
+          NODE
+      - name: Upload one unroutable candidate version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler versions upload --tag "$GITHUB_SHA" --message "Repo Atlas $GITHUB_SHA" --strict --experimental-provision=false --experimental-auto-create=false --env="" --config .release/verify/wrangler.jsonc
+          npx wrangler versions list --json --env="" --config .release/verify/wrangler.jsonc > .release/versions.json
+      - id: version
+        name: Resolve exact uploaded version
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFile, readFile } from "node:fs/promises";
+          const versions = JSON.parse(await readFile(".release/versions.json", "utf8"));
+          const matches = Array.isArray(versions) ? versions.filter((version) =>
+            version.annotations?.["workers/tag"] === process.env.GITHUB_SHA) : [];
+          if (matches.length !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(matches[0].id))
+            throw new Error("worker_version_resolution_failed");
+          await appendFile(process.env.GITHUB_OUTPUT, `worker_version_id=${matches[0].id}\n`);
+          NODE
+      - name: Verify exact candidate version bindings
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WORKER_VERSION_ID: ${{ steps.version.outputs.worker_version_id }}
+        run: |
+          npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config .release/verify/wrangler.jsonc > .release/version.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [version, config] = await Promise.all([
+            readFile(".release/version.json", "utf8").then(JSON.parse),
+            readFile(".release/verify/wrangler.jsonc", "utf8").then(JSON.parse),
+          ]);
+          const bindings = version.resources?.bindings;
+          if (version.id !== process.env.WORKER_VERSION_ID ||
+              version.annotations?.["workers/tag"] !== process.env.GITHUB_SHA || !Array.isArray(bindings))
+            throw new Error("candidate_version_binding_mismatch");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              assets.length !== 1 || assets[0].name !== expectedAssets.binding)
+            throw new Error("candidate_version_binding_mismatch");
+          const expectedD1 = new Map(config.d1_databases.map((row) => [row.binding, row.database_id]));
+          const d1 = bindings.filter((binding) => binding.type === "d1");
+          if (d1.length !== expectedD1.size || d1.some((binding) => expectedD1.get(binding.name) !== binding.id))
+            throw new Error("candidate_version_binding_mismatch");
+          const expectedLimiter = config.ratelimits[0];
+          const limiters = bindings.filter((binding) => binding.type === "ratelimit");
+          if (limiters.length !== 1 || limiters[0].name !== expectedLimiter.name ||
+              limiters[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiters[0].simple?.limit !== 60 || limiters[0].simple?.period !== 60)
+            throw new Error("candidate_version_binding_mismatch");
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
+          if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets))
+            throw new Error("candidate_version_binding_mismatch");
+          const expectedVars = new Map(Object.entries({
+            ENVIRONMENT: "deployed",
+            OPENAI_MODEL: process.env.OPENAI_MODEL,
+            PRODUCTION_HOST: process.env.PRODUCTION_HOST,
+            RELEASE_ID: process.env.GITHUB_SHA,
+            TRUSTED_TYPES_MODE: process.env.TRUSTED_TYPES_MODE,
+          }));
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
+          if (variables.length !== expectedVars.size || variables.some((binding) => expectedVars.get(binding.name) !== binding.text))
+            throw new Error("candidate_version_binding_mismatch");
+          NODE
+      - name: Bind immutable deployment record
+        env:
+          SOURCE_ATTESTATION_ID: ${{ steps.attest-source.outputs.attestation-id }}
+          WORKER_VERSION_ID: ${{ steps.version.outputs.worker_version_id }}
+        run: |
+          ARCHIVE_SHA256="$(tr -d '\r\n' < .release/archive.sha256)"
+          record_args=(--dir .release --release-id "$GITHUB_SHA" --archive-sha256 "$ARCHIVE_SHA256" --source-attestation-id "$SOURCE_ATTESTATION_ID" --worker-version "$WORKER_VERSION_ID")
+          if [[ "$TEMPORARY_RELAXATION" = true ]]; then
+            record_args+=(--temporary-relaxation)
+          else
+            record_args+=(--safari-evidence-url "$SAFARI_EVIDENCE_URL" --ios-evidence-url "$IOS_EVIDENCE_URL")
+          fi
+          node scripts/release.mjs record "${record_args[@]}"
+          node scripts/release.mjs verify --dir .release/payload --record .release/deployment-record.json --archive ".release/repo-atlas-$GITHUB_SHA.tar.gz"
+      - id: attest-record
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: .release/deployment-record.json
+      - id: identity
+        name: Verify and expose bounded candidate identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECORD_ATTESTATION_BUNDLE: ${{ steps.attest-record.outputs.bundle-path }}
+          RECORD_ATTESTATION_ID: ${{ steps.attest-record.outputs.attestation-id }}
+          RECORD_ATTESTATION_URL: ${{ steps.attest-record.outputs.attestation-url }}
+          SOURCE_ATTESTATION_ID: ${{ steps.attest-source.outputs.attestation-id }}
+          WORKER_VERSION_ID: ${{ steps.version.outputs.worker_version_id }}
+        run: |
+          [[ "$SOURCE_ATTESTATION_ID" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$RECORD_ATTESTATION_ID" =~ ^[0-9]+$ ]] || exit 1
+          [[ -s "$RECORD_ATTESTATION_BUNDLE" ]] || exit 1
+          [[ "$WORKER_VERSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 1
+          ARCHIVE_SHA256="$(tr -d '\r\n' < .release/archive.sha256)"
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          RECORD_ATTESTATION_ID="$RECORD_ATTESTATION_ID" RECORD_ATTESTATION_URL="$RECORD_ATTESTATION_URL" node --input-type=module <<'NODE'
+          const url = new URL(process.env.RECORD_ATTESTATION_URL);
+          if (url.protocol !== "https:" || !url.pathname.endsWith(`/attestations/${process.env.RECORD_ATTESTATION_ID}`))
+            throw new Error("record_attestation_output_mismatch");
+          NODE
+          cp "$RECORD_ATTESTATION_BUNDLE" .release/record-attestation.json
+          gh attestation verify .release/deployment-record.json --bundle .release/record-attestation.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref refs/heads/main --deny-self-hosted-runners
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [record, metadata] = await Promise.all([
+            readFile(".release/deployment-record.json", "utf8").then(JSON.parse),
+            readFile(".release/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          const relaxed = process.env.TEMPORARY_RELAXATION === "true";
+          if (record.temporaryRelaxation !== metadata.temporaryRelaxation ||
+              record.temporaryRelaxation !== relaxed || metadata.temporaryRelaxation !== relaxed)
+            throw new Error("candidate_temporary_relaxation_mismatch");
+          NODE
+          printf 'archive_sha256=%s\nrecord_attestation_id=%s\nsource_attestation_id=%s\nworker_version_id=%s\n' "$ARCHIVE_SHA256" "$RECORD_ATTESTATION_ID" "$SOURCE_ATTESTATION_ID" "$WORKER_VERSION_ID" >> "$GITHUB_OUTPUT"
+      - name: Remove transient remote-read evidence
+        run: rm -f .release/versions.json .release/version.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-${{ github.sha }}
+          path: .release
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+
+  promote:
+    needs: candidate
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: repo-atlas-production
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      PRODUCTION_HOST: ${{ vars.PRODUCTION_HOST }}
+      TEMPORARY_RELAXATION: ${{ inputs.temporary_relaxation }}
+      ARCHIVE_SHA256: ${{ needs.candidate.outputs.archive_sha256 }}
+      RECORD_ATTESTATION_ID: ${{ needs.candidate.outputs.record_attestation_id }}
+      SOURCE_ATTESTATION_ID: ${{ needs.candidate.outputs.source_attestation_id }}
+      WORKER_VERSION_ID: ${{ needs.candidate.outputs.worker_version_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          package-manager-cache: false
+      - name: Validate production inputs and candidate outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_SMOKE_PIN: ${{ secrets.PRODUCTION_SMOKE_PIN }}
+          D1_BACKUP_ENCRYPTION_KEY: ${{ secrets.D1_BACKUP_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CLOUDFLARE_ENV:-}" ]]; then exit 1; fi
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST PRODUCTION_SMOKE_PIN D1_BACKUP_ENCRYPTION_KEY ARCHIVE_SHA256 RECORD_ATTESTATION_ID SOURCE_ATTESTATION_ID WORKER_VERSION_ID; do
+            [[ -n "${!name:-}" ]] || { echo "missing_external_prerequisite:$name" >&2; exit 1; }
+          done
+          [[ "$PRODUCTION_SMOKE_PIN" =~ ^[0-9]{6}$ ]] || { echo invalid_production_smoke_pin >&2; exit 1; }
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          [[ "$SOURCE_ATTESTATION_ID" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$RECORD_ATTESTATION_ID" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$WORKER_VERSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 1
+          node --input-type=module <<'NODE'
+          const value = process.env.D1_BACKUP_ENCRYPTION_KEY;
+          const decoded = /^[A-Za-z0-9+/]{43}=$/.test(value) ? Buffer.from(value, "base64") : null;
+          if (!decoded || decoded.length !== 32 || decoded.toString("base64") !== value)
+            throw new Error("backup_encryption_key_invalid");
+          NODE
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          node --input-type=module <<'NODE'
+          const tag = `repo-atlas-${process.env.GITHUB_SHA}`;
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/git/ref/tags/${tag}`, {
+            headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.GH_TOKEN}` },
+          });
+          if (response.status === 404) process.exit(0);
+          if (!response.ok) throw new Error("tag_ref_lookup_failed");
+          throw new Error("tag_ref_preexisting");
+          NODE
+      - run: npm ci
+      - name: Download exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test ! -e .release
+          gh run download "$GITHUB_RUN_ID" -n "candidate-$GITHUB_SHA" -D .release
+      - name: Verify unchanged candidate and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(tr -d '\r\n' < .release/archive.sha256)" = "$ARCHIVE_SHA256"
+          for subject in ".release/repo-atlas-$GITHUB_SHA.tar.gz" .release/payload/release-manifest.json .release/deployment-record.json; do
+            BUNDLE=.release/source-attestation.json
+            [[ "$subject" = .release/deployment-record.json ]] && BUNDLE=.release/record-attestation.json
+            gh attestation verify "$subject" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+          node scripts/release.mjs verify --dir .release/payload --record .release/deployment-record.json --archive ".release/repo-atlas-$GITHUB_SHA.tar.gz"
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const record = JSON.parse(await readFile(".release/deployment-record.json", "utf8"));
+          const metadata = JSON.parse(await readFile(".release/payload/release-metadata.json", "utf8"));
+          if (record.releaseId !== process.env.GITHUB_SHA || metadata.releaseId !== process.env.GITHUB_SHA ||
+              metadata.productionHost !== process.env.PRODUCTION_HOST ||
+              metadata.schema !== 2 ||
+              record.archiveSha256 !== process.env.ARCHIVE_SHA256 ||
+              record.sourceAttestationId !== process.env.SOURCE_ATTESTATION_ID ||
+              record.workerVersionId !== process.env.WORKER_VERSION_ID ||
+              record.temporaryRelaxation !== metadata.temporaryRelaxation ||
+              record.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true") ||
+              metadata.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true"))
+            throw new Error("candidate_output_mismatch");
+          NODE
+      - name: Recheck immutable GitHub Releases
+        env:
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/immutable-releases`, {
+            headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.RELEASE_ADMIN_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.enabled !== true) throw new Error("immutable_releases_disabled");
+          NODE
+      - id: previous
+        name: Verify previous known-good or first release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler deployments status --json --env="" --config .release/verify/wrangler.jsonc > .release/predecessor-status.json
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" > .release/releases.json
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const [pages, deployment] = await Promise.all([
+            readFile(".release/releases.json", "utf8").then(JSON.parse),
+            readFile(".release/predecessor-status.json", "utf8").then(JSON.parse),
+          ]);
+          if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) throw new Error("release_list_invalid");
+          const active = deployment?.versions;
+          if (!Array.isArray(active) || active.length !== 1 || active[0].percentage !== 100 ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(active[0].version_id))
+            throw new Error("active_predecessor_not_single");
+          const all = pages.flat();
+          if (all.some((row) => row?.tag_name === `repo-atlas-${process.env.GITHUB_SHA}`))
+            throw new Error("candidate_tag_reserved");
+          const prefixed = all.filter((row) => !row.draft && !row.prerelease &&
+            typeof row.tag_name === "string" && row.tag_name.startsWith("repo-atlas-"));
+          if (prefixed.some((row) => !/^repo-atlas-[0-9a-f]{40}$/.test(row.tag_name)))
+            throw new Error("malformed_repo_atlas_release_tag");
+          const releases = prefixed;
+          if (releases.some((row) => !Number.isFinite(Date.parse(row.published_at)))) throw new Error("release_list_invalid");
+          releases.sort((left, right) => Date.parse(right.published_at) - Date.parse(left.published_at));
+          const retained = releases.slice(0, 5);
+          await writeFile(".release/active-worker-version-id", `${active[0].version_id}\n`);
+          await writeFile(".release/retained-release-ids", retained.length ?
+            `${retained.map((row) => row.tag_name.slice("repo-atlas-".length)).join("\n")}\n` : "");
+          NODE
+          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .release/active-worker-version-id)"
+          npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config .release/verify/wrangler.jsonc > .release/active-version.json
+          PREVIOUS_RELEASE_ID="$(ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [version, ids, config] = await Promise.all([
+            readFile(".release/active-version.json", "utf8").then(JSON.parse),
+            readFile(".release/retained-release-ids", "utf8").then((text) => text.trim().split("\n").filter(Boolean)),
+            readFile(".release/verify/wrangler.jsonc", "utf8").then(JSON.parse),
+          ]);
+          if (version.id !== process.env.ACTIVE_WORKER_VERSION_ID) throw new Error("active_predecessor_version_mismatch");
+          const bindings = version.resources?.bindings;
+          if (!Array.isArray(bindings)) throw new Error("active_prod_db_binding_mismatch");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
+          const candidateProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              assets.length !== 1 || assets[0].name !== expectedAssets.binding ||
+              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id)
+            throw new Error("active_prod_db_binding_mismatch");
+          if (ids.length === 0) process.exit(0);
+          const id = version.annotations?.["workers/tag"];
+          if (!/^[0-9a-f]{40}$/.test(id) || !ids.includes(id)) throw new Error("active_predecessor_not_retained");
+          process.stdout.write(id);
+          NODE
+          )"
+          if [[ -n "$PREVIOUS_RELEASE_ID" ]]; then
+            mkdir .release/predecessor-record
+            gh release download "repo-atlas-$PREVIOUS_RELEASE_ID" -p deployment-record.json -D .release/predecessor-record
+            gh attestation verify .release/predecessor-record/deployment-record.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$PREVIOUS_RELEASE_ID" --source-ref refs/heads/main --deny-self-hosted-runners
+            ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" PREVIOUS_RELEASE_ID="$PREVIOUS_RELEASE_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const record = JSON.parse(await readFile(".release/predecessor-record/deployment-record.json", "utf8"));
+          const expected = ["archiveSha256","iosEvidenceUrl","recordedAt","releaseId","safariEvidenceUrl","sourceAttestationId","temporaryRelaxation","workerVersionId"];
+          if (JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(expected) ||
+              record.releaseId !== process.env.PREVIOUS_RELEASE_ID ||
+              record.workerVersionId !== process.env.ACTIVE_WORKER_VERSION_ID)
+            throw new Error("retained_release_record_invalid");
+          NODE
+          fi
+          printf '%s\n' "$PREVIOUS_RELEASE_ID" > .release/previous-release-id
+          printf 'active_worker_version_id=%s\nfirst_release=%s\nprevious_release_id=%s\n' "$ACTIVE_WORKER_VERSION_ID" "$([[ -n "$PREVIOUS_RELEASE_ID" ]] && printf false || printf true)" "$PREVIOUS_RELEASE_ID" >> "$GITHUB_OUTPUT"
+          PREVIOUS_RELEASE_ID="$(tr -d '\r\n' < .release/previous-release-id)"
+          if [[ -n "$PREVIOUS_RELEASE_ID" ]]; then
+            PREVIOUS_TAG="repo-atlas-$PREVIOUS_RELEASE_ID"
+            gh release view "$PREVIOUS_TAG" --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,publishedAt,assets > .release/previous-release.json
+            PREVIOUS_RELEASE_ID="$PREVIOUS_RELEASE_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const view = JSON.parse(await readFile(".release/previous-release.json", "utf8"));
+          const id = process.env.PREVIOUS_RELEASE_ID;
+          const expected = ["archive.sha256","deployment-record.json","licenses.json",`repo-atlas-${id}.tar.gz`,"release-manifest.json","sbom.cdx.json","test-summary.json"].sort();
+          const names = Array.isArray(view.assets) ? view.assets.map((asset) => asset.name).sort() : [];
+          if (view.tagName !== `repo-atlas-${id}` || view.targetCommitish !== id || view.isDraft ||
+              view.isPrerelease || view.isImmutable !== true || !Number.isFinite(Date.parse(view.publishedAt)) ||
+              JSON.stringify(names) !== JSON.stringify(expected))
+            throw new Error("previous_release_identity_invalid");
+          NODE
+            mkdir .release/previous
+            gh release download "$PREVIOUS_TAG" -D .release/previous
+            for subject in ".release/previous/repo-atlas-$PREVIOUS_RELEASE_ID.tar.gz" .release/previous/release-manifest.json .release/previous/deployment-record.json; do
+              gh attestation verify "$subject" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$PREVIOUS_RELEASE_ID" --source-ref refs/heads/main --deny-self-hosted-runners
+            done
+            test "$(tr -d '\r\n' < .release/previous/archive.sha256)" = "$(node -e "console.log(require('./.release/previous/deployment-record.json').archiveSha256)")"
+            mkdir .release/previous/payload
+            tar -xzf ".release/previous/repo-atlas-$PREVIOUS_RELEASE_ID.tar.gz" -C .release/previous/payload
+            PREVIOUS_SCHEMA="$(node -e "process.stdout.write(String(require('./.release/previous/payload/release-metadata.json').schema))")"
+            if [[ "$PREVIOUS_SCHEMA" = "2" ]]; then
+              node scripts/release.mjs verify --dir .release/previous/payload --record .release/previous/deployment-record.json --archive ".release/previous/repo-atlas-$PREVIOUS_RELEASE_ID.tar.gz"
+            elif [[ "$PREVIOUS_SCHEMA" = "1" ]]; then
+              echo schema1_predecessor_compatibility_only
+            else
+              echo predecessor_schema_invalid >&2
+              exit 1
+            fi
+            PREVIOUS_RELEASE_ID="$PREVIOUS_RELEASE_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [record, metadata] = await Promise.all([
+            readFile(".release/previous/deployment-record.json", "utf8").then(JSON.parse),
+            readFile(".release/previous/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          const httpsUrl = (value) => {
+            try {
+              const url = new URL(value);
+              return url.protocol === "https:" && Boolean(url.hostname) && !url.username && !url.password;
+            } catch { return false; }
+          };
+          const relaxed = record.temporaryRelaxation === true;
+          if (metadata.releaseId !== process.env.PREVIOUS_RELEASE_ID || metadata.temporaryRelaxation !== relaxed ||
+              (relaxed ? metadata.openAiModel !== "gpt-5.6-terra" || record.safariEvidenceUrl !== null || record.iosEvidenceUrl !== null :
+                !/^gpt-5\.6-terra-[a-z0-9._-]*[a-z0-9]$/.test(metadata.openAiModel) || !httpsUrl(record.safariEvidenceUrl) || !httpsUrl(record.iosEvidenceUrl)))
+            throw new Error("retained_release_record_invalid");
+          NODE
+          fi
+      - name: Check previous-version compatibility
+        env:
+          FIRST_RELEASE: ${{ steps.previous.outputs.first_release }}
+        run: |
+          if [[ "$FIRST_RELEASE" = "true" ]]; then
+            npm run release:compatibility -- --first-release
+          else
+            npm run release:compatibility -- --previous-dir .release/previous/payload
+          fi
+      - name: Enforce Trusted Types observation gate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          FIRST_RELEASE: ${{ steps.previous.outputs.first_release }}
+          PREVIOUS_RELEASE_ID: ${{ steps.previous.outputs.previous_release_id }}
+        run: |
+          CURRENT_MODE="$(node -e "console.log(require('./.release/payload/release-metadata.json').trustedTypesMode)")"
+          if [[ "$CURRENT_MODE" = "enforce" ]]; then
+            [[ "$FIRST_RELEASE" = "false" ]] || { echo trusted_types_previous_not_report_only >&2; exit 1; }
+            PREVIOUS_MODE="$(node -e "process.stdout.write(require('./.release/previous/payload/release-metadata.json').trustedTypesMode || '')")"
+            if [[ "$PREVIOUS_MODE" = "report-only" ]]; then
+              PREVIOUS_RELEASE_ID="$PREVIOUS_RELEASE_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const metadata = JSON.parse(await readFile(".release/previous/payload/release-metadata.json", "utf8"));
+          const published = JSON.parse(await readFile(".release/previous-release.json", "utf8"));
+          if (metadata.releaseId !== process.env.PREVIOUS_RELEASE_ID || metadata.trustedTypesMode !== "report-only")
+            throw new Error("trusted_types_previous_not_report_only");
+          const cutoff = new Date();
+          cutoff.setUTCHours(0, 0, 0, 0);
+          cutoff.setUTCDate(cutoff.getUTCDate() - 7);
+          if (new Date(published.publishedAt).valueOf() > cutoff.valueOf())
+            throw new Error("trusted_types_observation_incomplete");
+          NODE
+              npx wrangler d1 execute PROD_DB --remote --json --env="" --config .release/verify/wrangler.jsonc --command "SELECT event_type,dimension,SUM(count) AS count FROM telemetry_daily WHERE release_id='$PREVIOUS_RELEASE_ID' AND (event_type='navigation' OR (event_type='csp_violation' AND dimension IN ('require-trusted-types-for:self','require-trusted-types-for:other','trusted-types:self','trusted-types:other'))) GROUP BY event_type,dimension" > .release/trusted-types.json
+              node -e "const p=require('./.release/trusted-types.json');const r=p?.[0]?.results;if(!Array.isArray(r)||!r.some(x=>x.event_type==='navigation'&&x.count>0))throw Error('trusted_types_observation_incomplete');if(r.some(x=>x.event_type==='csp_violation'&&x.count>0))throw Error('trusted_types_violations_present')"
+            elif [[ "$PREVIOUS_MODE" != "enforce" ]]; then
+              echo trusted_types_previous_not_report_only >&2
+              exit 1
+            fi
+          elif [[ "$CURRENT_MODE" != "report-only" ]]; then
+            exit 1
+          fi
+      - name: Limit temporary relaxation to the first release
+        env:
+          FIRST_RELEASE: ${{ steps.previous.outputs.first_release }}
+        run: |
+          [[ "$TEMPORARY_RELAXATION" = true || "$TEMPORARY_RELAXATION" = false ]] || { echo invalid_temporary_relaxation >&2; exit 1; }
+          [[ "$FIRST_RELEASE" = true || "$FIRST_RELEASE" = false ]] || { echo invalid_first_release >&2; exit 1; }
+          [[ "$TEMPORARY_RELAXATION" = false || "$FIRST_RELEASE" = true ]] || { echo temporary_relaxation_requires_first_release >&2; exit 1; }
+      - id: backup
+        name: Encrypt production backup before mutation
+        env:
+          BACKUP_CIPHERTEXT: ${{ runner.temp }}/repo-atlas-${{ github.sha }}.sql.gpg
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_BACKUP_ENCRYPTION_KEY: ${{ secrets.D1_BACKUP_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          BACKUP_SQL="$(mktemp "$RUNNER_TEMP/repo-atlas-production.XXXXXX.sql")"
+          cleanup() { rm -f -- "$BACKUP_SQL"; }
+          trap cleanup EXIT
+          chmod 600 "$BACKUP_SQL"
+          npx wrangler d1 export PROD_DB --remote --env="" --config .release/verify/wrangler.jsonc --output "$BACKUP_SQL" --skip-confirmation
+          printf '%s' "$D1_BACKUP_ENCRYPTION_KEY" | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 0 --output "$BACKUP_CIPHERTEXT" "$BACKUP_SQL"
+          test -s "$BACKUP_CIPHERTEXT"
+      - name: Upload encrypted production backup
+        if: always() && steps.backup.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-backup-${{ github.sha }}
+          path: ${{ runner.temp }}/repo-atlas-${{ github.sha }}.sql.gpg
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+      - name: Remove encrypted runner copy
+        if: always()
+        env:
+          BACKUP_CIPHERTEXT: ${{ runner.temp }}/repo-atlas-${{ github.sha }}.sql.gpg
+        run: rm -f -- "$BACKUP_CIPHERTEXT"
+      - name: Recheck main before production migration
+        env:
+          ACTIVE_WORKER_VERSION_ID: ${{ steps.previous.outputs.active_worker_version_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          npx wrangler deployments status --json --env="" --config .release/verify/wrangler.jsonc > .release/predecessor-recheck.json
+          node --input-type=module <<'NODE'
+          const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/subdomain`, {
+            headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (!response.ok || body.success !== true || body.result?.enabled !== true ||
+              body.result?.previews_enabled !== false) throw new Error("worker_subdomain_readback_invalid");
+          NODE
+          node -e "const p=require('./.release/predecessor-recheck.json');if(p?.versions?.length!==1||p.versions[0].percentage!==100||p.versions[0].version_id!==process.env.ACTIVE_WORKER_VERSION_ID)throw Error('active_predecessor_changed')"
+          node --input-type=module <<'NODE'
+          import { writeFile } from "node:fs/promises";
+          const response = await fetch(`https://${process.env.PRODUCTION_HOST}/health`);
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.status !== "ok" ||
+              !/^[0-9a-f]{40}$/.test(body?.releaseId)) throw new Error("starting_release_health_invalid");
+          await writeFile(".release/starting-release-id", `${body.releaseId}\n`);
+          NODE
+          npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config .release/verify/wrangler.jsonc > .release/active-version-recheck.json
+          ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [version, config] = await Promise.all([
+            readFile(".release/active-version-recheck.json", "utf8").then(JSON.parse),
+            readFile(".release/verify/wrangler.jsonc", "utf8").then(JSON.parse),
+          ]);
+          const bindings = version.resources?.bindings;
+          if (version.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(bindings))
+            throw new Error("active_prod_db_binding_changed");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
+          const candidateProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              assets.length !== 1 || assets[0].name !== expectedAssets.binding ||
+              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id)
+            throw new Error("active_prod_db_binding_changed");
+          NODE
+      - name: Apply expand-contract migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler d1 migrations apply PROD_DB --remote --env="" --config .release/verify/wrangler.jsonc
+      - id: promote_version
+        name: Recheck main and promote exact version
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const source = JSON.parse(await readFile(".release/verify/wrangler.jsonc", "utf8"));
+          if (source.name !== "gx") throw new Error("worker_name_mismatch");
+          await writeFile(".release/deploy.jsonc", `${JSON.stringify({ name: source.name }, null, 2)}\n`);
+          const deploy = JSON.parse(await readFile(".release/deploy.jsonc", "utf8"));
+          if (JSON.stringify(deploy) !== JSON.stringify({ name: "gx" })) throw new Error("deploy_config_invalid");
+          NODE
+          printf 'started=true\n' >> "$GITHUB_OUTPUT"
+          npx wrangler versions deploy "$WORKER_VERSION_ID@100%" --yes --message "Promote $GITHUB_SHA" --env="" --config .release/deploy.jsonc
+      - name: Always verify promoted version
+        if: always()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PROMOTE_OUTCOME: ${{ steps.promote_version.outcome }}
+        run: |
+          npx wrangler deployments status --json --env="" --config .release/deploy.jsonc > .release/promotion-status.json
+          node -e "const p=require('./.release/promotion-status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('promotion_version_mismatch')"
+          [[ "$PROMOTE_OUTCOME" = success ]] || { echo promotion_command_failed >&2; exit 1; }
+      - id: production_data
+        name: Resolve production detail requirement
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler d1 execute PROD_DB --remote --json --env="" --config .release/verify/wrangler.jsonc --command "SELECT COUNT(*) AS count FROM repositories" > .release/production-count.json
+          node --input-type=module <<'NODE'
+          import { appendFile, readFile } from "node:fs/promises";
+          const payload = JSON.parse(await readFile(".release/production-count.json", "utf8"));
+          const count = payload?.[0]?.results?.[0]?.count;
+          if (!Number.isSafeInteger(count) || count < 0) throw new Error("production_count_invalid");
+          await appendFile(process.env.GITHUB_OUTPUT, `require_detail=${count > 0 ? "true" : "false"}\n`);
+          NODE
+      - name: Run production read-only smoke
+        env:
+          PRODUCTION_SMOKE_PIN: ${{ secrets.PRODUCTION_SMOKE_PIN }}
+          RELEASE_REQUIRE_DETAIL: ${{ steps.production_data.outputs.require_detail }}
+        run: RELEASE_BASE_URL="https://$PRODUCTION_HOST" RELEASE_ID="$GITHUB_SHA" RELEASE_PIN="$PRODUCTION_SMOKE_PIN" RELEASE_MODE="read-only" npx playwright test test/e2e/release-smoke.spec.js --project=chromium --retries=0
+      - name: Verify production health and compressed assets
+        run: |
+          node --input-type=module <<'NODE'
+          const base = new URL(`https://${process.env.PRODUCTION_HOST}/`);
+          const health = await fetch(new URL("/health", base));
+          let healthBody;
+          try { healthBody = await health.json(); } catch { healthBody = null; }
+          if (health.status !== 200 || healthBody?.status !== "ok" ||
+              healthBody?.releaseId !== process.env.GITHUB_SHA) throw new Error("production_health_mismatch");
+          const login = await fetch(new URL("/login", base), { headers: { "Accept-Encoding": "gzip, br" } });
+          const text = await login.text();
+          if (login.headers.get("cache-control") !== "no-store" ||
+              !["br", "gzip"].includes(login.headers.get("content-encoding")) ||
+              !login.headers.get("vary")?.toLowerCase().includes("accept-encoding"))
+            throw new Error("production_html_headers_invalid");
+          const asset = text.match(new RegExp(`/assets/${process.env.GITHUB_SHA}/favicon\\.svg`))?.[0];
+          if (!asset) throw new Error("production_release_asset_missing");
+          const response = await fetch(new URL(asset, base), { headers: { "Accept-Encoding": "gzip, br" } });
+          if (!response.ok || response.headers.get("content-type") !== "image/svg+xml" ||
+              !response.headers.get("cache-control")?.includes("immutable") ||
+              !["br", "gzip"].includes(response.headers.get("content-encoding")) ||
+              !response.headers.get("vary")?.toLowerCase().includes("accept-encoding"))
+            throw new Error("production_asset_headers_invalid");
+          NODE
+      - name: Verify exact deployment and telemetry
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler deployments status --json --env="" --config .release/verify/wrangler.jsonc > .release/deployment-status.json
+          node -e "const p=require('./.release/deployment-status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('production_version_mismatch')"
+          npx wrangler d1 execute PROD_DB --remote --json --env="" --config .release/verify/wrangler.jsonc --command "SELECT event_type,dimension,SUM(count) AS count FROM telemetry_daily WHERE release_id='$GITHUB_SHA' AND (event_type='client_error' OR event_type='csp_violation') GROUP BY event_type,dimension" > .release/production-telemetry.json
+          node -e "const p=require('./.release/production-telemetry.json');const r=p?.[0]?.results;if(!Array.isArray(r)||r.some(x=>x.count>0))throw Error('production_telemetry_errors')"
+      - name: Reverify immutable publication payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(tr -d '\r\n' < .release/archive.sha256)" = "$ARCHIVE_SHA256"
+          for subject in ".release/repo-atlas-$GITHUB_SHA.tar.gz" .release/payload/release-manifest.json .release/deployment-record.json; do
+            BUNDLE=.release/source-attestation.json
+            [[ "$subject" = .release/deployment-record.json ]] && BUNDLE=.release/record-attestation.json
+            gh attestation verify "$subject" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+          node scripts/release.mjs verify --dir .release/payload --record .release/deployment-record.json --archive ".release/repo-atlas-$GITHUB_SHA.tar.gz"
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [record, metadata] = await Promise.all([
+            readFile(".release/deployment-record.json", "utf8").then(JSON.parse),
+            readFile(".release/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          if (record.releaseId !== process.env.GITHUB_SHA || metadata.releaseId !== process.env.GITHUB_SHA ||
+              record.archiveSha256 !== process.env.ARCHIVE_SHA256 ||
+              record.sourceAttestationId !== process.env.SOURCE_ATTESTATION_ID ||
+              record.workerVersionId !== process.env.WORKER_VERSION_ID ||
+              metadata.productionHost !== process.env.PRODUCTION_HOST || metadata.schema !== 2 ||
+              record.temporaryRelaxation !== metadata.temporaryRelaxation ||
+              record.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true") ||
+              metadata.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true"))
+            throw new Error("publication_payload_identity_mismatch");
+          NODE
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: repo-atlas-${{ github.sha }}
+          path: |
+            .release/repo-atlas-${{ github.sha }}.tar.gz
+            .release/archive.sha256
+            .release/deployment-record.json
+            .release/payload/release-manifest.json
+            .release/payload/licenses.json
+            .release/payload/sbom.cdx.json
+            .release/payload/artifacts/test-summary.json
+          include-hidden-files: true
+          retention-days: 90
+          if-no-files-found: error
+      - name: Recheck immutable GitHub Releases before publication
+        env:
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/immutable-releases`, {
+            headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.RELEASE_ADMIN_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.enabled !== true) throw new Error("immutable_releases_disabled");
+          NODE
+      - name: Publish immutable known-good release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" > .release/publication-releases.json
+          node -e "const p=require('./.release/publication-releases.json');if(!Array.isArray(p)||p.some(x=>!Array.isArray(x)))throw Error('release_list_invalid');if(p.flat().some(x=>x?.tag_name==='repo-atlas-'+process.env.GITHUB_SHA))throw Error('candidate_tag_reserved')"
+          node --input-type=module <<'NODE'
+          const tag = `repo-atlas-${process.env.GITHUB_SHA}`;
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/git/ref/tags/${tag}`, {
+            headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${process.env.GH_TOKEN}` },
+          });
+          if (response.status === 404) process.exit(0);
+          if (!response.ok) throw new Error("tag_ref_lookup_failed");
+          throw new Error("tag_ref_preexisting");
+          NODE
+          gh release create "repo-atlas-$GITHUB_SHA" ".release/repo-atlas-$GITHUB_SHA.tar.gz" .release/archive.sha256 .release/deployment-record.json .release/payload/release-manifest.json .release/payload/licenses.json .release/payload/sbom.cdx.json .release/payload/artifacts/test-summary.json --target "$GITHUB_SHA" --title "Repo Atlas $GITHUB_SHA" --notes "Verified Repo Atlas production release $GITHUB_SHA"
+          gh release view "repo-atlas-$GITHUB_SHA" --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets > .release/published-release.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const view = JSON.parse(await readFile(".release/published-release.json", "utf8"));
+          const id = process.env.GITHUB_SHA;
+          const expected = ["archive.sha256","deployment-record.json","licenses.json",`repo-atlas-${id}.tar.gz`,"release-manifest.json","sbom.cdx.json","test-summary.json"].sort();
+          const names = Array.isArray(view.assets) ? view.assets.map((asset) => asset.name).sort() : [];
+          if (view.tagName !== `repo-atlas-${id}` || view.targetCommitish !== id || view.isDraft ||
+              view.isPrerelease || view.isImmutable !== true || JSON.stringify(names) !== JSON.stringify(expected))
+            throw new Error("published_release_identity_invalid");
+          NODE
+          gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/repo-atlas-$GITHUB_SHA" > .release/published-tag.json
+          node -e "const p=require('./.release/published-tag.json');if(p?.ref!=='refs/tags/repo-atlas-'+process.env.GITHUB_SHA||p?.object?.type!=='commit'||p.object.sha!==process.env.GITHUB_SHA)throw Error('published_tag_ref_mismatch')"
+      - id: automatic_rollback
+        name: Automatically restore exact starting version
+        if: failure() && steps.promote_version.outputs.started == 'true'
+        continue-on-error: true
+        env:
+          ACTIVE_WORKER_VERSION_ID: ${{ steps.previous.outputs.active_worker_version_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler versions deploy "$ACTIVE_WORKER_VERSION_ID@100%" --yes --message "Automatic rollback after failed $GITHUB_SHA promotion" --env="" --config .release/deploy.jsonc
+      - name: Always verify automatic rollback
+        if: always() && steps.automatic_rollback.outcome != 'skipped'
+        env:
+          ACTIVE_WORKER_VERSION_ID: ${{ steps.previous.outputs.active_worker_version_id }}
+          AUTOMATIC_ROLLBACK_OUTCOME: ${{ steps.automatic_rollback.outcome }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler deployments status --json --env="" --config .release/deploy.jsonc > .release/automatic-rollback-status.json
+          node -e "const p=require('./.release/automatic-rollback-status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.ACTIVE_WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('automatic_rollback_version_mismatch')"
+          STARTING_RELEASE_ID="$(tr -d '\r\n' < .release/starting-release-id)"
+          STARTING_RELEASE_ID="$STARTING_RELEASE_ID" node --input-type=module <<'NODE'
+          const response = await fetch(`https://${process.env.PRODUCTION_HOST}/health`);
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (response.status !== 200 || body?.status !== "ok" ||
+              body?.releaseId !== process.env.STARTING_RELEASE_ID)
+            throw new Error("automatic_rollback_health_mismatch");
+          NODE
+          [[ "$AUTOMATIC_ROLLBACK_OUTCOME" = success ]] || { echo automatic_rollback_command_failed >&2; exit 1; }

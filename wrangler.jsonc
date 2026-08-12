@@ -1,0 +1,73 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gx",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-09",
+  "workers_dev": true,
+  "preview_urls": false,
+  "dev": { "local_protocol": "https" },
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./public",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "invocation_logs": false }
+  },
+  "secrets": {
+    "required": [
+      "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY"
+    ]
+  },
+  "env": {
+    "test": {
+      "name": "repo-atlas-test",
+      "compatibility_date": "2026-07-29",
+      "vars": {
+        "ENVIRONMENT": "test",
+        "PRODUCTION_HOST": "production.repo-atlas.test",
+        "OPENAI_MODEL": "test-snapshot",
+        "RELEASE_ID": "test-release",
+        "TRUSTED_TYPES_MODE": "report-only"
+      },
+      "secrets": {
+        "required": [
+          "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY"
+        ]
+      },
+      "d1_databases": [
+        {
+          "binding": "PROD_DB",
+          "database_name": "repo-atlas-test-production",
+          "database_id": "00000000-0000-0000-0000-000000000001",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "ratelimits": [
+        {
+          "name": "REPORT_RATE_LIMITER",
+          "namespace_id": "1001",
+          "simple": { "limit": 60, "period": 60 }
+        }
+      ],
+      "services": [{ "binding": "PROVIDER_FIXTURE", "service": "provider-fixture" }]
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "PROD_DB",
+      "database_name": "gx-production",
+      "database_id": "5e031f7f-52cc-495a-9cd9-e080bd0090ac",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "REPORT_RATE_LIMITER",
+      "namespace_id": "2001",
+      "simple": { "limit": 60, "period": 60 }
+    }
+  ]
+}

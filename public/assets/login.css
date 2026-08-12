@@ -1,0 +1,19 @@
+@layer components {
+  main {
+    display: grid;
+    align-content: center;
+    min-height: 100vh;
+    max-width: var(--content-reading);
+  }
+
+  @supports (height: 100dvh) {
+    main { min-height: 100dvh; }
+  }
+
+  main > form {
+    padding: clamp(var(--space-4), 5vw, var(--space-8));
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-panel);
+  }
+}

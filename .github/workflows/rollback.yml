@@ -1,0 +1,490 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Full lowercase release commit SHA
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: repo-atlas-production
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      attestations: read
+      contents: read
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      PRODUCTION_HOST: ${{ vars.PRODUCTION_HOST }}
+      RELEASE_ID: ${{ inputs.release_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          package-manager-cache: false
+      - name: Fail closed before rollback discovery
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_SMOKE_PIN: ${{ secrets.PRODUCTION_SMOKE_PIN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CLOUDFLARE_ENV:-}" ]]; then exit 1; fi
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          [[ "$RELEASE_ID" =~ ^[0-9a-f]{40}$ ]] || { echo invalid_release_id >&2; exit 1; }
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST PRODUCTION_SMOKE_PIN; do
+            [[ -n "${!name:-}" ]] || { echo "missing_external_prerequisite:$name" >&2; exit 1; }
+          done
+          [[ "$PRODUCTION_SMOKE_PIN" =~ ^[0-9]{6}$ ]] || { echo invalid_production_smoke_pin >&2; exit 1; }
+          node --input-type=module <<'NODE'
+          const host = process.env.PRODUCTION_HOST;
+          if (host !== "gx.zra.workers.dev") throw new Error("invalid_production_host");
+          NODE
+      - name: Validate real production bindings
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+          if (config.name !== "gx" || config.workers_dev !== true || config.preview_urls !== false ||
+              Object.hasOwn(config, "route") || Object.hasOwn(config, "routes"))
+            throw new Error("invalid_worker_subdomain_config");
+          const testIds = new Set((config.env?.test?.d1_databases ?? []).map((db) => db.database_id));
+          const databases = config.d1_databases;
+          if (!Array.isArray(databases) || databases.length !== 1) throw new Error("missing_production_d1_bindings");
+          const bindings = new Set(databases.map((db) => db.binding));
+          if (bindings.size !== 1 || !bindings.has("PROD_DB") ||
+              databases.some((db) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(db.database_id) ||
+                testIds.has(db.database_id) || db.migrations_dir !== "migrations"))
+            throw new Error("missing_production_d1_bindings");
+          const limits = config.ratelimits;
+          if (!Array.isArray(limits) || limits.length !== 1 || limits[0].name !== "REPORT_RATE_LIMITER" ||
+              !/^[1-9][0-9]*$/.test(limits[0].namespace_id) ||
+              limits[0].namespace_id === config.env?.test?.ratelimits?.[0]?.namespace_id ||
+              limits[0].simple?.limit !== 60 || limits[0].simple?.period !== 60)
+            throw new Error("missing_production_rate_limit");
+          NODE
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Require immutable GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo missing_external_prerequisite:RELEASE_ADMIN_TOKEN >&2; exit 1; }
+          enabled="$(gh api "/repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')"
+          [[ "$enabled" = "true" ]] || { echo immutable_releases_disabled >&2; exit 1; }
+      - name: Prove authenticated production D1 binding
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler d1 info PROD_DB --json --env="" --config wrangler.jsonc > .prod-db.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [config, remote] = await Promise.all([
+            readFile("wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".prod-db.json", "utf8").then(JSON.parse),
+          ]);
+          const binding = config.d1_databases?.find((row) => row.binding === "PROD_DB");
+          if (!binding || remote.uuid !== binding.database_id || remote.name !== binding.database_name)
+            throw new Error("production_d1_readback_mismatch");
+          NODE
+      - name: Select newest_five published known-good releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir .rollback
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" > .rollback/releases.json
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const pages = JSON.parse(await readFile(".rollback/releases.json", "utf8"));
+          if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) throw new Error("release_list_invalid");
+          const releases = pages.flat().filter((row) => !row.draft && !row.prerelease &&
+            /^repo-atlas-[0-9a-f]{40}$/.test(row.tag_name));
+          if (releases.some((row) => !Number.isFinite(Date.parse(row.published_at)))) throw new Error("release_list_invalid");
+          releases.sort((left, right) => Date.parse(right.published_at) - Date.parse(left.published_at));
+          const newest_five = releases.slice(0, 5).map((row) => row.tag_name);
+          const tag = `repo-atlas-${process.env.RELEASE_ID}`;
+          if (!newest_five.includes(tag)) throw new Error("release_not_in_newest_five");
+          await writeFile(".rollback/newest-five.json", JSON.stringify(newest_five));
+          NODE
+          gh release view "repo-atlas-$RELEASE_ID" --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets > .rollback/release.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const view = JSON.parse(await readFile(".rollback/release.json", "utf8"));
+          const expected = ["archive.sha256","deployment-record.json","licenses.json",`repo-atlas-${process.env.RELEASE_ID}.tar.gz`,"release-manifest.json","sbom.cdx.json","test-summary.json"].sort();
+          const names = Array.isArray(view.assets) ? view.assets.map((asset) => asset.name).sort() : [];
+          if (view.tagName !== `repo-atlas-${process.env.RELEASE_ID}` || view.targetCommitish !== process.env.RELEASE_ID ||
+              view.isDraft || view.isPrerelease || view.isImmutable !== true || JSON.stringify(names) !== JSON.stringify(expected))
+            throw new Error("rollback_asset_set_invalid");
+          NODE
+          IFS=$'\t' read -r TAG_TYPE TAG_SHA <<< "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/repo-atlas-$RELEASE_ID" --jq '.object | [.type,.sha] | @tsv')"
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" = commit ]] && break
+            [[ "$TAG_TYPE" = tag && "$TAG_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo tag_ref_target_mismatch >&2; exit 1; }
+            IFS=$'\t' read -r TAG_TYPE TAG_SHA <<< "$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_SHA" --jq '.object | [.type,.sha] | @tsv')"
+          done
+          [[ "$TAG_TYPE" = commit && "$TAG_SHA" = "$RELEASE_ID" ]] || { echo tag_ref_target_mismatch >&2; exit 1; }
+      - name: Download and verify signed release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "repo-atlas-$RELEASE_ID" -D .rollback
+          for subject in ".rollback/repo-atlas-$RELEASE_ID.tar.gz" .rollback/release-manifest.json .rollback/deployment-record.json; do
+            gh attestation verify "$subject" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$RELEASE_ID" --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+          mkdir .rollback/payload
+          tar -xzf ".rollback/repo-atlas-$RELEASE_ID.tar.gz" -C .rollback/payload
+          node scripts/release.mjs verify --dir .rollback/payload --record .rollback/deployment-record.json --archive ".rollback/repo-atlas-$RELEASE_ID.tar.gz"
+      - name: Bind release, archive, record, payload, and Worker version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFile, writeFile } from "node:fs/promises";
+          const [archive, sidecar, publishedManifest, payloadManifest, record, metadata] = await Promise.all([
+            readFile(`.rollback/repo-atlas-${process.env.RELEASE_ID}.tar.gz`),
+            readFile(".rollback/archive.sha256", "utf8"),
+            readFile(".rollback/release-manifest.json"),
+            readFile(".rollback/payload/release-manifest.json"),
+            readFile(".rollback/deployment-record.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          const digest = createHash("sha256").update(archive).digest("hex");
+          if (sidecar !== `${digest}\n` || record.archiveSha256 !== digest) throw new Error("archive_digest_mismatch");
+          if (!publishedManifest.equals(payloadManifest)) throw new Error("release_manifest_mismatch");
+          const expected = ["archiveSha256","iosEvidenceUrl","recordedAt","releaseId","safariEvidenceUrl","sourceAttestationId","temporaryRelaxation","workerVersionId"];
+          const httpsUrl = (value) => {
+            try {
+              const url = new URL(value);
+              return url.protocol === "https:" && Boolean(url.hostname) && !url.username && !url.password;
+            } catch { return false; }
+          };
+          const relaxed = record.temporaryRelaxation === true;
+          if (metadata.schema !== 2) throw new Error("rollback_metadata_schema_invalid");
+          if (JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(expected) ||
+              record.temporaryRelaxation !== metadata.temporaryRelaxation || metadata.temporaryRelaxation !== relaxed ||
+              (relaxed ? record.safariEvidenceUrl !== null || record.iosEvidenceUrl !== null :
+                !httpsUrl(record.safariEvidenceUrl) || !httpsUrl(record.iosEvidenceUrl)))
+            throw new Error("release_evidence_mismatch");
+          if (record.releaseId !== process.env.RELEASE_ID) throw new Error("record_release_mismatch");
+          if (metadata.releaseId !== process.env.RELEASE_ID) throw new Error("metadata_release_mismatch");
+          if (metadata.productionHost !== process.env.PRODUCTION_HOST) throw new Error("production_host_mismatch");
+          if (!/^[0-9]+$/.test(record.sourceAttestationId)) throw new Error("source_attestation_id_invalid");
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.workerVersionId))
+            throw new Error("worker_version_mismatch");
+          await writeFile(".rollback/worker-version-id", `${record.workerVersionId}\n`);
+          NODE
+          WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
+          npx wrangler deployments status --json --env="" --config wrangler.jsonc > .rollback/current-status.json
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const status = JSON.parse(await readFile(".rollback/current-status.json", "utf8"));
+          const active = status?.versions;
+          if (!Array.isArray(active) || active.length !== 1 || active[0].percentage !== 100 ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(active[0].version_id))
+            throw new Error("current_active_version_invalid");
+          await writeFile(".rollback/active-worker-version-id", `${active[0].version_id}\n`);
+          NODE
+          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/active-worker-version-id)"
+          npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/active-version.json
+          npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/version.json
+          ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" WORKER_VERSION_ID="$WORKER_VERSION_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [version, activeVersion, config, rootConfig, metadata] = await Promise.all([
+            readFile(".rollback/version.json", "utf8").then(JSON.parse),
+            readFile(".rollback/active-version.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile("wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          if (version.id !== process.env.WORKER_VERSION_ID) throw new Error("worker_version_mismatch");
+          if (version.annotations?.["workers/tag"] !== process.env.RELEASE_ID) throw new Error("worker_version_tag_mismatch");
+          const bindings = version.resources?.bindings;
+          if (!Array.isArray(bindings)) throw new Error("worker_version_binding_mismatch");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              assets.length !== 1 || assets[0].name !== expectedAssets.binding)
+            throw new Error("worker_version_binding_mismatch");
+          const d1 = bindings.filter((row) => row.type === "d1");
+          const expectedD1 = new Map(config.d1_databases.map((row) => [row.binding, row.database_id]));
+          const rootProd = rootConfig.d1_databases?.filter((row) => row.binding === "PROD_DB");
+          if (d1.length !== 1 || d1.length !== expectedD1.size || d1.some((row) => expectedD1.get(row.name) !== row.id) ||
+              rootProd?.length !== 1 || rootProd[0].database_id !== expectedD1.get("PROD_DB"))
+            throw new Error("worker_version_binding_mismatch");
+          const activeBindings = activeVersion.resources?.bindings;
+          if (activeVersion.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(activeBindings))
+            throw new Error("current_prod_db_binding_mismatch");
+          if (activeBindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const activeAssets = activeBindings.filter((binding) => binding.type === "assets");
+          const activeProd = activeBindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
+          if (activeAssets.length !== 1 || activeAssets[0].name !== expectedAssets.binding ||
+              activeProd.length !== 1 || activeProd[0].id !== expectedD1.get("PROD_DB"))
+            throw new Error("current_prod_db_binding_mismatch");
+          const limiter = Array.isArray(bindings) ? bindings.filter((row) => row.type === "ratelimit") : [];
+          const expectedLimiter = config.ratelimits[0];
+          if (limiter.length !== 1 || limiter[0].name !== expectedLimiter.name ||
+              limiter[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiter[0].simple?.limit !== 60 || limiter[0].simple?.period !== 60)
+            throw new Error("worker_version_binding_mismatch");
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
+          if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets)) throw new Error("worker_version_binding_mismatch");
+          const expectedVars = new Map(Object.entries({
+            ENVIRONMENT: "deployed",
+            OPENAI_MODEL: metadata.openAiModel,
+            PRODUCTION_HOST: metadata.productionHost,
+            RELEASE_ID: process.env.RELEASE_ID,
+            TRUSTED_TYPES_MODE: metadata.trustedTypesMode,
+          }));
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
+          if (expectedVars.size !== 5 || variables.length !== expectedVars.size || variables.some((binding) => expectedVars.get(binding.name) !== binding.text))
+            throw new Error("worker_version_binding_mismatch");
+          NODE
+      - name: Refuse schema-incompatible rollback
+        run: npm run release:compatibility -- --previous-dir .rollback/payload
+      - name: Recheck main, newest five, release identity, and Worker version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" > .rollback/releases-recheck.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const pages = JSON.parse(await readFile(".rollback/releases-recheck.json", "utf8"));
+          if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) throw new Error("release_list_invalid");
+          const releases = pages.flat().filter((row) => !row.draft && !row.prerelease &&
+            /^repo-atlas-[0-9a-f]{40}$/.test(row.tag_name));
+          if (releases.some((row) => !Number.isFinite(Date.parse(row.published_at)))) throw new Error("release_list_invalid");
+          releases.sort((left, right) => Date.parse(right.published_at) - Date.parse(left.published_at));
+          const newest_five = releases.slice(0, 5).map((row) => row.tag_name);
+          if (!newest_five.includes(`repo-atlas-${process.env.RELEASE_ID}`)) throw new Error("recheck_newest_five_failed");
+          NODE
+          gh release view "repo-atlas-$RELEASE_ID" --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets > .rollback/release-recheck.json
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const view = JSON.parse(await readFile(".rollback/release-recheck.json", "utf8"));
+          const expected = ["archive.sha256","deployment-record.json","licenses.json",`repo-atlas-${process.env.RELEASE_ID}.tar.gz`,"release-manifest.json","sbom.cdx.json","test-summary.json"].sort();
+          const names = Array.isArray(view.assets) ? view.assets.map((asset) => asset.name).sort() : [];
+          if (view.tagName !== `repo-atlas-${process.env.RELEASE_ID}` || view.targetCommitish !== process.env.RELEASE_ID ||
+              view.isDraft || view.isPrerelease || view.isImmutable !== true || JSON.stringify(names) !== JSON.stringify(expected))
+            throw new Error("rollback_asset_set_invalid");
+          NODE
+          IFS=$'\t' read -r TAG_TYPE TAG_SHA <<< "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/repo-atlas-$RELEASE_ID" --jq '.object | [.type,.sha] | @tsv')"
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" = commit ]] && break
+            [[ "$TAG_TYPE" = tag && "$TAG_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo tag_ref_target_mismatch >&2; exit 1; }
+            IFS=$'\t' read -r TAG_TYPE TAG_SHA <<< "$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_SHA" --jq '.object | [.type,.sha] | @tsv')"
+          done
+          [[ "$TAG_TYPE" = commit && "$TAG_SHA" = "$RELEASE_ID" ]] || { echo tag_ref_target_mismatch >&2; exit 1; }
+          for subject in ".rollback/repo-atlas-$RELEASE_ID.tar.gz" .rollback/release-manifest.json .rollback/deployment-record.json; do
+            gh attestation verify "$subject" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$RELEASE_ID" --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+          node scripts/release.mjs verify --dir .rollback/payload --record .rollback/deployment-record.json --archive ".rollback/repo-atlas-$RELEASE_ID.tar.gz"
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFile } from "node:fs/promises";
+          const [archive, sidecar, publishedManifest, payloadManifest, record, metadata, workerVersionId] = await Promise.all([
+            readFile(`.rollback/repo-atlas-${process.env.RELEASE_ID}.tar.gz`),
+            readFile(".rollback/archive.sha256", "utf8"),
+            readFile(".rollback/release-manifest.json"),
+            readFile(".rollback/payload/release-manifest.json"),
+            readFile(".rollback/deployment-record.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/release-metadata.json", "utf8").then(JSON.parse),
+            readFile(".rollback/worker-version-id", "utf8"),
+          ]);
+          const digest = createHash("sha256").update(archive).digest("hex");
+          if (sidecar !== `${digest}\n` || record.archiveSha256 !== digest)
+            throw new Error("archive_digest_mismatch");
+          if (!publishedManifest.equals(payloadManifest)) throw new Error("release_manifest_mismatch");
+          const expected = ["archiveSha256","iosEvidenceUrl","recordedAt","releaseId","safariEvidenceUrl","sourceAttestationId","temporaryRelaxation","workerVersionId"];
+          const httpsUrl = (value) => {
+            try {
+              const url = new URL(value);
+              return url.protocol === "https:" && Boolean(url.hostname) && !url.username && !url.password;
+            } catch { return false; }
+          };
+          const relaxed = record.temporaryRelaxation === true;
+          if (metadata.schema !== 2) throw new Error("rollback_metadata_schema_invalid");
+          if (JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(expected) ||
+              record.temporaryRelaxation !== metadata.temporaryRelaxation || metadata.temporaryRelaxation !== relaxed ||
+              (relaxed ? record.safariEvidenceUrl !== null || record.iosEvidenceUrl !== null :
+                !httpsUrl(record.safariEvidenceUrl) || !httpsUrl(record.iosEvidenceUrl)))
+            throw new Error("release_evidence_mismatch");
+          if (record.releaseId !== process.env.RELEASE_ID) throw new Error("record_release_mismatch");
+          if (metadata.releaseId !== process.env.RELEASE_ID) throw new Error("metadata_release_mismatch");
+          if (metadata.productionHost !== process.env.PRODUCTION_HOST) throw new Error("production_host_mismatch");
+          if (workerVersionId !== `${record.workerVersionId}\n`) throw new Error("worker_version_mismatch");
+          NODE
+          WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
+          npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/version-recheck.json
+          WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [version, config, metadata] = await Promise.all([
+            readFile(".rollback/version-recheck.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/release-metadata.json", "utf8").then(JSON.parse),
+          ]);
+          if (version.id !== process.env.WORKER_VERSION_ID) throw new Error("worker_version_mismatch");
+          if (version.annotations?.["workers/tag"] !== process.env.RELEASE_ID) throw new Error("worker_version_tag_mismatch");
+          const bindings = version.resources?.bindings;
+          if (!Array.isArray(bindings)) throw new Error("worker_version_binding_mismatch");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              assets.length !== 1 || assets[0].name !== expectedAssets.binding)
+            throw new Error("worker_version_binding_mismatch");
+          const d1 = bindings.filter((row) => row.type === "d1");
+          const expectedD1 = new Map(config.d1_databases.map((row) => [row.binding, row.database_id]));
+          if (d1.length !== 1 || d1.length !== expectedD1.size || d1.some((row) => expectedD1.get(row.name) !== row.id))
+            throw new Error("worker_version_binding_mismatch");
+          const limiter = Array.isArray(bindings) ? bindings.filter((row) => row.type === "ratelimit") : [];
+          const expectedLimiter = config.ratelimits[0];
+          if (limiter.length !== 1 || limiter[0].name !== expectedLimiter.name ||
+              limiter[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiter[0].simple?.limit !== 60 || limiter[0].simple?.period !== 60)
+            throw new Error("worker_version_binding_mismatch");
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
+          if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets)) throw new Error("worker_version_binding_mismatch");
+          const expectedVars = new Map(Object.entries({
+            ENVIRONMENT: "deployed",
+            OPENAI_MODEL: metadata.openAiModel,
+            PRODUCTION_HOST: metadata.productionHost,
+            RELEASE_ID: process.env.RELEASE_ID,
+            TRUSTED_TYPES_MODE: metadata.trustedTypesMode,
+          }));
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
+          if (expectedVars.size !== 5 || variables.length !== expectedVars.size || variables.some((binding) => expectedVars.get(binding.name) !== binding.text))
+            throw new Error("worker_version_binding_mismatch");
+          NODE
+          npx wrangler d1 execute PROD_DB --remote --json --env="" --config wrangler.jsonc --command "SELECT COALESCE(SUM(CASE WHEN event_type='client_error' THEN count ELSE 0 END),0) AS client_errors,COALESCE(SUM(CASE WHEN event_type='csp_violation' THEN count ELSE 0 END),0) AS csp_violations FROM telemetry_daily WHERE release_id='$RELEASE_ID'" > .rollback/telemetry-baseline.json
+          npx wrangler d1 execute PROD_DB --remote --json --env="" --config wrangler.jsonc --command "SELECT COUNT(*) AS count FROM repositories" > .rollback/repository-count.json
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const result = JSON.parse(await readFile(".rollback/repository-count.json", "utf8"));
+          const count = result?.[0]?.results?.[0]?.count;
+          if (!Number.isSafeInteger(count) || count < 0) throw new Error("production_repository_count_invalid");
+          await writeFile(".rollback/require-detail", `${count > 0}\n`);
+          NODE
+          test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          node --input-type=module <<'NODE'
+          const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/subdomain`, {
+            headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+          });
+          let body;
+          try { body = await response.json(); } catch { body = null; }
+          if (!response.ok || body.success !== true || body.result?.enabled !== true ||
+              body.result?.previews_enabled !== false) throw new Error("worker_subdomain_readback_invalid");
+          NODE
+          npx wrangler deployments status --json --env="" --config wrangler.jsonc > .rollback/current-status-recheck.json
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const status = JSON.parse(await readFile(".rollback/current-status-recheck.json", "utf8"));
+          const active = status?.versions;
+          if (!Array.isArray(active) || active.length !== 1 || active[0].percentage !== 100 ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(active[0].version_id))
+            throw new Error("current_active_version_invalid");
+          await writeFile(".rollback/active-worker-version-id", `${active[0].version_id}\n`);
+          NODE
+          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/active-worker-version-id)"
+          npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/active-version-recheck.json
+          ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const [activeVersion, config, rootConfig] = await Promise.all([
+            readFile(".rollback/active-version-recheck.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile("wrangler.jsonc", "utf8").then(JSON.parse),
+          ]);
+          const bindings = activeVersion.resources?.bindings;
+          if (activeVersion.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(bindings))
+            throw new Error("current_prod_db_binding_changed");
+          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
+          const activeAssets = bindings.filter((binding) => binding.type === "assets");
+          const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
+          const targetProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          const rootProd = rootConfig.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
+              activeAssets.length !== 1 || activeAssets[0].name !== expectedAssets.binding ||
+              targetProd?.length !== 1 || rootProd?.length !== 1 ||
+              rootProd[0].database_id !== targetProd[0].database_id ||
+              activeProd.length !== 1 || activeProd[0].id !== targetProd[0].database_id)
+            throw new Error("current_prod_db_binding_changed");
+          NODE
+      - id: rollback_version
+        name: Roll back exact Worker version
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          const source = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+          if (source.name !== "gx" || source.workers_dev !== true || source.preview_urls !== false ||
+              Object.hasOwn(source, "route") || Object.hasOwn(source, "routes"))
+            throw new Error("worker_subdomain_config_mismatch");
+          await writeFile(".rollback/deploy.jsonc", `${JSON.stringify({ name: source.name }, null, 2)}\n`);
+          const deploy = JSON.parse(await readFile(".rollback/deploy.jsonc", "utf8"));
+          if (JSON.stringify(deploy) !== JSON.stringify({ name: "gx" })) throw new Error("deploy_config_invalid");
+          NODE
+          npx wrangler versions deploy "$WORKER_VERSION_ID@100%" --yes --message "Rollback to $RELEASE_ID" --env="" --config .rollback/deploy.jsonc
+      - name: Always verify exact rollback deployment
+        if: always()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DEPLOY_OUTCOME: ${{ steps.rollback_version.outcome }}
+        run: |
+          set -euo pipefail
+          WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
+          npx wrangler deployments status --json --env="" --config .rollback/deploy.jsonc > .rollback/status.json
+          WORKER_VERSION_ID="$WORKER_VERSION_ID" node -e "const p=require('./.rollback/status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('rollback_version_not_current')"
+          [[ "$DEPLOY_OUTCOME" = success ]] || { echo rollback_command_failed >&2; exit 1; }
+      - name: Verify rollback without schema or domain-data mutation
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_SMOKE_PIN: ${{ secrets.PRODUCTION_SMOKE_PIN }}
+        run: |
+          set -euo pipefail
+          RELEASE_REQUIRE_DETAIL="$(tr -d '\r\n' < .rollback/require-detail)"
+          RELEASE_BASE_URL="https://$PRODUCTION_HOST" RELEASE_ID="$RELEASE_ID" RELEASE_PIN="$PRODUCTION_SMOKE_PIN" RELEASE_MODE="read-only" RELEASE_REQUIRE_DETAIL="$RELEASE_REQUIRE_DETAIL" npx playwright test test/e2e/release-smoke.spec.js --project=chromium --retries=0
+          sleep 5
+          npx wrangler d1 execute PROD_DB --remote --json --env="" --config wrangler.jsonc --command "SELECT COALESCE(SUM(CASE WHEN event_type='client_error' THEN count ELSE 0 END),0) AS client_errors,COALESCE(SUM(CASE WHEN event_type='csp_violation' THEN count ELSE 0 END),0) AS csp_violations FROM telemetry_daily WHERE release_id='$RELEASE_ID'" > .rollback/telemetry.json
+          node -e "const fs=require('node:fs'),row=p=>p?.[0]?.results?.[0],before=row(JSON.parse(fs.readFileSync('.rollback/telemetry-baseline.json'))),after=row(JSON.parse(fs.readFileSync('.rollback/telemetry.json')));for(const k of ['client_errors','csp_violations'])if(!Number.isSafeInteger(before?.[k])||!Number.isSafeInteger(after?.[k])||before[k]<0||after[k]<0||after[k]>before[k])throw Error('rollback_telemetry_errors')"
+          echo "Rollback verification passed; use the documented forward-fix path if compatibility blocked rollback."

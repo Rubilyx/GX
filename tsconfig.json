@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.js", "public/**/*.js", "scripts/**/*.mjs", "test/**/*.js", "worker-configuration.d.ts"]
+}

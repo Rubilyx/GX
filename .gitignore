@@ -1,0 +1,11 @@
+.superpowers/
+.worktrees/
+.dev.vars*
+.env*
+node_modules/
+.release/
+.wrangler/
+artifacts/
+coverage/
+playwright-report/
+test-results/

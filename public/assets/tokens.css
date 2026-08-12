@@ -1,0 +1,63 @@
+@layer tokens {
+  :root {
+    --color-bg-page: #f7f6f3;
+    --color-bg-surface: #ffffff;
+    --color-bg-subtle: #f1f0ed;
+    --color-text-primary: #252522;
+    --color-text-secondary: #6b6963;
+    --color-border-default: #e3e1dc;
+    --color-border-control: #918c83;
+    --color-action-primary: #252522;
+    --color-action-primary-hover: #403f3b;
+    --color-status-success: #346538;
+    --color-status-warning: #956400;
+    --color-status-danger: #9f2f2d;
+    --color-action-danger-hover: #7f2624;
+    --color-bg-success: #edf3ec;
+    --color-bg-warning: #fbf3db;
+    --color-bg-danger: #fdebec;
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-6: 1.5rem;
+    --space-8: 2rem;
+    --font-sans: "Segoe UI Variable", "Aptos", "Helvetica Neue", sans-serif;
+    --font-mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    --text-sm: 0.75rem;
+    --text-base: 0.875rem;
+    --text-lg: 1.125rem;
+    --text-xl: clamp(1.625rem, calc(5vw - 0.125rem), 2.875rem);
+    --leading-body: 1.55;
+    --radius-control: 0.5rem;
+    --radius-panel: 0.75rem;
+    --content-reading: 72ch;
+    --content-standard: 1200px;
+    --content-wide: 1440px;
+    --content-main: var(--content-standard);
+    --layout-columns: 4;
+    --layout-gutter: 16px;
+    --layout-gap: 16px;
+  }
+
+  @media (min-width: 600px) {
+    :root { --layout-columns: 8; --layout-gutter: 24px; --layout-gap: 24px; }
+  }
+
+  @media (min-width: 840px) {
+    :root { --layout-columns: 12; --layout-gutter: 32px; --layout-gap: 24px; }
+  }
+
+  @media (min-width: 1200px) {
+    :root { --layout-columns: 12; --layout-gutter: 32px; --layout-gap: 24px; }
+  }
+
+  @media (min-width: 1600px) {
+    :root {
+      --layout-columns: 12;
+      --layout-gutter: 48px;
+      --layout-gap: 32px;
+      --content-main: var(--content-wide);
+    }
+  }
+}

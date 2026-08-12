@@ -1,0 +1,31 @@
+import { expect, test } from "./fixtures.js";
+
+test("core form flow survives disabled JavaScript", async ({ page }) => {
+  await page.goto("/login");
+  await page.getByLabel("6자리 PIN").fill("123456");
+  await page.getByRole("button", { name: "접속" }).click();
+  await page.getByLabel("GitHub 저장소 URL").fill("https://github.com/OpenAI/example");
+  await page.getByRole("button", { name: "저장" }).click();
+  await expect(page.getByRole("heading", { name: "OpenAI/example" })).toBeVisible();
+  await page.getByRole("textbox", { name: "개인 메모", exact: true }).fill("브라우저 없이 저장한 메모");
+  await page.getByLabel("주 분류", { exact: true }).selectOption("Backend");
+  await page.getByLabel("태그 (쉼표로 구분)").fill("example, node-js");
+  await page.getByRole("button", { name: "변경 저장" }).click();
+  await page.getByLabel(/AI 요약, 주 분류와 태그가 새 분석 결과로 교체됨/).check();
+  await page.getByRole("button", { name: "GitHub 정보와 분석 새로고침" }).click();
+  await expect(page.getByRole("textbox", { name: "개인 메모", exact: true })).toHaveValue("브라우저 없이 저장한 메모");
+  await page.getByRole("link", { name: "저장소 목록" }).click();
+  await page.getByLabel("검색").fill("example");
+  await page.getByLabel("주 분류").selectOption("Backend");
+  await page.getByLabel("태그").selectOption("example");
+  await page.getByRole("button", { name: "찾기" }).click();
+  await expect(page.locator("[data-repository-link]")).toHaveCount(1);
+  await page.getByRole("button", { name: "로그아웃" }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await page.getByLabel("6자리 PIN").fill("123456");
+  await page.getByRole("button", { name: "접속" }).click();
+  await page.locator("[data-repository-link]").first().click();
+  await page.getByLabel(/이 저장소와 개인 메모를 영구 삭제함/).check();
+  await page.getByRole("button", { name: "저장소 삭제" }).click();
+  await expect(page).toHaveURL(/\/\?flash=repository_deleted$/);
+});

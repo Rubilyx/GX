@@ -1,0 +1,135 @@
+@layer reset {
+  *, *::before, *::after { box-sizing: border-box; }
+  html { color-scheme: light; }
+  body, h1, h2, p, dl, dd { margin: 0; }
+  button, input, select, textarea { font: inherit; }
+  textarea { resize: vertical; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
+}
+
+@layer base {
+  body {
+    min-width: 20rem;
+    background: var(--color-bg-page);
+    color: var(--color-text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: var(--leading-body);
+  }
+
+  a { color: inherit; text-underline-offset: 0.18em; }
+  a:hover { text-decoration-thickness: 0.125rem; }
+  h1 { font-size: var(--text-xl); letter-spacing: -0.035em; line-height: 1.08; }
+  h2 { font-size: var(--text-lg); letter-spacing: -0.015em; line-height: 1.25; }
+  code, kbd { font-family: var(--font-mono); }
+
+  :focus-visible {
+    outline: 0.1875rem solid var(--color-action-primary);
+    outline-offset: 0.1875rem;
+  }
+}
+
+@layer layout {
+  main {
+    width: min(calc(100% - (2 * var(--layout-gutter))), var(--content-main));
+    margin-inline: auto;
+    padding-block: clamp(var(--space-6), 5vw, 3.5rem);
+  }
+
+  main > * + * { margin-top: var(--layout-gap); }
+
+  body > a[href="#main"] {
+    position: fixed;
+    display: inline-flex;
+    align-items: center;
+    min-block-size: 2.75rem;
+    inset: var(--space-3) auto auto var(--space-3);
+    z-index: 10;
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-control);
+    transform: translateY(-200%);
+  }
+
+  body > a[href="#main"]:focus { transform: translateY(0); }
+}
+
+@layer components {
+  .status-marker { display: inline-block; inline-size: 0.55em; block-size: 0.55em; margin-inline-end: 0.35em; border-radius: 50%; background: currentColor; }
+  form { display: grid; gap: var(--space-3); }
+  label { font-weight: 650; }
+
+  input, select, textarea, button {
+    min-height: 2.75rem;
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-control);
+  }
+
+  input, select, textarea {
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg-surface);
+    color: var(--color-text-primary);
+    border-color: var(--color-border-control);
+  }
+
+  select { padding-inline-end: var(--space-6); }
+
+  textarea { min-height: 7rem; }
+
+  button {
+    width: fit-content;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-action-primary);
+    color: #ffffff;
+    border-color: var(--color-action-primary);
+    cursor: pointer;
+  }
+
+  button:hover { background: var(--color-action-primary-hover); }
+  .button-danger { background: var(--color-status-danger); border-color: var(--color-status-danger); }
+  .button-danger:hover { background: var(--color-action-danger-hover); border-color: var(--color-action-danger-hover); }
+  button:disabled { cursor: wait; opacity: 0.65; }
+
+  [role="status"] {
+    min-height: 1.5em;
+    color: var(--color-text-secondary);
+  }
+
+  label:has(input[type="checkbox"]) {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 2.75rem;
+    font-weight: 400;
+  }
+
+  input[type="checkbox"] { width: 1.25rem; min-height: 1.25rem; }
+
+  @media (max-width: 599px) {
+    input, select, textarea { font-size: 1rem; }
+  }
+}
+
+@layer utilities {
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}

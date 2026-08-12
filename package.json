@@ -1,0 +1,32 @@
+{
+  "name": "repo-atlas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "24.18.0" },
+  "scripts": {
+    "check": "npm run check:types && npm run lint:css && npm run check:source && npm run test:unit",
+    "check:types": "tsc -p tsconfig.json",
+    "lint:css": "stylelint \"public/assets/*.css\"",
+    "check:source": "node scripts/check-source.mjs",
+    "preloads": "node scripts/check-source.mjs --write-preloads public/modulepreload.json",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --test --test-reporter=spec test/unit/*.test.js",
+    "test:integration": "node --test --test-reporter=spec test/integration/*.test.js",
+    "test:e2e": "playwright test",
+    "test:release-smoke": "playwright test test/e2e/release-smoke.spec.js --project=chromium",
+    "release:create": "node scripts/release.mjs create",
+    "release:verify": "node scripts/release.mjs verify",
+    "release:record": "node scripts/release.mjs record",
+    "release:compatibility": "node scripts/release.mjs compatibility"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.13.3",
+    "stylelint": "17.14.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.114.0"
+  }
+}

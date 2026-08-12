@@ -77,6 +77,8 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   });
   assert.match(html, /<link rel="icon" href="\/assets\/abc123\/favicon\.svg">/);
   assert.match(html, /<repo-capture>[\s\S]*<form[^>]*method="post"[^>]*action="\/repositories"/);
+  assert.match(html,
+    /<header class="index-header"><h1>Repo Atlas<\/h1><form[^>]*method="post"[^>]*action="\/session\/logout"[\s\S]*?<\/form><\/header>/);
   assert.match(html, /<button type="submit">저장<\/button>/);
   assert.doesNotMatch(html, /저장하고 요약하기/);
   assert.match(html, /<repo-filter>[\s\S]*<form[^>]*method="get"[^>]*action="\/"/);

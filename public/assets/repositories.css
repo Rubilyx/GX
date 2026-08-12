@@ -9,8 +9,6 @@
     gap: var(--space-3);
   }
 
-  .index-header > form { margin-inline-start: auto; }
-
   repo-capture > form, repo-filter > form, main > section {
     padding: clamp(var(--space-4), 4vw, var(--space-6));
     background: var(--color-bg-surface);
@@ -143,6 +141,7 @@
   dialog::backdrop { background: rgb(37 37 34 / 0.24); }
 
   main > section form, main > section + section { margin-top: var(--space-4); }
+  .index-header > form { margin-inline-start: auto; }
 
   @media (max-width: 599px) {
     .index-header > form {

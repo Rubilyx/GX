@@ -161,8 +161,4 @@
       border-radius: var(--radius-panel) 0 0 var(--radius-panel);
     }
   }
-
-  @media (min-width: 1200px) {
-    repo-panel > section { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-  }
 }

@@ -480,7 +480,6 @@ test("detail and status declarations belong to real rules in the required media 
   const responsiveRules = [
     ["600px", { filter: 2, gallery: 2 }],
     ["840px", { filter: 3, gallery: 3 }],
-    ["1200px", { gallery: 5 }],
   ];
   for (const [width, expected] of responsiveRules) {
     const prelude = normalizeAtRule(`@media (min-width: ${width})`);

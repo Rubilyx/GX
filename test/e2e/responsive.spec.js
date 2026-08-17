@@ -5,8 +5,8 @@ const cases = [
   { width: 390, columns: 4, gutter: 16, gap: 16, filter: 1, gallery: 1, max: 358 },
   { width: 768, columns: 8, gutter: 24, gap: 24, filter: 2, gallery: 2, max: 720 },
   { width: 1024, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 960 },
-  { width: 1440, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 5, max: 1200 },
-  { width: 1920, columns: 12, gutter: 48, gap: 32, filter: 3, gallery: 5, max: 1440 },
+  { width: 1440, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 1200 },
+  { width: 1920, columns: 12, gutter: 48, gap: 32, filter: 3, gallery: 3, max: 1440 },
 ];
 
 test("reference widths use the approved grid without horizontal overflow", async ({ page }) => {

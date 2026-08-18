@@ -195,7 +195,7 @@ test("index uses the terse analysis failure fallback", () => {
   assert.doesNotMatch(html, /AI 분석을 완료하지 못했습니다/);
 });
 
-test("index omits detail links only from analysis error cards", () => {
+test("index separates detail navigation from the memo dialog opener", () => {
   const html = renderIndexPage({
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
     repositories: [
@@ -212,10 +212,10 @@ test("index omits detail links only from analysis error cards", () => {
 
   assert.equal(cards.length, 2);
   assert.match(cards[0], /^<article data-analysis-card-status="error">/);
-  assert.doesNotMatch(cards[0], /data-repository-link/);
+  assert.doesNotMatch(cards[0], /class="repository-actions"/);
   assert.match(cards[1], /^<article>/);
   assert.match(cards[1],
-    /<a data-repository-link href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">자세히 보기<\/a>/);
+    /<div class="repository-actions"><a href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">자세히 보기<\/a><a data-repository-link href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">Memo<\/a><\/div>/);
 });
 
 test("repository document renders canonical GitHub URL and all native mutation forms", () => {

@@ -159,15 +159,19 @@ test("analysis failure cards keep red failure accents without a detail link", as
   await expect(card.locator("[data-repository-link]")).toHaveCount(0);
 });
 
-test("repository detail link is localized and undecorated", async ({ page }) => {
+test("repository card exposes separate detail and memo actions", async ({ page }) => {
   await loginAndSeed(page);
-  const link = page.locator("[data-repository-link]").first();
+  const card = page.locator("repo-panel article").first();
+  const detail = card.getByRole("link", { name: "자세히 보기", exact: true });
+  const memo = card.locator("[data-repository-link]");
 
-  await expect(link).toHaveText("자세히 보기");
-  await expect(link).toHaveCSS("text-decoration-line", "none");
+  await expect(detail).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+$/);
+  await expect(detail).toHaveCSS("text-decoration-line", "none");
+  await expect(memo).toHaveText("Memo");
+  await expect(memo).toHaveCSS("text-decoration-line", "none");
 });
 
-test("repository detail links stay 44px tall with uneven card content", async ({ page, harness }) => {
+test("repository actions stay 44px tall with uneven card content", async ({ page, harness }) => {
   await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
   const env = await harness.worker.getEnv();
@@ -187,8 +191,8 @@ test("repository detail links stay 44px tall with uneven card content", async ({
   });
   await page.reload();
 
-  expect(await page.locator("[data-repository-link]").evaluateAll((links) =>
-    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44]);
+  expect(await page.locator(".repository-actions > a").evaluateAll((links) =>
+    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44, 44, 44]);
 });
 
 test("repository summary boxes keep their top edge fixed with uneven text", async ({ page, harness }) => {
@@ -369,7 +373,7 @@ test("card delete confirms, restores focus, and submits the protected native for
 test("desktop repository link opens the native detail dialog and restores focus", async ({ page }) => {
   test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
   await loginAndSeed(page);
-  const opener = page.locator("[data-repository-link]").first();
+  const opener = page.getByRole("link", { name: "Memo", exact: true }).first();
   await opener.focus();
   await opener.click();
   const dialog = page.locator("[data-repository-dialog]");
@@ -384,6 +388,16 @@ test("desktop repository link opens the native detail dialog and restores focus"
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(opener).toBeFocused();
+});
+
+test("desktop detail action navigates to the repository page", async ({ page }) => {
+  test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+  await loginAndSeed(page);
+
+  await page.getByRole("link", { name: "자세히 보기", exact: true }).first().click();
+
+  await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+$/);
+  await expect(page.getByRole("heading", { name: "OpenAI/example" })).toBeVisible();
 });
 
 test("panel failure follows the original detail link", async ({ page }) => {

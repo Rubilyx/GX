@@ -157,17 +157,23 @@
     overflow-wrap: anywhere;
   }
 
-  a[data-repository-link],
+  .repository-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+  }
+
+  .repository-actions > a {
+    align-self: start;
+    text-decoration: none;
+  }
+
+  .repository-actions > a,
   nav[aria-label="페이지"] > a,
   a[data-repository-detail-link]:not([hidden]) {
     display: inline-flex;
     align-items: center;
     min-block-size: 2.75rem;
-  }
-
-  a[data-repository-link] {
-    align-self: start;
-    text-decoration: none;
   }
 
   .index-header > h1 > a {

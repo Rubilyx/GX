@@ -448,7 +448,7 @@ test("index header places the filter responsively beside the title", async () =>
   });
 });
 
-test("each standalone navigation selector owns its normalized 44px target declarations", async () => {
+test("each navigation selector owns its normalized 44px target declarations", async () => {
   assert.equal(
     normalizeSelector(String.raw`[ data-x = foo\]bar ]`),
     normalizeSelector(String.raw`[data-x=foo\]bar]`),
@@ -519,14 +519,19 @@ test("each standalone navigation selector owns its normalized 44px target declar
     "min-block-size": "2.75rem",
     "overflow-wrap": "anywhere",
   });
+  assertOwnRule(repositories, ".repository-actions", {
+    display: "flex",
+    "align-items": "center",
+    gap: "var(--space-4)",
+  });
   for (const selector of [
-    "a[data-repository-link]",
+    ".repository-actions > a",
     'nav[aria-label="페이지"] > a',
     "main > p > a",
     "a[data-repository-detail-link]:not([hidden])",
     ".category-filter > a",
   ]) assertOwnRule(repositories, selector, navigationTarget);
-  assertOwnRule(repositories, "a[data-repository-link]", {
+  assertOwnRule(repositories, ".repository-actions > a", {
     "align-self": "start",
     "text-decoration": "none",
   });

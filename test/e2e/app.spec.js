@@ -124,7 +124,7 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
   });
 });
 
-test("analysis failure summary uses the light red status background", async ({ page, harness }) => {
+test("analysis failure cards use a quiet disabled treatment without a detail link", async ({ page, harness }) => {
   await loginAndSeed(page);
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB, {
@@ -135,9 +135,16 @@ test("analysis failure summary uses the light red status background", async ({ p
   });
   await page.reload();
 
-  const description = page.locator('[data-analysis-summary-status="error"]');
+  const card = page.locator('article[data-analysis-card-status="error"]');
+  const description = card.locator('[data-analysis-summary-status="error"]');
+  const badge = card.locator('[data-analysis-status="error"]');
+  await expect(card).toHaveCSS("background-color", "rgb(241, 240, 237)");
+  await expect(card).toHaveCSS("color", "rgb(107, 105, 99)");
   await expect(description).toHaveText("AI 분석 실패");
-  await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
+  await expect(description).toHaveCSS("background-color", "rgb(247, 246, 243)");
+  await expect(badge).toHaveCSS("background-color", "rgb(243, 242, 239)");
+  await expect(badge).toHaveCSS("color", "rgb(107, 105, 99)");
+  await expect(card.locator("[data-repository-link]")).toHaveCount(0);
 });
 
 test("repository detail link is localized and undecorated", async ({ page }) => {
@@ -169,7 +176,7 @@ test("repository detail links stay 44px tall with uneven card content", async ({
   await page.reload();
 
   expect(await page.locator("[data-repository-link]").evaluateAll((links) =>
-    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44, 44]);
+    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44]);
 });
 
 test("repository summary boxes keep their top edge fixed with uneven text", async ({ page, harness }) => {
@@ -246,19 +253,19 @@ test("repository metadata keeps lighter dividers in the value column", async ({ 
   })).toEqual({
     firstLabel: {
       borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "4px", paddingTop: "4px",
+      paddingBottom: "8px", paddingTop: "8px",
     },
     firstValue: {
       borderColor: "rgb(243, 242, 239)", borderStyle: "solid", borderWidth: "1px",
-      paddingBottom: "4px", paddingTop: "4px",
+      paddingBottom: "8px", paddingTop: "8px",
     },
     lastLabel: {
       borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "4px", paddingTop: "4px",
+      paddingBottom: "8px", paddingTop: "8px",
     },
     lastValue: {
       borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "4px", paddingTop: "4px",
+      paddingBottom: "8px", paddingTop: "8px",
     },
     rowGap: "4px",
   });

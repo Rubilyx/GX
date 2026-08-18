@@ -109,10 +109,10 @@ test("index exposes complete native forms and safe enhancement controls", () => 
     /<span class="repository-title"><span class="repository-owner">a\/b&lt;script&gt;\/<\/span><span class="repository-name">x\?y&quot;&gt;&lt;img src=x&gt;<\/span><\/span>/);
   assert.doesNotMatch(html, /data-repository-source-link|target="_blank"/);
   assert.match(html,
-    /<a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a>/);
-  assert.match(html,
     /<dl><dt>Primary category<\/dt><dd>[\s\S]*?<dt>Tags<\/dt>[\s\S]*?<dt>Stars<\/dt>[\s\S]*?<dt>Forks<\/dt>[\s\S]*?<dt>Language<\/dt>[\s\S]*?<dt>Analysis status<\/dt>/);
-  const card = html.match(/<article>[\s\S]*?<\/article>/)?.[0] ?? "";
+  const card = html.match(/<article[^>]*>[\s\S]*?<\/article>/)?.[0] ?? "";
+  assert.match(card, /^<article data-analysis-card-status="error">/);
+  assert.doesNotMatch(card, /data-repository-link/);
   assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.match(card,
     /<a data-repository-delete href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#delete-heading" aria-label="[^"]+ 삭제"><span aria-hidden="true">×<\/span><\/a>/);
@@ -192,6 +192,29 @@ test("index uses the terse analysis failure fallback", () => {
   });
   assert.match(html, /<p data-analysis-summary-status="error">AI 분석 실패<\/p>/);
   assert.doesNotMatch(html, /AI 분석을 완료하지 못했습니다/);
+});
+
+test("index omits detail links only from analysis error cards", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [
+      { ...repository, summary: null },
+      {
+        ...repository, id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        owner: "Ready", name: "repository", summary: "분석 완료 요약", analysisStatus: "ready",
+      },
+    ],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+  });
+  const cards = html.match(/<article[^>]*>[\s\S]*?<\/article>/g) ?? [];
+
+  assert.equal(cards.length, 2);
+  assert.match(cards[0], /^<article data-analysis-card-status="error">/);
+  assert.doesNotMatch(cards[0], /data-repository-link/);
+  assert.match(cards[1], /^<article>/);
+  assert.match(cards[1],
+    /<a data-repository-link href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">자세히 보기<\/a>/);
 });
 
 test("repository document renders canonical GitHub URL and all native mutation forms", () => {

@@ -588,15 +588,24 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories, "repo-panel article > p", {
     "background-color": "var(--color-bg-subtle)",
   });
-  assertOwnRule(repositories, 'repo-panel article > p[data-analysis-summary-status="error"]', {
-    "background-color": "var(--color-bg-danger)",
+  assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"]', {
+    color: "var(--color-text-secondary)",
+    "background-color": "var(--color-bg-subtle)",
   });
+  assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"] > p', {
+    "background-color": "var(--color-bg-page)",
+  });
+  assertOwnRule(repositories,
+    'repo-panel article[data-analysis-card-status="error"] [data-analysis-status="error"]', {
+      color: "var(--color-text-secondary)",
+      background: "var(--color-border-subtle)",
+    });
   assertOwnRule(repositories, "repo-panel article dl", {
     "grid-template-columns": "max-content minmax(0, 1fr)",
     gap: "var(--space-1) var(--space-3)",
   });
   assertOwnRule(repositories, "repo-panel article dl > :where(dt, dd)", {
-    "padding-block": "var(--space-1)",
+    "padding-block": "var(--space-2)",
   });
   assertOwnRule(repositories, "repo-panel article dl > dd", {
     "border-bottom": "1px solid var(--color-border-subtle)",

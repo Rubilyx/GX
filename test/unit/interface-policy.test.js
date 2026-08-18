@@ -614,9 +614,10 @@ test("detail and status declarations belong to real rules in the required media 
     node.prelude === normalizeAtRule("@media (min-width: 840px)"));
   assert.equal(desktop.length, 1);
   assertOwnRule(desktop[0].children, "dialog[data-repository-delete-dialog]", {
-    width: "min(32rem, calc(100% - 2rem))",
+    width: "min(28rem, calc(100% - 2rem))",
     "max-height": "calc(100% - 2rem)",
-    height: "auto",
+    height: "fit-content",
+    overflow: "auto",
     margin: "auto",
     "border-radius": "var(--radius-panel)",
   });

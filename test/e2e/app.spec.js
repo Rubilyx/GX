@@ -208,7 +208,7 @@ test("card delete hover changes only the glyph color", async ({ page }) => {
   expect(await visualState()).toEqual({ ...resting, color: "rgb(159, 47, 45)" });
 });
 
-test("card delete dialog is compact and centered at the desktop reference viewport", async ({ page }) => {
+test("card delete dialog fits its confirmation content at the desktop reference viewport", async ({ page }) => {
   await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
   await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
@@ -225,8 +225,8 @@ test("card delete dialog is compact and centered at the desktop reference viewpo
       radius: style.borderTopLeftRadius,
     };
   });
-  expect(geometry.width).toBeLessThanOrEqual(512);
-  expect(geometry.height).toBeLessThan(1379);
+  expect(geometry.width).toBeLessThanOrEqual(448);
+  expect(geometry.height).toBeLessThanOrEqual(320);
   expect(Math.abs(geometry.centerX - 1389 / 2)).toBeLessThanOrEqual(1);
   expect(Math.abs(geometry.centerY - 1379 / 2)).toBeLessThanOrEqual(1);
   expect(geometry.radius).toBe("12px");

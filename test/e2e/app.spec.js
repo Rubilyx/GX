@@ -33,15 +33,38 @@ test("capture enhancement reaches detail through the provider fixture", async ({
   ]);
 });
 
-test("filter change submits one canonical query", async ({ page }) => {
+test("category chips preserve search and tag in one canonical query", async ({ page }) => {
   await loginAndSeed(page);
   await page.getByLabel("검색").fill("example");
-  await page.getByLabel("주 분류").selectOption("Backend");
-  await expect(page).toHaveURL(/\?q=example&category=Backend&page=1$/);
-  await expect(page.locator("repo-filter")).toHaveAttribute("data-ready", "true");
   await page.getByLabel("태그").selectOption("example");
+  await expect(page).toHaveURL(/\?q=example&tag=example&page=1$/);
+  await expect(page.locator("#category")).toHaveCount(0);
+  await page.getByRole("link", { name: "Backend 1", exact: true }).click();
   await expect(page).toHaveURL(/\?q=example&category=Backend&tag=example&page=1$/);
+  await expect(page.getByRole("link", { name: "Backend 1", exact: true }))
+    .toHaveAttribute("aria-current", "page");
   expect(new URL(page.url()).search).toBe("?q=example&category=Backend&tag=example&page=1");
+});
+
+test("filter hides pointer focus chrome and preserves keyboard focus", async ({ page }) => {
+  await loginAndSeed(page);
+  const search = page.getByLabel("검색", { exact: true });
+  const tag = page.getByLabel("태그");
+  await expect(tag).toHaveAttribute("id", "tag");
+  const tagControl = page.locator("#tag");
+
+  await search.click();
+  await expect(search).toHaveAttribute("data-pointer-focus", "");
+  await expect(search).toHaveCSS("outline-style", "none");
+
+  await page.keyboard.press("Tab");
+  await expect(tagControl).toBeFocused();
+  await expect(tagControl).not.toHaveAttribute("data-pointer-focus");
+  await expect(tagControl).toHaveCSS("outline-style", "solid");
+
+  await tagControl.click();
+  await expect(tagControl).toHaveAttribute("data-pointer-focus", "");
+  await expect(tagControl).toHaveCSS("outline-style", "none");
 });
 
 test("paging preserves a stable canonical page query", async ({ page, harness }) => {
@@ -55,6 +78,187 @@ test("paging preserves a stable canonical page query", async ({ page, harness })
   await next.click();
   await expect(page).toHaveURL(/\?page=2$/);
   await expect(page.getByRole("link", { name: "이전" })).toHaveAttribute("href", "/?page=1");
+});
+
+test("repository title is non-interactive", async ({ page }) => {
+  await loginAndSeed(page);
+  const title = page.locator(".repository-title").first();
+  await expect(title).toHaveText("OpenAI/example");
+  expect(await title.evaluate((element) => ({
+    tag: element.tagName, insideLink: element.closest("a") !== null,
+  }))).toEqual({ tag: "SPAN", insideLink: false });
+});
+
+test("repository descriptions keep their bordered bubble spacing", async ({ page }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
+  await loginAndSeed(page);
+  const description = page.locator("repo-panel article > p").first();
+
+  expect(await description.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      borderColor: style.borderTopColor,
+      borderRadius: style.borderTopLeftRadius,
+      borderStyle: style.borderTopStyle,
+      borderWidth: style.borderTopWidth,
+      marginBottom: style.marginBottom,
+      marginTop: style.marginTop,
+      paddingBottom: style.paddingBottom,
+      paddingLeft: style.paddingLeft,
+      paddingRight: style.paddingRight,
+      paddingTop: style.paddingTop,
+    };
+  })).toEqual({
+    borderColor: "rgb(227, 225, 220)",
+    borderRadius: "8px",
+    borderStyle: "solid",
+    borderWidth: "1px",
+    marginBottom: "8px",
+    marginTop: "8px",
+    paddingBottom: "12px",
+    paddingLeft: "16px",
+    paddingRight: "16px",
+    paddingTop: "12px",
+  });
+});
+
+test("repository metadata separates rows without trailing divider", async ({ page }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
+  await loginAndSeed(page);
+  const metadata = page.locator("repo-panel article > dl").first();
+
+  expect(await metadata.evaluate((element) => {
+    const firstLabel = element.firstElementChild;
+    const firstValue = firstLabel?.nextElementSibling;
+    const lastValue = element.lastElementChild;
+    const lastLabel = lastValue?.previousElementSibling;
+    if (!(firstLabel instanceof HTMLElement) || !(firstValue instanceof HTMLElement) ||
+        !(lastLabel instanceof HTMLElement) || !(lastValue instanceof HTMLElement))
+      throw new Error("repository_metadata_nodes_missing");
+    const style = getComputedStyle(element);
+    /** @param {HTMLElement} node */
+    const rowSpacing = (node) => {
+      const nodeStyle = getComputedStyle(node);
+      return {
+        borderStyle: nodeStyle.borderBottomStyle,
+        borderWidth: nodeStyle.borderBottomWidth,
+        paddingBottom: nodeStyle.paddingBottom,
+        paddingTop: nodeStyle.paddingTop,
+      };
+    };
+    /** @param {HTMLElement} node */
+    const dividedRowStyle = (node) => ({
+      ...rowSpacing(node), borderColor: getComputedStyle(node).borderBottomColor,
+    });
+    return {
+      firstLabel: dividedRowStyle(firstLabel),
+      firstValue: dividedRowStyle(firstValue),
+      lastLabel: rowSpacing(lastLabel),
+      lastValue: rowSpacing(lastValue),
+      rowGap: style.rowGap,
+    };
+  })).toEqual({
+    firstLabel: {
+      borderColor: "rgb(227, 225, 220)", borderStyle: "solid", borderWidth: "1px",
+      paddingBottom: "4px", paddingTop: "4px",
+    },
+    firstValue: {
+      borderColor: "rgb(227, 225, 220)", borderStyle: "solid", borderWidth: "1px",
+      paddingBottom: "4px", paddingTop: "4px",
+    },
+    lastLabel: {
+      borderStyle: "none", borderWidth: "0px",
+      paddingBottom: "4px", paddingTop: "4px",
+    },
+    lastValue: {
+      borderStyle: "none", borderWidth: "0px",
+      paddingBottom: "4px", paddingTop: "4px",
+    },
+    rowGap: "0px",
+  });
+});
+
+test("card delete hover changes only the glyph color", async ({ page }) => {
+  await loginAndSeed(page);
+  const opener = page.getByRole("link", { name: "OpenAI/example 삭제", exact: true });
+  const visualState = () => opener.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      color: style.color,
+      backgroundColor: style.backgroundColor,
+      borderTopStyle: style.borderTopStyle,
+      borderRadius: style.borderRadius,
+      boxShadow: style.boxShadow,
+      opacity: style.opacity,
+      transform: style.transform,
+    };
+  });
+  const resting = await visualState();
+  expect(resting).toEqual({
+    color: "rgb(107, 105, 99)",
+    backgroundColor: "rgba(0, 0, 0, 0)",
+    borderTopStyle: "none",
+    borderRadius: "0px",
+    boxShadow: "none",
+    opacity: "1",
+    transform: "none",
+  });
+
+  await opener.hover();
+  expect(await visualState()).toEqual({ ...resting, color: "rgb(159, 47, 45)" });
+});
+
+test("card delete dialog is compact and centered at the desktop reference viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
+  await loginAndSeed(page);
+  await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
+  const dialog = page.locator("[data-repository-delete-dialog]");
+  await expect(dialog).toBeVisible();
+  const geometry = await dialog.evaluate((element) => {
+    const box = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return {
+      width: box.width,
+      height: box.height,
+      centerX: box.left + box.width / 2,
+      centerY: box.top + box.height / 2,
+      radius: style.borderTopLeftRadius,
+    };
+  });
+  expect(geometry.width).toBeLessThanOrEqual(512);
+  expect(geometry.height).toBeLessThan(1379);
+  expect(Math.abs(geometry.centerX - 1389 / 2)).toBeLessThanOrEqual(1);
+  expect(Math.abs(geometry.centerY - 1379 / 2)).toBeLessThanOrEqual(1);
+  expect(geometry.radius).toBe("12px");
+});
+
+test("card delete confirms, restores focus, and submits the protected native form", async ({ page }) => {
+  await loginAndSeed(page);
+  const opener = page.getByRole("link", { name: "OpenAI/example 삭제", exact: true });
+  const dialog = page.locator("[data-repository-delete-dialog]");
+
+  await expect(opener).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+#delete-heading$/);
+  await opener.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-repository-delete-name]")).toHaveText("OpenAI/example");
+  await dialog.getByRole("button", { name: "취소", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await expect(opener).toBeFocused();
+
+  await opener.click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(opener).toBeFocused();
+
+  await opener.click();
+  const deletion = page.waitForRequest((request) =>
+    request.method() === "POST" && /\/repositories\/[0-9a-f-]+\/delete$/.test(new URL(request.url()).pathname));
+  await dialog.getByRole("button", { name: "삭제", exact: true }).click();
+  const request = await deletion;
+  expect(request.postData()).toContain("confirm=yes");
+  expect(request.postData()).toContain("csrf=");
+  await expect(page).toHaveURL(/\/?flash=repository_deleted$/);
+  await expect(page.getByText("저장소를 삭제했습니다.", { exact: true })).toBeVisible();
 });
 
 test("desktop repository link opens the native detail dialog and restores focus", async ({ page }) => {

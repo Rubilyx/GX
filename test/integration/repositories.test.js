@@ -364,6 +364,10 @@ test("list combines q category and tag with AND and clamps to last page", async 
   assert.deepEqual(filtered.repositories.map((/** @type {any} */ repository) => repository.id), ["match"]);
   assert.equal(filtered.page, 1);
   assert.deepEqual(filtered.availableTags, ["chosen", "other"]);
+  assert.deepEqual(filtered.repositoryCounts, {
+    all: 35,
+    byCategory: { Backend: 32, Data: 3 },
+  });
   const clamped = await listRepositories(env.PROD_DB, { q: "", category: "", tag: "", page: 99 });
   assert.equal(clamped.page, 4);
   assert.equal(clamped.repositories.length, 5);

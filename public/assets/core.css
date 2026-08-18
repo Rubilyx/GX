@@ -82,7 +82,7 @@
     border-color: var(--color-border-control);
   }
 
-  select { padding-inline-end: var(--space-6); }
+  select { padding-inline-end: var(--space-8); }
 
   textarea { min-height: 7rem; }
 

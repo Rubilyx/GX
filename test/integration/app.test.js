@@ -122,7 +122,14 @@ test("native forms cover login through create, detail, edit, refresh, filter, de
     headers: { Cookie: session.cookie },
   });
   assert.equal(filtered.status, 200);
-  assert.match(await filtered.text(), /보관할 메모|OpenAI\/example/);
+  const filteredHtml = await filtered.text();
+  assert.match(filteredHtml,
+    /<span class="repository-title"><span class="repository-owner">OpenAI\/<\/span><span class="repository-name">example<\/span><\/span>/);
+  assert.match(filteredHtml,
+    /<a href="\/\?q=example&amp;tag=example&amp;page=1">All 1<\/a>/);
+  assert.match(filteredHtml,
+    /<a href="\/\?q=example&amp;category=Backend&amp;tag=example&amp;page=1" aria-current="page">Backend 1<\/a>/);
+  assert.doesNotMatch(filteredHtml, /id="category"|name="category"/);
 
   const deleted = await postForm(harness.worker, `${path}/delete`, session, { confirm: "yes" });
   assert.equal(deleted.status, 303);
@@ -512,7 +519,7 @@ test("page CSP, Trusted Types rollout, and global security headers are exact", a
   const session = await login(harness.worker);
   const appPage = await harness.worker.fetch(`${origin}/`, { headers: { Cookie: session.cookie } });
   assert.equal(appPage.headers.get("content-security-policy"),
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; report-uri /csp-report");
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; report-uri /csp-report");
   assert.equal(appPage.headers.get("content-security-policy-report-only"),
     "require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
 
@@ -521,7 +528,7 @@ test("page CSP, Trusted Types rollout, and global security headers are exact", a
     headers: { Cookie: session.cookie },
   }), { ...env, TRUSTED_TYPES_MODE: "enforce" }, { waitUntil() {} }, providerFixture());
   assert.equal(enforced.headers.get("content-security-policy"),
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
   assert.equal(enforced.headers.get("content-security-policy-report-only"), null);
 
   for (const response of [loginPage, appPage, enforced, await harness.worker.fetch(`${origin}/health`)]) {

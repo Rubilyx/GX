@@ -73,18 +73,58 @@ test("index exposes complete native forms and safe enhancement controls", () => 
       q: `"><script>alert("q")</script>`, category: repository.primaryCategory,
       tag: repository.tags[0], page: 1,
     }, categories: [repository.primaryCategory], availableTags: repository.tags,
+    repositoryCounts: { all: 1, byCategory: { [repository.primaryCategory]: 1 } },
     page: 1, totalPages: 1, flash: "repository_created",
   });
   assert.match(html, /<link rel="icon" href="\/assets\/abc123\/favicon\.svg">/);
   assert.match(html, /<repo-capture>[\s\S]*<form[^>]*method="post"[^>]*action="\/repositories"/);
+  assert.match(html,
+    /<header class="index-header"><h1>Repo Atlas<\/h1><form[^>]*method="post"[^>]*action="\/session\/logout"[\s\S]*?<\/form><\/header>/);
   assert.match(html, /<button type="submit">저장<\/button>/);
   assert.doesNotMatch(html, /저장하고 요약하기/);
   assert.match(html, /<repo-filter>[\s\S]*<form[^>]*method="get"[^>]*action="\/"/);
+  assert.match(html,
+    /<label for="q"><span class="visually-hidden">검색<\/span><input id="q" name="q" type="search" maxlength="100" placeholder="검색" value=/);
+  assert.doesNotMatch(html, /<label for="q">검색<input/);
+  const filterIndex = html.indexOf("<repo-filter>");
+  const captureIndex = html.indexOf("<repo-capture>");
+  const categoriesIndex = html.indexOf('<nav class="category-filter" aria-label="Primary category">');
+  const resultsIndex = html.indexOf('<h2 id="results">Repository</h2>');
+  assert.ok(filterIndex < captureIndex);
+  assert.ok(captureIndex < categoriesIndex);
+  assert.ok(categoriesIndex < resultsIndex);
+  assert.doesNotMatch(html, /id="category"|name="category"|>주 분류<select/);
+  assert.match(html, /<h2 id="results">Repository<\/h2>/);
   assert.match(html, /name="csrf" value="csrf&quot;x"/);
   assert.match(html, /<form[^>]*method="post"[^>]*action="\/session\/logout"/);
-  assert.match(html, /<repo-panel>[\s\S]*data-repository-link[^>]*href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/);
+  assert.match(html,
+    /<img class="repository-avatar" src="https:\/\/github\.com\/a%2Fb%3Cscript%3E\.png\?size=80" alt="" width="45" height="45" loading="lazy" decoding="async" referrerpolicy="no-referrer">/);
+  assert.match(html,
+    /<span class="repository-title"><span class="repository-owner">a\/b&lt;script&gt;\/<\/span><span class="repository-name">x\?y&quot;&gt;&lt;img src=x&gt;<\/span><\/span>/);
+  assert.doesNotMatch(html, /data-repository-source-link|target="_blank"/);
+  assert.match(html,
+    /<a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">View details<\/a>/);
+  assert.match(html,
+    /<dl><dt>Primary category<\/dt><dd>[\s\S]*?<dt>Tags<\/dt>[\s\S]*?<dt>Stars<\/dt>[\s\S]*?<dt>Forks<\/dt>[\s\S]*?<dt>Language<\/dt>[\s\S]*?<dt>Analysis status<\/dt>/);
+  const card = html.match(/<article>[\s\S]*?<\/article>/)?.[0] ?? "";
+  assert.match(card,
+    /<a data-repository-delete href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#delete-heading" aria-label="[^"]+ 삭제"><span aria-hidden="true">×<\/span><\/a>/);
+  for (const korean of ["주 분류", "태그", "별", "포크", "언어", "분석 상태"])
+    assert.doesNotMatch(card, new RegExp(`<dt>${korean}<\\/dt>`));
   assert.match(html, /data-analysis-status="error"[^>]*><span class="status-marker" aria-hidden="true"><\/span>분석 오류<\/span>/);
   assert.match(html, /<dialog data-repository-dialog aria-labelledby="repository-dialog-heading">[\s\S]*<h2 id="repository-dialog-heading">저장소 상세<\/h2>/);
+  const deleteDialog = html.match(
+    /<dialog data-repository-delete-dialog[\s\S]*?<\/dialog>/,
+  )?.[0] ?? "";
+  assert.match(deleteDialog, /aria-labelledby="repository-delete-dialog-heading"/);
+  assert.match(deleteDialog, /<strong data-repository-delete-name><\/strong>/);
+  assert.match(deleteDialog, /<form method="post" data-repository-delete-form>/);
+  assert.match(deleteDialog, /name="csrf" value="csrf&quot;x"/);
+  assert.match(deleteDialog, /<input type="hidden" name="confirm" value="yes">/);
+  assert.match(deleteDialog,
+    /<button type="submit" class="button-danger" data-repository-delete-confirm disabled>삭제<\/button>/);
+  assert.match(deleteDialog, /<form method="dialog"><button type="submit">취소<\/button><\/form>/);
+  assert.doesNotMatch(deleteDialog, /<form[^>]+action=/);
   assert.match(html, /<a data-repository-detail-link hidden>상세 페이지 열기<\/a>/);
   assert.doesNotMatch(html, /data-repository-detail-link[^>]*href=|data-repository-link href="\/"/);
   assert.match(html, /저장소를 저장했습니다/);
@@ -97,17 +137,54 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.doesNotMatch(html, /<[^>]+\son(?:click|submit|change)=/);
   assert.doesNotMatch(html, /<script>alert|<img src|<b>summary|onclick=/);
   assert.match(html, /value="&quot;&gt;&lt;script&gt;alert\(&quot;q&quot;\)&lt;\/script&gt;"/);
-  assert.match(html, /value="Backend&quot;&gt;&lt;script&gt;" selected/);
+  assert.match(html, />Backend&quot;&gt;&lt;script&gt; 1<\/a>/);
+  assert.match(html, /category=Backend%22%3E%3Cscript%3E/);
   assert.match(html, /tag&quot;&gt;&lt;script&gt;/);
 
   const empty = renderIndexPage({
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf", repositories: [],
     filters: { q: "", category: "", tag: "", page: 1 }, categories: ["Backend"],
-    availableTags: [], page: 1, totalPages: 1, flash: "",
+    availableTags: [], repositoryCounts: { all: 0, byCategory: {} },
+    page: 1, totalPages: 1, flash: "",
   });
   assert.doesNotMatch(empty, /data-repository-link/);
+  assert.doesNotMatch(empty, /data-repository-delete href=/);
   assert.match(empty, /<a data-repository-detail-link hidden>상세 페이지 열기<\/a>/);
+  assert.match(empty, /<dialog data-repository-delete-dialog/);
   assert.match(empty, /class="status-marker" aria-hidden="true"/);
+  assert.match(empty,
+    /<nav class="category-filter" aria-label="Primary category"><a href="\/\?page=1" aria-current="page">All 0<\/a>/);
+});
+
+test("index category chips preserve filters and expose one active category", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf", repositories: [repository],
+    filters: { q: "llm tools", category: "Backend", tag: "python", page: 4 },
+    categories: ["Backend", "Data & AI", "Empty"], availableTags: ["python"],
+    repositoryCounts: { all: 4, byCategory: { Backend: 3, "Data & AI": 1 } },
+    page: 4, totalPages: 4, flash: "",
+  });
+  const categoryNav = html.match(/<nav class="category-filter"[\s\S]*?<\/nav>/)?.[0] ?? "";
+  assert.match(categoryNav,
+    /<a href="\/\?q=llm\+tools&amp;tag=python&amp;page=1">All 4<\/a>/);
+  assert.match(categoryNav,
+    /<a href="\/\?q=llm\+tools&amp;category=Backend&amp;tag=python&amp;page=1" aria-current="page">Backend 3<\/a>/);
+  assert.match(categoryNav,
+    /<a href="\/\?q=llm\+tools&amp;category=Data\+%26\+AI&amp;tag=python&amp;page=1">Data &amp; AI 1<\/a>/);
+  assert.match(categoryNav,
+    /<a href="\/\?q=llm\+tools&amp;category=Empty&amp;tag=python&amp;page=1">Empty 0<\/a>/);
+  assert.equal((categoryNav.match(/aria-current="page"/g) ?? []).length, 1);
+});
+
+test("index uses the terse analysis failure fallback", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [{ ...repository, summary: null }],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: ["Backend"],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+  });
+  assert.match(html, /<p>AI 분석 실패<\/p>/);
+  assert.doesNotMatch(html, /AI 분석을 완료하지 못했습니다/);
 });
 
 test("repository document renders canonical GitHub URL and all native mutation forms", () => {
@@ -151,7 +228,7 @@ test("analysis status hooks admit only fixed own values", () => {
     assert.equal((html.match(new RegExp(`data-analysis-status="${status}"`, "g")) ?? []).length, 1);
   assert.doesNotMatch(html, /data-analysis-status="constructor"|function Object|native code/);
   assert.match(html, /상태 확인 필요/);
-  assert.match(html, /AI 분석을 완료하지 못했습니다\. 상세에서 다시 분석할 수 있습니다\./);
+  assert.match(html, /<p>AI 분석 실패<\/p>/);
   assert.match(html, /<nav aria-label="페이지">[\s\S]*<a rel="next"/);
 
   const detailHtml = renderRepositoryPage({

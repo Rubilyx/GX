@@ -116,9 +116,14 @@ export function renderLoginPage({ releaseId, errorCode = "" }) {
 /** @param {any} repository */
 function repositoryCard(repository) {
   const summary = repository.summary || (statusKey(repository.analysisStatus) === "error"
-    ? "AI 분석을 완료하지 못했습니다. 상세에서 다시 분석할 수 있습니다."
+    ? "AI 분석 실패"
     : statusText(repository.analysisStatus));
-  return `<article><h2><a data-repository-link href="/repositories/${encodeURIComponent(repository.id)}">${htmlText(repository.owner)}/${htmlText(repository.name)}</a></h2><p>${htmlText(summary)}</p><dl><dt>주 분류</dt><dd>${htmlText(repository.primaryCategory || "미분류")}</dd><dt>태그</dt><dd>${htmlText(repository.tags?.join(", ") || "없음")}</dd><dt>별</dt><dd>${htmlText(repository.stars)}</dd><dt>포크</dt><dd>${htmlText(repository.forks)}</dd><dt>언어</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd><dt>분석 상태</dt><dd>${statusBadge(repository.analysisStatus)}</dd></dl></article>`;
+  const owner = encodeURIComponent(repository.owner);
+  const avatar = `https://github.com/${owner}.png?size=80`;
+  const detail = `/repositories/${encodeURIComponent(repository.id)}`;
+  const label = `${repository.owner}/${repository.name} 삭제`;
+  const remove = `<a data-repository-delete href="${htmlAttr(`${detail}#delete-heading`)}" aria-label="${htmlAttr(label)}"><span aria-hidden="true">×</span></a>`;
+  return `<article>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="45" height="45" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p>${htmlText(summary)}</p><dl><dt>Primary category</dt><dd>${htmlText(repository.primaryCategory || "미분류")}</dd><dt>Tags</dt><dd>${htmlText(repository.tags?.join(", ") || "없음")}</dd><dt>Stars</dt><dd>${htmlText(repository.stars)}</dd><dt>Forks</dt><dd>${htmlText(repository.forks)}</dd><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd><dt>Analysis status</dt><dd>${statusBadge(repository.analysisStatus)}</dd></dl><a data-repository-link href="${htmlAttr(detail)}">View details</a></article>`;
 }
 
 /** @param {{ q?: string, category?: string, tag?: string }} filters @param {number} page */
@@ -131,18 +136,39 @@ function pageHref(filters, page) {
   return `/?${htmlAttr(query.toString())}`;
 }
 
+/** @param {{ q?: string, tag?: string }} filters @param {string} category */
+function categoryHref(filters, category) {
+  const query = new URLSearchParams();
+  if (filters.q) query.set("q", filters.q);
+  if (category) query.set("category", category);
+  if (filters.tag) query.set("tag", filters.tag);
+  query.set("page", "1");
+  return `/?${htmlAttr(query.toString())}`;
+}
+
+/** @param {string[]} categories @param {{ q?: string, category?: string, tag?: string }} filter @param {{ all?: number, byCategory?: Record<string, number> }} [counts] */
+function categoryFilter(categories, filter, counts = {}) {
+  /** @type {Array<[string, string, number]>} */
+  const chips = [["", "All", counts.all ?? 0], ...categories.map((category) =>
+    /** @type {[string, string, number]} */
+    ([category, category, counts.byCategory?.[category] ?? 0]))];
+  return `<nav class="category-filter" aria-label="Primary category">${chips.map(([value, label, count]) =>
+    `<a href="${categoryHref(filter, value)}"${value === filter.category ? ' aria-current="page"' : ""}>${htmlText(label)} ${htmlText(count)}</a>`).join("")}</nav>`;
+}
+
 /** @param {any} view */
 export function renderIndexPage(view) {
   const repositories = view.repositories ?? [];
   const filter = view.filters ?? { q: "", category: "", tag: "" };
   const list = repositories.length
-    ? `<section aria-labelledby="results"><h2 id="results">저장한 저장소</h2>${repositories.map(repositoryCard).join("")}</section>`
+    ? `<section aria-labelledby="results"><h2 id="results">Repository</h2>${repositories.map(repositoryCard).join("")}</section>`
     : `<section><h2>저장한 저장소가 없습니다</h2><p role="status">${statusMarker}위 입력란에 공개 GitHub 저장소 URL을 넣어 첫 저장소를 추가하세요.</p></section>`;
+  const deleteDialog = `<dialog data-repository-delete-dialog aria-labelledby="repository-delete-dialog-heading"><h2 id="repository-delete-dialog-heading">저장소 삭제</h2><p><strong data-repository-delete-name></strong> 저장소를 삭제하시겠습니까?</p><p>저장소와 개인 메모가 영구 삭제됩니다.</p><form method="post" data-repository-delete-form>${csrf(view.csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger" data-repository-delete-confirm disabled>삭제</button></form><form method="dialog"><button type="submit">취소</button></form></dialog>`;
   const pagination = view.totalPages > 1 ? `<nav aria-label="페이지">${view.page > 1 ? `<a rel="prev" href="${pageHref(filter, view.page - 1)}">이전</a>` : ""}<span>${htmlText(view.page)} / ${htmlText(view.totalPages)}</span>${view.page < view.totalPages ? `<a rel="next" href="${pageHref(filter, view.page + 1)}">다음</a>` : ""}</nav>` : "";
   return document({
     releaseId: view.releaseId, page: "repositories.css", title: "Repo Atlas",
     app: true, modulePreloads: view.modulePreloads,
-    body: `<main id="main"><h1>Repo Atlas</h1>${errorStatus(view.flash)}<repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-filter><form method="get" action="/"><label for="q">검색<input id="q" name="q" type="search" maxlength="100" value="${htmlAttr(filter.q)}"></label><label for="category">주 분류<select id="category" name="category">${options(view.categories ?? CATEGORIES, filter.category, "전체 분류")}</select></label><label for="tag">태그<select id="tag" name="tag">${options(view.availableTags ?? [], filter.tag, "전체 태그")}</select></label><input type="hidden" name="page" value="${htmlAttr(view.page)}"><button type="submit">찾기</button></form></repo-filter><repo-panel>${list}${pagination}<dialog data-repository-dialog aria-labelledby="repository-dialog-heading"><h2 id="repository-dialog-heading">저장소 상세</h2><label for="dialog-summary">요약</label><textarea id="dialog-summary" data-repository-summary readonly></textarea><label for="dialog-note">개인 메모</label><textarea id="dialog-note" data-repository-note readonly></textarea><a data-repository-detail-link hidden>상세 페이지 열기</a><form method="dialog"><button type="submit">닫기</button></form></dialog></repo-panel>${logoutForm(view.csrfToken)}</main>`,
+    body: `<main id="main"><header class="index-header"><h1>Repo Atlas</h1>${logoutForm(view.csrfToken)}</header>${errorStatus(view.flash)}<repo-filter><form method="get" action="/"><label for="q"><span class="visually-hidden">검색</span><input id="q" name="q" type="search" maxlength="100" placeholder="검색" value="${htmlAttr(filter.q)}"></label><label for="tag">태그<select id="tag" name="tag">${options(view.availableTags ?? [], filter.tag, "전체 태그")}</select></label><input type="hidden" name="page" value="${htmlAttr(view.page)}"><button type="submit">찾기</button></form></repo-filter><repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-panel>${categoryFilter(view.categories ?? CATEGORIES, filter, view.repositoryCounts)}${list}${pagination}<dialog data-repository-dialog aria-labelledby="repository-dialog-heading"><h2 id="repository-dialog-heading">저장소 상세</h2><label for="dialog-summary">요약</label><textarea id="dialog-summary" data-repository-summary readonly></textarea><label for="dialog-note">개인 메모</label><textarea id="dialog-note" data-repository-note readonly></textarea><a data-repository-detail-link hidden>상세 페이지 열기</a><form method="dialog"><button type="submit">닫기</button></form></dialog>${deleteDialog}</repo-panel></main>`,
   });
 }
 

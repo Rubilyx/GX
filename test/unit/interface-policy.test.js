@@ -327,9 +327,13 @@ test("control border policy derives contrast and token use from parsed CSS decla
   assert.equal(usageCount, 1, "the control-border token must have one declaration use across five CSS files");
   const control = assertOwnRule(core, "input", { "border-color": "var(--color-border-control)" });
   assert.deepEqual([...control.selectors].sort(), ["input", "select", "textarea"]);
-  assertOwnRule(core, "select", { "padding-inline-end": "var(--space-6)" });
+  assertOwnRule(core, "select", { "padding-inline-end": "var(--space-8)" });
   assertOwnRule(core, 'body > a[href="#main"]', {
     border: "1px solid var(--color-border-default)",
+  });
+  assertOwnRule(core, ":focus-visible", {
+    outline: "0.1875rem solid var(--color-action-primary)",
+    "outline-offset": "0.1875rem",
   });
 });
 
@@ -412,6 +416,30 @@ test("capture input and submit button share the medium-width row", async () => {
   ]);
 });
 
+test("index header aligns logout and wraps it on compact screens", async () => {
+  const repositories = parseCss(await asset("repositories.css"));
+  assertOwnRule(repositories, ".index-header", {
+    display: "flex",
+    "flex-wrap": "wrap",
+    "align-items": "flex-start",
+    "justify-content": "space-between",
+    gap: "var(--space-3)",
+  });
+  assertOwnRule(repositories, ".index-header > h1", {
+    "font-size": "2rem",
+  });
+  assertOwnRule(repositories, ".index-header > form", {
+    "margin-inline-start": "auto",
+  });
+  const compact = descendants(repositories).filter((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (max-width: 599px)"));
+  assert.equal(compact.length, 1);
+  assertOwnRule(compact[0].children, ".index-header > form", {
+    "flex-basis": "100%",
+    "justify-items": "end",
+  });
+});
+
 test("each standalone navigation selector owns its normalized 44px target declarations", async () => {
   assert.equal(
     normalizeSelector(String.raw`[ data-x = foo\]bar ]`),
@@ -434,14 +462,92 @@ test("each standalone navigation selector owns its normalized 44px target declar
   const [core, repositories] = await Promise.all([
     asset("core.css").then(parseCss), asset("repositories.css").then(parseCss),
   ]);
-  const target = { display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem" };
-  assertOwnRule(core, 'body > a[href="#main"]', target);
+  const navigationTarget = {
+    display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem",
+  };
+  assertOwnRule(core, 'body > a[href="#main"]', navigationTarget);
+  assertOwnRule(repositories, "repo-panel article h2", {
+    display: "grid",
+    "grid-template-columns": "45px minmax(0, 1fr)",
+    gap: "var(--space-3)",
+    "align-items": "start",
+    "padding-inline-end": "2.75rem",
+  });
+  assertOwnRule(repositories, "repo-panel article", { position: "relative" });
   for (const selector of [
-    "repo-panel article h2 > a",
+    "repo-filter #q[data-pointer-focus]:focus",
+    "repo-filter #tag[data-pointer-focus]:focus",
+  ]) assertOwnRule(repositories, selector, { outline: "none" });
+  const deleteTarget = assertOwnRule(repositories, "a[data-repository-delete]", {
+    position: "absolute",
+    "inset-block-start": "var(--space-2)",
+    "inset-inline-end": "var(--space-2)",
+    display: "inline-flex",
+    "align-items": "center",
+    "justify-content": "center",
+    "min-inline-size": "2.75rem",
+    "min-block-size": "2.75rem",
+    color: "var(--color-text-secondary)",
+    background: "transparent",
+    border: "0",
+    "border-radius": "0",
+  });
+  assert.ok(deleteTarget);
+  const deleteHover = assertOwnRule(repositories, "a[data-repository-delete]:hover", {
+    color: "var(--color-status-danger)",
+  });
+  assert.deepEqual([...deleteHover.declarations.keys()], ["color"]);
+  assertOwnRule(repositories, ".repository-avatar", {
+    display: "block",
+    width: "45px",
+    height: "45px",
+    "border-radius": "50%",
+    "object-fit": "cover",
+  });
+  assertOwnRule(repositories, ".repository-title", {
+    display: "inline-flex",
+    "flex-direction": "column",
+    "align-items": "flex-start",
+    "min-block-size": "2.75rem",
+    "overflow-wrap": "anywhere",
+  });
+  for (const selector of [
+    "a[data-repository-link]",
     'nav[aria-label="페이지"] > a',
     "main > p > a",
     "a[data-repository-detail-link]:not([hidden])",
-  ]) assertOwnRule(repositories, selector, target);
+    ".category-filter > a",
+  ]) assertOwnRule(repositories, selector, navigationTarget);
+  assertOwnRule(repositories, ".category-filter", {
+    display: "flex",
+    gap: "var(--space-2)",
+    "max-width": "100%",
+    "overflow-x": "auto",
+  });
+  assertOwnRule(repositories, ".category-filter > a", {
+    display: "inline-flex",
+    "align-items": "center",
+    "min-block-size": "2.75rem",
+    "flex-shrink": "0",
+    padding: "0 var(--space-4)",
+    color: "var(--color-text-primary)",
+    "background-color": "var(--color-bg-surface)",
+    border: "1px solid var(--color-border-default)",
+    "border-radius": "999px",
+    "text-decoration": "none",
+    "white-space": "nowrap",
+  });
+  assertOwnRule(repositories, '.category-filter > a[aria-current="page"]', {
+    color: "#ffffff",
+    "background-color": "var(--color-action-primary)",
+    "border-color": "var(--color-action-primary)",
+  });
+});
+
+test("repository cards keep 20px inner spacing on every side", async () => {
+  const repositories = await asset("repositories.css").then(parseCss);
+
+  assertOwnRule(repositories, "repo-panel article", { padding: "20px" });
 });
 
 test("detail and status declarations belong to real rules in the required media subtree", async () => {
@@ -472,15 +578,15 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories, "repo-panel > section > h2", { "grid-column": "1 / -1" });
   assertOwnRule(repositories,
     "repo-capture [data-capture-status]:has([data-capture-message]:empty)", { display: "none" });
+  assertOwnRule(repositories, 'main > p[role="status"]:empty', { display: "none" });
   assertOwnRule(repositories, "repo-panel article dl", {
-    "grid-template-columns": "repeat(2, minmax(0, 1fr))",
+    "grid-template-columns": "max-content minmax(0, 1fr)",
   });
 
   /** @type {Array<[string, { filter?: number, gallery: number }]>} */
   const responsiveRules = [
     ["600px", { filter: 2, gallery: 2 }],
-    ["840px", { filter: 3, gallery: 3 }],
-    ["1200px", { gallery: 5 }],
+    ["840px", { filter: 0, gallery: 3 }],
   ];
   for (const [width, expected] of responsiveRules) {
     const prelude = normalizeAtRule(`@media (min-width: ${width})`);
@@ -488,7 +594,7 @@ test("detail and status declarations belong to real rules in the required media 
       node.kind === "at-rule" && node.prelude === prelude);
     assert.equal(media.length, 1, width);
     if (expected.filter) assertOwnRule(media[0].children, "repo-filter > form", {
-      "grid-template-columns": `repeat(${expected.filter}, minmax(0, 1fr))`,
+      "grid-template-columns": "repeat(2, minmax(0, 1fr)) auto",
     });
     assertOwnRule(media[0].children, "repo-panel > section", {
       "grid-template-columns": `repeat(${expected.gallery}, minmax(0, 1fr))`,
@@ -503,6 +609,17 @@ test("detail and status declarations belong to real rules in the required media 
       });
     }
   }
+
+  const desktop = descendants(repositories).filter((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (min-width: 840px)"));
+  assert.equal(desktop.length, 1);
+  assertOwnRule(desktop[0].children, "dialog[data-repository-delete-dialog]", {
+    width: "min(32rem, calc(100% - 2rem))",
+    "max-height": "calc(100% - 2rem)",
+    height: "auto",
+    margin: "auto",
+    "border-radius": "var(--radius-panel)",
+  });
 
   const panel = await asset("repo-panel.js");
   assert.match(panel, /matchMedia\("\(min-width: 840px\)"\)/);

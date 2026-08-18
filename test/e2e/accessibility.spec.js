@@ -21,6 +21,11 @@ test("index and detail have no serious or critical axe violations", async ({ pag
     await expect(page.getByRole("dialog")).toBeVisible();
   }
   await expectNoBlockingAxe(page);
+  await page.goto("/");
+  await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
+  await expect(page.locator("[data-repository-delete-dialog]")).toBeVisible();
+  await expectNoBlockingAxe(page);
+  await page.keyboard.press("Escape");
 });
 
 test("keyboard focus is visible and native dialog stays focused then returns it", async ({ page }) => {

@@ -16,10 +16,14 @@ test("core form flow survives disabled JavaScript", async ({ page }) => {
   await expect(page.getByRole("textbox", { name: "개인 메모", exact: true })).toHaveValue("브라우저 없이 저장한 메모");
   await page.getByRole("link", { name: "저장소 목록" }).click();
   await page.getByLabel("검색").fill("example");
-  await page.getByLabel("주 분류").selectOption("Backend");
+  await page.getByRole("link", { name: "Backend 1", exact: true }).click();
   await page.getByLabel("태그").selectOption("example");
   await page.getByRole("button", { name: "찾기" }).click();
   await expect(page.locator("[data-repository-link]")).toHaveCount(1);
+  await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
+  await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+#delete-heading$/);
+  await expect(page.getByRole("heading", { name: "저장소 삭제", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "저장소 목록" }).click();
   await page.getByRole("button", { name: "로그아웃" }).click();
   await expect(page).toHaveURL(/\/login$/);
   await page.getByLabel("6자리 PIN").fill("123456");

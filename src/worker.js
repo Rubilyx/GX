@@ -23,7 +23,7 @@ const FLASH = new Set([
 ]);
 const COOKIE_EXPIRED = "__Host-repo_atlas_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
 const LOGIN_CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; connect-src 'none'; report-uri /csp-report";
-const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; trusted-types 'none'";
 
 /**
@@ -444,6 +444,7 @@ async function renderIndex(url, runtime, session) {
     releaseId: runtime.releaseId, modulePreloads,
     csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
     repositories: result.repositories, filters, categories: CATEGORIES,
+    repositoryCounts: result.repositoryCounts,
     availableTags: result.availableTags, page: result.page, totalPages: result.totalPages, flash,
   }), 200, {}, "app", runtime.trustedTypesMode);
 }

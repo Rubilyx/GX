@@ -147,13 +147,14 @@ function categoryHref(filters, category) {
   return `/?${htmlAttr(query.toString())}`;
 }
 
-/** @param {string[]} categories @param {{ q?: string, category?: string, tag?: string }} filter */
-function categoryFilter(categories, filter) {
-  /** @type {Array<[string, string]>} */
-  const chips = [["", "All"], ...categories.map((category) =>
-    /** @type {[string, string]} */ ([category, category]))];
-  return `<nav class="category-filter" aria-label="Primary category">${chips.map(([value, label]) =>
-    `<a href="${categoryHref(filter, value)}"${value === filter.category ? ' aria-current="page"' : ""}>${htmlText(label)}</a>`).join("")}</nav>`;
+/** @param {string[]} categories @param {{ q?: string, category?: string, tag?: string }} filter @param {{ all?: number, byCategory?: Record<string, number> }} [counts] */
+function categoryFilter(categories, filter, counts = {}) {
+  /** @type {Array<[string, string, number]>} */
+  const chips = [["", "All", counts.all ?? 0], ...categories.map((category) =>
+    /** @type {[string, string, number]} */
+    ([category, category, counts.byCategory?.[category] ?? 0]))];
+  return `<nav class="category-filter" aria-label="Primary category">${chips.map(([value, label, count]) =>
+    `<a href="${categoryHref(filter, value)}"${value === filter.category ? ' aria-current="page"' : ""}>${htmlText(label)} ${htmlText(count)}</a>`).join("")}</nav>`;
 }
 
 /** @param {any} view */
@@ -169,7 +170,7 @@ export function renderIndexPage(view) {
   return document({
     releaseId: view.releaseId, page: "repositories.css", title: "Repo Atlas",
     app: true, modulePreloads: view.modulePreloads,
-    body: `<main id="main"><header class="index-header"><h1>Repo Atlas</h1>${filterForm}${logoutForm(view.csrfToken)}</header>${errorStatus(view.flash)}<repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-panel>${categoryFilter(view.categories ?? CATEGORIES, filter)}${list}${pagination}<dialog data-repository-dialog aria-labelledby="repository-dialog-heading"><h2 id="repository-dialog-heading">저장소 상세</h2><label for="dialog-summary">요약</label><textarea id="dialog-summary" data-repository-summary readonly></textarea><label for="dialog-note">개인 메모</label><textarea id="dialog-note" data-repository-note readonly></textarea><a data-repository-detail-link hidden>상세 페이지 열기</a><form method="dialog"><button type="submit">닫기</button></form></dialog>${deleteDialog}</repo-panel></main>`,
+    body: `<main id="main"><header class="index-header"><h1>Repo Atlas</h1>${filterForm}${logoutForm(view.csrfToken)}</header>${errorStatus(view.flash)}<repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-panel>${categoryFilter(view.categories ?? CATEGORIES, filter, view.repositoryCounts)}${list}${pagination}<dialog data-repository-dialog aria-labelledby="repository-dialog-heading"><h2 id="repository-dialog-heading">저장소 상세</h2><label for="dialog-summary">요약</label><textarea id="dialog-summary" data-repository-summary readonly></textarea><label for="dialog-note">개인 메모</label><textarea id="dialog-note" data-repository-note readonly></textarea><a data-repository-detail-link hidden>상세 페이지 열기</a><form method="dialog"><button type="submit">닫기</button></form></dialog>${deleteDialog}</repo-panel></main>`,
   });
 }
 

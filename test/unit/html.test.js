@@ -73,6 +73,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
       q: `"><script>alert("q")</script>`, category: repository.primaryCategory,
       tag: repository.tags[0], page: 1,
     }, categories: [repository.primaryCategory], availableTags: repository.tags,
+    repositoryCounts: { all: 1, byCategory: { [repository.primaryCategory]: 1 } },
     page: 1, totalPages: 1, flash: "repository_created",
   });
   assert.match(html, /<link rel="icon" href="\/assets\/abc123\/favicon\.svg">/);
@@ -143,14 +144,14 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.doesNotMatch(html, /<[^>]+\son(?:click|submit|change)=/);
   assert.doesNotMatch(html, /<script>alert|<img src|<b>summary|onclick=/);
   assert.match(html, /value="&quot;&gt;&lt;script&gt;alert\(&quot;q&quot;\)&lt;\/script&gt;"/);
-  assert.match(html, />Backend&quot;&gt;&lt;script&gt;<\/a>/);
+  assert.match(html, />Backend&quot;&gt;&lt;script&gt; 1<\/a>/);
   assert.match(html, /category=Backend%22%3E%3Cscript%3E/);
   assert.match(html, /tag&quot;&gt;&lt;script&gt;/);
 
   const empty = renderIndexPage({
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf", repositories: [],
     filters: { q: "", category: "", tag: "", page: 1 }, categories: ["Backend"],
-    availableTags: [],
+    availableTags: [], repositoryCounts: { all: 0, byCategory: {} },
     page: 1, totalPages: 1, flash: "",
   });
   assert.doesNotMatch(empty, /data-repository-link/);
@@ -159,7 +160,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(empty, /<dialog data-repository-delete-dialog/);
   assert.match(empty, /class="status-marker" aria-hidden="true"/);
   assert.match(empty,
-    /<nav class="category-filter" aria-label="Primary category"><a href="\/\?page=1" aria-current="page">All<\/a>/);
+    /<nav class="category-filter" aria-label="Primary category"><a href="\/\?page=1" aria-current="page">All 0<\/a>/);
 });
 
 test("index category chips preserve filters and expose one active category", () => {
@@ -167,17 +168,18 @@ test("index category chips preserve filters and expose one active category", () 
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf", repositories: [repository],
     filters: { q: "llm tools", category: "Backend", tag: "python", page: 4 },
     categories: ["Backend", "Data & AI", "Empty"], availableTags: ["python"],
+    repositoryCounts: { all: 4, byCategory: { Backend: 3, "Data & AI": 1 } },
     page: 4, totalPages: 4, flash: "",
   });
   const categoryNav = html.match(/<nav class="category-filter"[\s\S]*?<\/nav>/)?.[0] ?? "";
   assert.match(categoryNav,
-    /<a href="\/\?q=llm\+tools&amp;tag=python&amp;page=1">All<\/a>/);
+    /<a href="\/\?q=llm\+tools&amp;tag=python&amp;page=1">All 4<\/a>/);
   assert.match(categoryNav,
-    /<a href="\/\?q=llm\+tools&amp;category=Backend&amp;tag=python&amp;page=1" aria-current="page">Backend<\/a>/);
+    /<a href="\/\?q=llm\+tools&amp;category=Backend&amp;tag=python&amp;page=1" aria-current="page">Backend 3<\/a>/);
   assert.match(categoryNav,
-    /<a href="\/\?q=llm\+tools&amp;category=Data\+%26\+AI&amp;tag=python&amp;page=1">Data &amp; AI<\/a>/);
+    /<a href="\/\?q=llm\+tools&amp;category=Data\+%26\+AI&amp;tag=python&amp;page=1">Data &amp; AI 1<\/a>/);
   assert.match(categoryNav,
-    /<a href="\/\?q=llm\+tools&amp;category=Empty&amp;tag=python&amp;page=1">Empty<\/a>/);
+    /<a href="\/\?q=llm\+tools&amp;category=Empty&amp;tag=python&amp;page=1">Empty 0<\/a>/);
   assert.equal((categoryNav.match(/aria-current="page"/g) ?? []).length, 1);
 });
 

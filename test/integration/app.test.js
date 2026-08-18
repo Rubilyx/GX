@@ -126,9 +126,9 @@ test("native forms cover login through create, detail, edit, refresh, filter, de
   assert.match(filteredHtml,
     /<span class="repository-title"><span class="repository-owner">OpenAI\/<\/span><span class="repository-name">example<\/span><\/span>/);
   assert.match(filteredHtml,
-    /<a href="\/\?q=example&amp;tag=example&amp;page=1">All<\/a>/);
+    /<a href="\/\?q=example&amp;tag=example&amp;page=1">All 1<\/a>/);
   assert.match(filteredHtml,
-    /<a href="\/\?q=example&amp;category=Backend&amp;tag=example&amp;page=1" aria-current="page">Backend<\/a>/);
+    /<a href="\/\?q=example&amp;category=Backend&amp;tag=example&amp;page=1" aria-current="page">Backend 1<\/a>/);
   assert.doesNotMatch(filteredHtml, /id="category"|name="category"/);
 
   const deleted = await postForm(harness.worker, `${path}/delete`, session, { confirm: "yes" });

@@ -1,5 +1,7 @@
 # Root Card Delete and Filter Polish Implementation Plan
 
+> **Historical record:** Do not execute this plan's direct Wrangler deployment steps. All current production releases must follow [`docs/operations/release.md`](../../operations/release.md), including merge-to-main, exact-SHA CI, evidence, and the protected `Release` workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a safe top-right repository-card delete flow while polishing root search focus, placeholder, and empty-status spacing.

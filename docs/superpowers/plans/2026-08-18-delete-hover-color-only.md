@@ -1,5 +1,7 @@
 # Delete Hover Color-Only Implementation Plan
 
+> **Historical record:** Do not execute this plan's direct Wrangler deployment steps. All current production releases must follow [`docs/operations/release.md`](../../operations/release.md), including merge-to-main, exact-SHA CI, evidence, and the protected `Release` workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the repository delete link's circular surface and make hover change only the `×` glyph from danger red to the existing darker danger-hover color.

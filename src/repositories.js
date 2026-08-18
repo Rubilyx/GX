@@ -269,32 +269,21 @@ export async function listRepositories(db, filters) {
        ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?`,
     ).bind(...bindings, pageSize, (page - 1) * pageSize).all();
     // ponytail: the 1,000-repository cap bounds this to 5,000 rows; scope by page if that cap grows.
-    const [allTags, available, categoryCountRows] = await Promise.all([
+    const [allTags, available] = await Promise.all([
       db.prepare(
         "SELECT repository_id, normalized_tag FROM repository_tags ORDER BY normalized_tag",
       ).all(),
       db.prepare("SELECT DISTINCT normalized_tag FROM repository_tags ORDER BY normalized_tag").all(),
-      db.prepare(
-        `SELECT primary_category, COUNT(*) AS count FROM repositories
-         GROUP BY primary_category ORDER BY primary_category`,
-      ).all(),
     ]);
     const tagsByRepository = new Map();
     for (const { repository_id, normalized_tag } of allTags.results) {
       if (!tagsByRepository.has(repository_id)) tagsByRepository.set(repository_id, []);
       tagsByRepository.get(repository_id).push(normalized_tag);
     }
-    /** @type {Array<[string | null, number]>} */
-    const categoryCounts = categoryCountRows.results.map((/** @type {any} */ row) =>
-      [row.primary_category, Number(row.count)]);
     return {
       repositories: rows.results.map((/** @type {any} */ row) => mapRepository(row, tagsByRepository.get(row.id) ?? [])),
       page, totalPages, total,
       availableTags: available.results.map((/** @type {any} */ tag) => tag.normalized_tag),
-      repositoryCounts: {
-        all: categoryCounts.reduce((sum, [, count]) => sum + count, 0),
-        byCategory: Object.fromEntries(categoryCounts.filter(([category]) => typeof category === "string")),
-      },
     };
   } catch (error) { throw storageError(error); }
 }

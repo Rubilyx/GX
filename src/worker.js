@@ -444,7 +444,6 @@ async function renderIndex(url, runtime, session) {
     releaseId: runtime.releaseId, modulePreloads,
     csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
     repositories: result.repositories, filters, categories: CATEGORIES,
-    repositoryCounts: result.repositoryCounts,
     availableTags: result.availableTags, page: result.page, totalPages: result.totalPages, flash,
   }), 200, {}, "app", runtime.trustedTypesMode);
 }

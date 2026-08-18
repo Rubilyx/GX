@@ -1,5 +1,7 @@
 # Delete Hover Color-Only Design
 
+> **Historical record:** Do not execute this design's direct deployment instructions. All current production releases must follow [`docs/operations/release.md`](../../operations/release.md), including merge-to-main, exact-SHA CI, evidence, and the protected `Release` workflow.
+
 ## Goal
 
 Repository card delete links keep their 44px pointer target and keyboard accessibility, but no longer render a circular surface. Hover changes only the `×` glyph color from the existing danger red to the existing darker danger-hover token.

@@ -1,5 +1,7 @@
 # Repository Filter and Card Spacing Implementation Plan
 
+> **Historical record:** Do not execute this plan's direct Wrangler deployment steps. All current production releases must follow [`docs/operations/release.md`](../../operations/release.md), including merge-to-main, exact-SHA CI, evidence, and the protected `Release` workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Tighten repository-card label/value column spacing, place the filter action beside the tag field, and increase native select Chevron clearance before deploying directly to Cloudflare.

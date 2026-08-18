@@ -1,5 +1,7 @@
 # Root Page Filter Chips Implementation Plan
 
+> **Historical record:** Do not execute this plan's direct Wrangler deployment steps. All current production releases must follow [`docs/operations/release.md`](../../operations/release.md), including merge-to-main, exact-SHA CI, evidence, and the protected `Release` workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the root page more compact, move search above repository capture, replace the primary-category select with bookmarkable category chips, and rename the populated results heading to `Repository`.

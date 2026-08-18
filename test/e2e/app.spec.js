@@ -39,9 +39,9 @@ test("category chips preserve search and tag in one canonical query", async ({ p
   await page.getByLabel("태그").selectOption("example");
   await expect(page).toHaveURL(/\?q=example&tag=example&page=1$/);
   await expect(page.locator("#category")).toHaveCount(0);
-  await page.getByRole("link", { name: "Backend 1", exact: true }).click();
+  await page.getByRole("link", { name: "Backend", exact: true }).click();
   await expect(page).toHaveURL(/\?q=example&category=Backend&tag=example&page=1$/);
-  await expect(page.getByRole("link", { name: "Backend 1", exact: true }))
+  await expect(page.getByRole("link", { name: "Backend", exact: true }))
     .toHaveAttribute("aria-current", "page");
   expect(new URL(page.url()).search).toBe("?q=example&category=Backend&tag=example&page=1");
 });

@@ -79,7 +79,8 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(html, /<link rel="icon" href="\/assets\/abc123\/favicon\.svg">/);
   assert.match(html, /<repo-capture>[\s\S]*<form[^>]*method="post"[^>]*action="\/repositories"/);
   const header = html.match(/<header class="index-header">[\s\S]*?<\/header>/)?.[0] ?? "";
-  assert.match(header, /^<header class="index-header"><h1>Repo Atlas<\/h1><repo-filter>/);
+  assert.match(header,
+    /^<header class="index-header"><h1><a href="\/">Repo Atlas<\/a><\/h1><repo-filter>/);
   assert.match(header,
     /<repo-filter><form[^>]*method="get"[^>]*action="\/"[\s\S]*?<\/form><\/repo-filter>/);
   assert.match(header,

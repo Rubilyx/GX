@@ -429,6 +429,12 @@ test("index header places the filter responsively beside the title", async () =>
     "grid-column": "1",
     "grid-row": "1",
   });
+  assertOwnRule(repositories, ".index-header > h1 > a", {
+    display: "inline-flex",
+    "align-items": "center",
+    "min-block-size": "2.75rem",
+    "text-decoration": "none",
+  });
   assertOwnRule(repositories, ".index-header > repo-filter", { "min-width": "0" });
   assertOwnRule(repositories, ":where(.index-header) > form", {
     "justify-self": "end",
@@ -593,13 +599,8 @@ test("detail and status declarations belong to real rules in the required media 
     "background-color": "var(--color-bg-subtle)",
   });
   assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"] > p', {
-    "background-color": "var(--color-bg-page)",
+    "background-color": "var(--color-bg-danger)",
   });
-  assertOwnRule(repositories,
-    'repo-panel article[data-analysis-card-status="error"] [data-analysis-status="error"]', {
-      color: "var(--color-text-secondary)",
-      background: "var(--color-border-subtle)",
-    });
   assertOwnRule(repositories, "repo-panel article dl", {
     "grid-template-columns": "max-content minmax(0, 1fr)",
     gap: "var(--space-1) var(--space-3)",

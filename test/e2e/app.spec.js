@@ -46,6 +46,18 @@ test("category chips preserve search and tag in one canonical query", async ({ p
   expect(new URL(page.url()).search).toBe("?q=example&category=Backend&tag=example&page=1");
 });
 
+test("Repo Atlas title returns to the unfiltered first screen", async ({ page }) => {
+  await loginAndSeed(page);
+  await page.goto("/?q=example&tag=example&page=1");
+  const home = page.getByRole("link", { name: "Repo Atlas", exact: true });
+
+  await expect(home).toHaveAttribute("href", "/");
+  await expect(home).toHaveCSS("text-decoration-line", "none");
+  await expect(home).toHaveCSS("min-height", "44px");
+  await home.click();
+  await expect(page).toHaveURL((url) => url.pathname === "/" && url.search === "");
+});
+
 test("filter hides pointer focus chrome and preserves keyboard focus", async ({ page }) => {
   await loginAndSeed(page);
   const search = page.getByLabel("검색", { exact: true });
@@ -124,7 +136,7 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
   });
 });
 
-test("analysis failure cards use a quiet disabled treatment without a detail link", async ({ page, harness }) => {
+test("analysis failure cards keep red failure accents without a detail link", async ({ page, harness }) => {
   await loginAndSeed(page);
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB, {
@@ -141,9 +153,9 @@ test("analysis failure cards use a quiet disabled treatment without a detail lin
   await expect(card).toHaveCSS("background-color", "rgb(241, 240, 237)");
   await expect(card).toHaveCSS("color", "rgb(107, 105, 99)");
   await expect(description).toHaveText("AI 분석 실패");
-  await expect(description).toHaveCSS("background-color", "rgb(247, 246, 243)");
-  await expect(badge).toHaveCSS("background-color", "rgb(243, 242, 239)");
-  await expect(badge).toHaveCSS("color", "rgb(107, 105, 99)");
+  await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
+  await expect(badge).toHaveCSS("background-color", "rgb(253, 235, 236)");
+  await expect(badge).toHaveCSS("color", "rgb(159, 47, 45)");
   await expect(card.locator("[data-repository-link]")).toHaveCount(0);
 });
 

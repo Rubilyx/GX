@@ -2,13 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile, readdir } from "node:fs/promises";
 
+/** @param {string} source */
+const normalizedLines = (source) => source.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+
 /** @param {string} name */
-const workflow = (name) => readFile(new URL(`../../.github/workflows/${name}.yml`, import.meta.url), "utf8");
+const workflow = (name) => readFile(
+  new URL(`../../.github/workflows/${name}.yml`, import.meta.url), "utf8",
+).then(normalizedLines);
 
 async function currentWorkflows() {
   const directory = new URL("../../.github/workflows/", import.meta.url);
   const names = (await readdir(directory)).filter((name) => /\.ya?ml$/.test(name)).sort();
-  return Promise.all(names.map(async (name) => ({ name, source: await readFile(new URL(name, directory), "utf8") })));
+  return Promise.all(names.map(async (name) => ({
+    name, source: normalizedLines(await readFile(new URL(name, directory), "utf8")),
+  })));
 }
 const allowedActions = new Set([
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",

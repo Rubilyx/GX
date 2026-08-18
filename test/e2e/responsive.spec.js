@@ -6,6 +6,8 @@ const cases = [
   { width: 599, columns: 4, gutter: 16, gap: 16, filter: 1, gallery: 1, max: 567 },
   { width: 600, columns: 8, gutter: 24, gap: 24, filter: 3, gallery: 2, max: 552 },
   { width: 768, columns: 8, gutter: 24, gap: 24, filter: 3, gallery: 2, max: 720 },
+  { width: 839, columns: 8, gutter: 24, gap: 24, filter: 3, gallery: 2, max: 791 },
+  { width: 840, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 776 },
   { width: 1024, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 960 },
   { width: 1037, height: 1097, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 973 },
   { width: 1317, height: 1379, columns: 12, gutter: 32, gap: 24, filter: 3, gallery: 3, max: 1200 },
@@ -94,6 +96,7 @@ test("reference widths use the approved grid without horizontal overflow", async
         gap: Number.parseFloat(root.getPropertyValue("--layout-gap")),
         main: main.getBoundingClientRect().width,
         filter: getComputedStyle(filter).gridTemplateColumns.split(" ").length,
+        filterInsideHeader: header.contains(filter),
         gallery: getComputedStyle(gallery).gridTemplateColumns.split(" ").length,
         selectPaddingEnd: Number.parseFloat(getComputedStyle(tagStyleTarget).paddingInlineEnd),
         headingFontSize: Number.parseFloat(getComputedStyle(heading).fontSize),
@@ -137,6 +140,7 @@ test("reference widths use the approved grid without horizontal overflow", async
       gutter: scenario.gutter,
       gap: scenario.gap,
       filter: scenario.filter,
+      filterInsideHeader: true,
       gallery: scenario.gallery,
       titleDecoration: "none",
     });
@@ -161,9 +165,12 @@ test("reference widths use the approved grid without horizontal overflow", async
       expect(Math.abs(layout.buttonBottom - layout.tagBottom)).toBeLessThanOrEqual(1);
     if (scenario.width >= 840) {
       expect(Math.abs(layout.searchControlTop - layout.tagControlTop)).toBeLessThanOrEqual(1);
+      expect(Math.abs(layout.searchControlTop - layout.headingTop)).toBeLessThanOrEqual(1);
     } else if (scenario.width < 600) {
       expect(layout.buttonTop).toBeGreaterThanOrEqual(layout.tagBottom);
     }
+    if (scenario.width < 840)
+      expect(layout.searchControlTop).toBeGreaterThanOrEqual(layout.headingBottom);
     if (scenario.width < 600) expect(layout.logoutTop).toBeGreaterThan(layout.headingBottom);
     else expect(Math.abs(layout.logoutTop - layout.headingTop)).toBeLessThanOrEqual(1);
   }

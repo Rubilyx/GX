@@ -97,6 +97,7 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
   expect(await description.evaluate((element) => {
     const style = getComputedStyle(element);
     return {
+      backgroundColor: style.backgroundColor,
       borderColor: style.borderTopColor,
       borderRadius: style.borderTopLeftRadius,
       borderStyle: style.borderTopStyle,
@@ -109,6 +110,7 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
       paddingTop: style.paddingTop,
     };
   })).toEqual({
+    backgroundColor: "rgb(241, 240, 237)",
     borderColor: "rgb(227, 225, 220)",
     borderRadius: "8px",
     borderStyle: "solid",
@@ -122,7 +124,91 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
   });
 });
 
-test("repository metadata separates rows without trailing divider", async ({ page }) => {
+test("analysis failure summary uses the light red status background", async ({ page, harness }) => {
+  await loginAndSeed(page);
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", githubId: "404",
+    owner: "Failure", name: "short", htmlUrl: "https://github.com/Failure/short",
+    summary: null, primaryCategory: null, analysisStatus: "error",
+    analysisErrorCode: "analysis_unavailable", createdAt: 999,
+  });
+  await page.reload();
+
+  const description = page.locator('[data-analysis-summary-status="error"]');
+  await expect(description).toHaveText("AI 분석 실패");
+  await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
+});
+
+test("repository detail link is localized and undecorated", async ({ page }) => {
+  await loginAndSeed(page);
+  const link = page.locator("[data-repository-link]").first();
+
+  await expect(link).toHaveText("자세히 보기");
+  await expect(link).toHaveCSS("text-decoration-line", "none");
+});
+
+test("repository detail links stay 44px tall with uneven card content", async ({ page, harness }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
+  await loginAndSeed(page);
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", githubId: "404",
+    owner: "Failure", name: "short", htmlUrl: "https://github.com/Failure/short",
+    summary: null, primaryCategory: null, analysisStatus: "error",
+    analysisErrorCode: "analysis_unavailable", createdAt: 999,
+  });
+  await seedRepository(env.PROD_DB, {
+    id: "dddddddd-dddd-dddd-dddd-dddddddddddd", githubId: "405",
+    owner: "Extremely-long-owner-name", name: "content-heavy-repository",
+    htmlUrl: "https://github.com/Extremely-long-owner-name/content-heavy-repository",
+    summary: "긴 설명이 있는 저장소 카드가 같은 행의 높이를 크게 늘려도 자세히 보기 링크의 터치 영역은 늘어나지 않아야 합니다. ".repeat(4),
+    tags: ["long-design-system", "responsive-layout", "accessibility", "javascript", "documentation"],
+    createdAt: 998,
+  });
+  await page.reload();
+
+  expect(await page.locator("[data-repository-link]").evaluateAll((links) =>
+    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44, 44]);
+});
+
+test("repository summary boxes keep their top edge fixed with uneven text", async ({ page, harness }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
+  await loginAndSeed(page);
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", githubId: "404",
+    owner: "Pair", name: "short", htmlUrl: "https://github.com/Pair/short",
+    summary: "짧은 설명", createdAt: 999,
+  });
+  await seedRepository(env.PROD_DB, {
+    id: "dddddddd-dddd-dddd-dddd-dddddddddddd", githubId: "405",
+    owner: "Pair", name: "lengthy", htmlUrl: "https://github.com/Pair/lengthy",
+    summary: "본문이 길어져도 요약 박스의 상단 위치는 움직이지 않아야 합니다. ".repeat(16),
+    createdAt: 998,
+  });
+  await page.reload();
+
+  const summaries = await page.locator("repo-panel article").evaluateAll((cards) =>
+    Object.fromEntries(cards.map((card) => {
+      const heading = card.querySelector("h2")?.textContent;
+      const summary = card.querySelector(":scope > p");
+      if (!heading || !(summary instanceof HTMLElement))
+        throw new Error("repository_summary_nodes_missing");
+      const cardBox = card.getBoundingClientRect();
+      const summaryBox = summary.getBoundingClientRect();
+      return [heading, {
+        height: summaryBox.height,
+        top: summaryBox.top - cardBox.top,
+      }];
+    })));
+
+  expect(Math.abs(summaries["Pair/short"].top - summaries["Pair/lengthy"].top))
+    .toBeLessThanOrEqual(1);
+  expect(summaries["Pair/lengthy"].height).toBeGreaterThan(summaries["Pair/short"].height);
+});
+
+test("repository metadata keeps lighter dividers in the value column", async ({ page }) => {
   await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
   const metadata = page.locator("repo-panel article > dl").first();
@@ -151,7 +237,7 @@ test("repository metadata separates rows without trailing divider", async ({ pag
       ...rowSpacing(node), borderColor: getComputedStyle(node).borderBottomColor,
     });
     return {
-      firstLabel: dividedRowStyle(firstLabel),
+      firstLabel: rowSpacing(firstLabel),
       firstValue: dividedRowStyle(firstValue),
       lastLabel: rowSpacing(lastLabel),
       lastValue: rowSpacing(lastValue),
@@ -159,11 +245,11 @@ test("repository metadata separates rows without trailing divider", async ({ pag
     };
   })).toEqual({
     firstLabel: {
-      borderColor: "rgb(227, 225, 220)", borderStyle: "solid", borderWidth: "1px",
+      borderStyle: "none", borderWidth: "0px",
       paddingBottom: "4px", paddingTop: "4px",
     },
     firstValue: {
-      borderColor: "rgb(227, 225, 220)", borderStyle: "solid", borderWidth: "1px",
+      borderColor: "rgb(243, 242, 239)", borderStyle: "solid", borderWidth: "1px",
       paddingBottom: "4px", paddingTop: "4px",
     },
     lastLabel: {
@@ -174,7 +260,7 @@ test("repository metadata separates rows without trailing divider", async ({ pag
       borderStyle: "none", borderWidth: "0px",
       paddingBottom: "4px", paddingTop: "4px",
     },
-    rowGap: "0px",
+    rowGap: "4px",
   });
 });
 

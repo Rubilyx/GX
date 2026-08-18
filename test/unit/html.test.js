@@ -78,13 +78,19 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   });
   assert.match(html, /<link rel="icon" href="\/assets\/abc123\/favicon\.svg">/);
   assert.match(html, /<repo-capture>[\s\S]*<form[^>]*method="post"[^>]*action="\/repositories"/);
-  assert.match(html,
-    /<header class="index-header"><h1>Repo Atlas<\/h1><form[^>]*method="post"[^>]*action="\/session\/logout"[\s\S]*?<\/form><\/header>/);
+  const header = html.match(/<header class="index-header">[\s\S]*?<\/header>/)?.[0] ?? "";
+  assert.match(header, /^<header class="index-header"><h1>Repo Atlas<\/h1><repo-filter>/);
+  assert.match(header,
+    /<repo-filter><form[^>]*method="get"[^>]*action="\/"[\s\S]*?<\/form><\/repo-filter>/);
+  assert.match(header,
+    /<\/repo-filter><form[^>]*method="post"[^>]*action="\/session\/logout"[\s\S]*?<\/form><\/header>$/);
   assert.match(html, /<button type="submit">저장<\/button>/);
   assert.doesNotMatch(html, /저장하고 요약하기/);
   assert.match(html, /<repo-filter>[\s\S]*<form[^>]*method="get"[^>]*action="\/"/);
   assert.match(html,
     /<label for="q"><span class="visually-hidden">검색<\/span><input id="q" name="q" type="search" maxlength="100" placeholder="검색" value=/);
+  assert.match(html,
+    /<label for="tag"><span class="visually-hidden">태그<\/span><select id="tag" name="tag">/);
   assert.doesNotMatch(html, /<label for="q">검색<input/);
   const filterIndex = html.indexOf("<repo-filter>");
   const captureIndex = html.indexOf("<repo-capture>");
@@ -103,10 +109,11 @@ test("index exposes complete native forms and safe enhancement controls", () => 
     /<span class="repository-title"><span class="repository-owner">a\/b&lt;script&gt;\/<\/span><span class="repository-name">x\?y&quot;&gt;&lt;img src=x&gt;<\/span><\/span>/);
   assert.doesNotMatch(html, /data-repository-source-link|target="_blank"/);
   assert.match(html,
-    /<a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">View details<\/a>/);
+    /<a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a>/);
   assert.match(html,
     /<dl><dt>Primary category<\/dt><dd>[\s\S]*?<dt>Tags<\/dt>[\s\S]*?<dt>Stars<\/dt>[\s\S]*?<dt>Forks<\/dt>[\s\S]*?<dt>Language<\/dt>[\s\S]*?<dt>Analysis status<\/dt>/);
   const card = html.match(/<article>[\s\S]*?<\/article>/)?.[0] ?? "";
+  assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.match(card,
     /<a data-repository-delete href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#delete-heading" aria-label="[^"]+ 삭제"><span aria-hidden="true">×<\/span><\/a>/);
   for (const korean of ["주 분류", "태그", "별", "포크", "언어", "분석 상태"])
@@ -183,7 +190,7 @@ test("index uses the terse analysis failure fallback", () => {
     filters: { q: "", category: "", tag: "", page: 1 }, categories: ["Backend"],
     availableTags: [], page: 1, totalPages: 1, flash: "",
   });
-  assert.match(html, /<p>AI 분석 실패<\/p>/);
+  assert.match(html, /<p data-analysis-summary-status="error">AI 분석 실패<\/p>/);
   assert.doesNotMatch(html, /AI 분석을 완료하지 못했습니다/);
 });
 
@@ -228,7 +235,7 @@ test("analysis status hooks admit only fixed own values", () => {
     assert.equal((html.match(new RegExp(`data-analysis-status="${status}"`, "g")) ?? []).length, 1);
   assert.doesNotMatch(html, /data-analysis-status="constructor"|function Object|native code/);
   assert.match(html, /상태 확인 필요/);
-  assert.match(html, /<p>AI 분석 실패<\/p>/);
+  assert.match(html, /<p data-analysis-summary-status="error">AI 분석 실패<\/p>/);
   assert.match(html, /<nav aria-label="페이지">[\s\S]*<a rel="next"/);
 
   const detailHtml = renderRepositoryPage({

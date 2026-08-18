@@ -2,16 +2,17 @@
   repo-capture, repo-filter, repo-panel { display: block; }
 
   .index-header {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-start;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
     gap: var(--space-3);
   }
 
-  .index-header > h1 { font-size: 2rem; }
+  .index-header > h1 { grid-column: 1; grid-row: 1; font-size: 2rem; }
+  .index-header > repo-filter { min-width: 0; }
+  :where(.index-header) > form { justify-self: end; }
 
-  repo-capture > form, repo-filter > form, main > section {
+  repo-capture > form, main > section {
     padding: clamp(var(--space-4), 4vw, var(--space-6));
     background: var(--color-bg-surface);
     border: 1px solid var(--color-border-default);
@@ -23,6 +24,9 @@
   repo-filter > form {
     grid-template-columns: 1fr;
     align-items: end;
+    padding: 0;
+    background: transparent;
+    border: 0;
   }
 
   repo-filter label { display: grid; gap: var(--space-1); }
@@ -41,6 +45,7 @@
   repo-panel article {
     position: relative;
     display: grid;
+    align-content: start;
     gap: var(--space-3);
     padding: 20px;
     background: var(--color-bg-surface);
@@ -94,8 +99,13 @@
   repo-panel article > p {
     margin-block: var(--space-2);
     padding: var(--space-3) var(--space-4);
+    background-color: var(--color-bg-subtle);
     border: 1px solid var(--color-border-default);
     border-radius: var(--radius-control);
+  }
+
+  repo-panel article > p[data-analysis-summary-status="error"] {
+    background-color: var(--color-bg-danger);
   }
 
   /* stylelint-disable selector-max-id, selector-max-specificity -- Required controls. */
@@ -150,18 +160,20 @@
     min-block-size: 2.75rem;
   }
 
+  a[data-repository-link] {
+    align-self: start;
+    text-decoration: none;
+  }
+
   repo-panel article dl {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr);
-    gap: 0 var(--space-3);
+    gap: var(--space-1) var(--space-3);
   }
 
   repo-panel article dl > :where(dt, dd) {
     padding-block: var(--space-1);
-    border-bottom: 1px solid var(--color-border-default);
   }
-
-  repo-panel article dl > :where(dt:last-of-type, dd:last-of-type) { border-bottom: 0; }
 
   .repository-facts > dl {
     display: grid;
@@ -171,6 +183,8 @@
 
   repo-panel article dt { color: var(--color-text-secondary); font-size: var(--text-sm); }
   repo-panel article dd { overflow-wrap: anywhere; }
+
+  repo-panel article dl > dd { border-bottom: 1px solid var(--color-border-subtle); }
 
   .repository-facts > dl dt,
   .repository-facts > dl dd {
@@ -186,6 +200,8 @@
     font-size: var(--text-sm);
     font-weight: 650;
   }
+
+  repo-panel article dl > dd:last-of-type { border-bottom: 0; }
 
   .repository-facts > dl dt:first-child,
   .repository-facts > dl dt:first-child + dd { border-top: 0; }
@@ -234,16 +250,11 @@
   dialog::backdrop { background: rgb(37 37 34 / 0.24); }
 
   main > section form, main > section + section { margin-top: var(--space-4); }
-  .index-header > form { margin-inline-start: auto; }
-
-  @media (max-width: 599px) {
-    .index-header > form {
-      flex-basis: 100%;
-      justify-items: end;
-    }
-  }
 
   @media (min-width: 600px) {
+    .index-header { grid-template-columns: minmax(0, 1fr) auto; }
+    .index-header > repo-filter { grid-column: 1 / -1; grid-row: 2; }
+    :where(.index-header) > form { grid-column: 2; grid-row: 1; }
     repo-capture > form {
       grid-template-columns: minmax(0, var(--content-reading)) auto;
       justify-content: start;
@@ -255,6 +266,9 @@
   }
 
   @media (min-width: 840px) {
+    .index-header { grid-template-columns: max-content minmax(0, 1fr) max-content; }
+    .index-header > repo-filter { grid-column: 2; grid-row: 1; }
+    :where(.index-header) > form { grid-column: 3; grid-row: 1; }
     repo-panel > section { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .repository-facts > dl { grid-template-columns: minmax(7rem, 0.28fr) minmax(0, 1fr); }
     .repository-facts > dl dd {

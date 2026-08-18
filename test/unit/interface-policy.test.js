@@ -416,27 +416,29 @@ test("capture input and submit button share the medium-width row", async () => {
   ]);
 });
 
-test("index header aligns logout and wraps it on compact screens", async () => {
+test("index header places the filter responsively beside the title", async () => {
   const repositories = parseCss(await asset("repositories.css"));
   assertOwnRule(repositories, ".index-header", {
-    display: "flex",
-    "flex-wrap": "wrap",
-    "align-items": "flex-start",
-    "justify-content": "space-between",
+    display: "grid",
+    "grid-template-columns": "minmax(0, 1fr)",
+    "align-items": "start",
     gap: "var(--space-3)",
   });
   assertOwnRule(repositories, ".index-header > h1", {
     "font-size": "2rem",
+    "grid-column": "1",
+    "grid-row": "1",
   });
-  assertOwnRule(repositories, ".index-header > form", {
-    "margin-inline-start": "auto",
+  assertOwnRule(repositories, ".index-header > repo-filter", { "min-width": "0" });
+  assertOwnRule(repositories, ":where(.index-header) > form", {
+    "justify-self": "end",
   });
-  const compact = descendants(repositories).filter((node) => node.kind === "at-rule" &&
-    node.prelude === normalizeAtRule("@media (max-width: 599px)"));
-  assert.equal(compact.length, 1);
-  assertOwnRule(compact[0].children, ".index-header > form", {
-    "flex-basis": "100%",
-    "justify-items": "end",
+  assertOwnRule(repositories, "repo-filter > form", {
+    "grid-template-columns": "1fr",
+    "align-items": "end",
+    padding: "0",
+    background: "transparent",
+    border: "0",
   });
 });
 
@@ -518,6 +520,10 @@ test("each standalone navigation selector owns its normalized 44px target declar
     "a[data-repository-detail-link]:not([hidden])",
     ".category-filter > a",
   ]) assertOwnRule(repositories, selector, navigationTarget);
+  assertOwnRule(repositories, "a[data-repository-link]", {
+    "align-self": "start",
+    "text-decoration": "none",
+  });
   assertOwnRule(repositories, ".category-filter", {
     display: "flex",
     gap: "var(--space-2)",
@@ -579,8 +585,24 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories,
     "repo-capture [data-capture-status]:has([data-capture-message]:empty)", { display: "none" });
   assertOwnRule(repositories, 'main > p[role="status"]:empty', { display: "none" });
+  assertOwnRule(repositories, "repo-panel article > p", {
+    "background-color": "var(--color-bg-subtle)",
+  });
+  assertOwnRule(repositories, 'repo-panel article > p[data-analysis-summary-status="error"]', {
+    "background-color": "var(--color-bg-danger)",
+  });
   assertOwnRule(repositories, "repo-panel article dl", {
     "grid-template-columns": "max-content minmax(0, 1fr)",
+    gap: "var(--space-1) var(--space-3)",
+  });
+  assertOwnRule(repositories, "repo-panel article dl > :where(dt, dd)", {
+    "padding-block": "var(--space-1)",
+  });
+  assertOwnRule(repositories, "repo-panel article dl > dd", {
+    "border-bottom": "1px solid var(--color-border-subtle)",
+  });
+  assertOwnRule(repositories, "repo-panel article dl > dd:last-of-type", {
+    "border-bottom": "0",
   });
 
   /** @type {Array<[string, { filter?: number, gallery: number }]>} */

@@ -146,8 +146,8 @@ test("reference widths use the approved grid without horizontal overflow", async
     });
     expect(layout.selectPaddingEnd).toBeGreaterThanOrEqual(32);
     expect(layout.headingFontSize).toBe(32);
-    expect(Math.abs(layout.avatarWidth - 45)).toBeLessThanOrEqual(1);
-    expect(Math.abs(layout.avatarHeight - 45)).toBeLessThanOrEqual(1);
+    expect(Math.abs(layout.avatarWidth - 48)).toBeLessThanOrEqual(1);
+    expect(Math.abs(layout.avatarHeight - 48)).toBeLessThanOrEqual(1);
     expect(layout.avatarRadius).toBe("50%");
     expect(layout.avatarLeft).toBeGreaterThanOrEqual(layout.cardLeft);
     expect(layout.avatarRight).toBeLessThanOrEqual(layout.cardRight);

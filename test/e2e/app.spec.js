@@ -160,15 +160,26 @@ test("analysis failure cards keep red failure accents without a detail link", as
 });
 
 test("repository card exposes separate detail and memo actions", async ({ page }) => {
+  await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
   const card = page.locator("repo-panel article").first();
   const detail = card.getByRole("link", { name: "자세히 보기", exact: true });
   const memo = card.locator("[data-repository-link]");
+  const actions = card.locator(".repository-actions");
+  const summary = card.locator("[data-analysis-summary-status]");
 
   await expect(detail).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+$/);
   await expect(detail).toHaveCSS("text-decoration-line", "none");
   await expect(memo).toHaveText("Memo");
   await expect(memo).toHaveCSS("text-decoration-line", "none");
+  await expect(summary).toHaveCSS("font-weight", "500");
+  const [actionsBox, memoBox] = await Promise.all([actions.boundingBox(), memo.boundingBox()]);
+  expect(actionsBox).not.toBeNull();
+  expect(memoBox).not.toBeNull();
+  if (!actionsBox || !memoBox) throw new Error("repository_action_bounds_missing");
+  expect(Math.abs((actionsBox.x + actionsBox.width) - (memoBox.x + memoBox.width))).toBeLessThanOrEqual(1);
+  await detail.hover();
+  await expect(detail).toHaveCSS("color", "rgb(159, 47, 45)");
 });
 
 test("repository actions stay 44px tall with uneven card content", async ({ page, harness }) => {

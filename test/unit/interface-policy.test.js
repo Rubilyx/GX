@@ -476,7 +476,7 @@ test("each navigation selector owns its normalized 44px target declarations", as
   assertOwnRule(core, 'body > a[href="#main"]', navigationTarget);
   assertOwnRule(repositories, "repo-panel article h2", {
     display: "grid",
-    "grid-template-columns": "45px minmax(0, 1fr)",
+    "grid-template-columns": "48px minmax(0, 1fr)",
     gap: "var(--space-3)",
     "align-items": "start",
     "padding-inline-end": "2.75rem",
@@ -507,8 +507,8 @@ test("each navigation selector owns its normalized 44px target declarations", as
   assert.deepEqual([...deleteHover.declarations.keys()], ["color"]);
   assertOwnRule(repositories, ".repository-avatar", {
     display: "block",
-    width: "45px",
-    height: "45px",
+    width: "48px",
+    height: "48px",
     "border-radius": "50%",
     "object-fit": "cover",
   });
@@ -535,6 +535,13 @@ test("each navigation selector owns its normalized 44px target declarations", as
     "align-self": "start",
     "text-decoration": "none",
   });
+  assertOwnRule(repositories, ".repository-actions > [data-repository-link]", {
+    "margin-inline-start": "auto",
+  });
+  const detailHover = assertOwnRule(repositories, ".repository-actions > a:first-child:hover", {
+    color: "var(--color-status-danger)",
+  });
+  assert.deepEqual([...detailHover.declarations.keys()], ["color"]);
   assertOwnRule(repositories, ".category-filter", {
     display: "flex",
     gap: "var(--space-2)",
@@ -598,6 +605,7 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories, 'main > p[role="status"]:empty', { display: "none" });
   assertOwnRule(repositories, "repo-panel article > p", {
     "background-color": "var(--color-bg-subtle)",
+    "font-weight": "500",
   });
   assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"]', {
     color: "var(--color-text-secondary)",

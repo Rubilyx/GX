@@ -95,7 +95,7 @@
 
   repo-panel article h2 {
     display: grid;
-    grid-template-columns: 45px minmax(0, 1fr);
+    grid-template-columns: 48px minmax(0, 1fr);
     gap: var(--space-3);
     align-items: start;
     padding-inline-end: 2.75rem;
@@ -107,6 +107,7 @@
     background-color: var(--color-bg-subtle);
     border: 1px solid var(--color-border-default);
     border-radius: var(--radius-control);
+    font-weight: 500;
   }
 
   repo-panel article[data-analysis-card-status="error"] > p {
@@ -142,8 +143,8 @@
 
   .repository-avatar {
     display: block;
-    width: 45px;
-    height: 45px;
+    width: 48px;
+    height: 48px;
     border-radius: 50%;
     object-fit: cover;
   }
@@ -168,6 +169,8 @@
     text-decoration: none;
   }
 
+  .repository-actions > [data-repository-link] { margin-inline-start: auto; }
+
   .repository-actions > a,
   nav[aria-label="페이지"] > a,
   a[data-repository-detail-link]:not([hidden]) {
@@ -182,6 +185,8 @@
     min-block-size: 2.75rem;
     text-decoration: none;
   }
+
+  .repository-actions > a:first-child:hover { color: var(--color-status-danger); }
 
   repo-panel article dl {
     display: grid;

@@ -105,7 +105,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(html, /name="csrf" value="csrf&quot;x"/);
   assert.match(html, /<form[^>]*method="post"[^>]*action="\/session\/logout"/);
   assert.match(html,
-    /<img class="repository-avatar" src="https:\/\/github\.com\/a%2Fb%3Cscript%3E\.png\?size=80" alt="" width="45" height="45" loading="lazy" decoding="async" referrerpolicy="no-referrer">/);
+    /<img class="repository-avatar" src="https:\/\/avatars\.githubusercontent\.com\/a%2Fb%3Cscript%3E" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer">/);
   assert.match(html,
     /<span class="repository-title"><span class="repository-owner">a\/b&lt;script&gt;\/<\/span><span class="repository-name">x\?y&quot;&gt;&lt;img src=x&gt;<\/span><\/span>/);
   assert.doesNotMatch(html, /data-repository-source-link|target="_blank"/);

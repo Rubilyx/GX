@@ -120,7 +120,7 @@ function repositoryCard(repository) {
     ? "AI 분석 실패"
     : statusText(repository.analysisStatus));
   const owner = encodeURIComponent(repository.owner);
-  const avatar = `https://github.com/${owner}.png?size=80`;
+  const avatar = `https://avatars.githubusercontent.com/${owner}`;
   const detail = `/repositories/${encodeURIComponent(repository.id)}`;
   const label = `${repository.owner}/${repository.name} 삭제`;
   const remove = `<a data-repository-delete href="${htmlAttr(`${detail}#delete-heading`)}" aria-label="${htmlAttr(label)}"><span aria-hidden="true">×</span></a>`;
@@ -128,7 +128,7 @@ function repositoryCard(repository) {
   const actions = analysisStatus === "error"
     ? ""
     : `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(detail)}">Memo</a></div>`;
-  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="45" height="45" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p><dl><dt>Primary category</dt><dd>${htmlText(repository.primaryCategory || "미분류")}</dd><dt>Tags</dt><dd>${htmlText(repository.tags?.join(", ") || "없음")}</dd><dt>Stars</dt><dd>${htmlText(repository.stars)}</dd><dt>Forks</dt><dd>${htmlText(repository.forks)}</dd><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd><dt>Analysis status</dt><dd>${statusBadge(repository.analysisStatus)}</dd></dl>${actions}</article>`;
+  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p><dl><dt>Primary category</dt><dd>${htmlText(repository.primaryCategory || "미분류")}</dd><dt>Tags</dt><dd>${htmlText(repository.tags?.join(", ") || "없음")}</dd><dt>Stars</dt><dd>${htmlText(repository.stars)}</dd><dt>Forks</dt><dd>${htmlText(repository.forks)}</dd><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd><dt>Analysis status</dt><dd>${statusBadge(repository.analysisStatus)}</dd></dl>${actions}</article>`;
 }
 
 /** @param {{ q?: string, category?: string, tag?: string }} filters @param {number} page */

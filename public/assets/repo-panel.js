@@ -48,9 +48,11 @@ class RepoPanel extends HTMLElement {
     const deleteDialog = this.querySelector("[data-repository-delete-dialog]");
     const deleteForm = deleteDialog?.querySelector("[data-repository-delete-form]");
     const deleteConfirm = deleteDialog?.querySelector("[data-repository-delete-confirm]");
+    const deleteCancel = deleteDialog?.querySelector("[data-repository-delete-cancel]");
     const deleteSupported = typeof HTMLDialogElement !== "undefined" &&
       deleteDialog instanceof HTMLDialogElement && typeof deleteDialog.showModal === "function" &&
-      deleteForm instanceof HTMLFormElement && deleteConfirm instanceof HTMLButtonElement;
+      deleteForm instanceof HTMLFormElement && deleteConfirm instanceof HTMLButtonElement &&
+      deleteCancel instanceof HTMLButtonElement;
     if (deleteSupported) {
       deleteDialog.addEventListener("close", () => {
         deleteForm.removeAttribute("action");
@@ -83,14 +85,17 @@ class RepoPanel extends HTMLElement {
       const name = article?.querySelector(".repository-name");
       const form = dialog.querySelector("[data-repository-delete-form]");
       const confirm = dialog.querySelector("[data-repository-delete-confirm]");
+      const cancel = dialog.querySelector("[data-repository-delete-cancel]");
       if (!(owner instanceof HTMLElement) || !(name instanceof HTMLElement) ||
-        !(form instanceof HTMLFormElement) || !(confirm instanceof HTMLButtonElement))
+        !(form instanceof HTMLFormElement) || !(confirm instanceof HTMLButtonElement) ||
+        !(cancel instanceof HTMLButtonElement))
         throw new Error("missing_delete_nodes");
       setText(dialog, "[data-repository-delete-name]", `${owner.textContent}${name.textContent}`);
       form.setAttribute("action", `${source.pathname}/delete`);
       confirm.disabled = false;
       this.deleteOpener = link;
       dialog.showModal();
+      cancel.focus();
     } catch {
       location.href = original;
     }

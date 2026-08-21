@@ -360,6 +360,39 @@
 
   main > section form, main > section + section { margin-top: var(--space-4); }
 
+  .repository-delete-target {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-3);
+    background: var(--color-bg-subtle);
+    border-radius: var(--radius-control);
+  }
+
+  .repository-delete-target > span {
+    color: var(--color-text-secondary);
+    font-size: var(--text-sm);
+  }
+
+  .repository-delete-target > strong { overflow-wrap: anywhere; }
+  .repository-delete-warning { color: var(--color-status-danger); }
+
+  .repository-delete-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-6);
+  }
+
+  .repository-delete-actions > form { display: block; }
+
+  [data-repository-delete-cancel] {
+    color: var(--color-text-primary);
+    background: var(--color-bg-surface);
+  }
+
+  [data-repository-delete-cancel]:hover { background: var(--color-bg-subtle); }
+
   @media (min-width: 600px) {
     .index-header { grid-template-columns: minmax(0, 1fr) auto; }
     .index-header > repo-filter { grid-column: 1 / -1; grid-row: 2; }

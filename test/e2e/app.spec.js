@@ -327,6 +327,14 @@ test("card delete dialog fits its confirmation content at the desktop reference 
   await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
   const dialog = page.locator("[data-repository-delete-dialog]");
   await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "저장소를 삭제할까요?" })).toBeVisible();
+  await expect(dialog.getByText("삭제 대상", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("저장소와 개인 메모가 영구 삭제되며 복구할 수 없습니다.", {
+    exact: true,
+  })).toBeVisible();
+  const cancel = dialog.getByRole("button", { name: "취소", exact: true });
+  const remove = dialog.getByRole("button", { name: "저장소 삭제", exact: true });
+  await expect(cancel).toBeFocused();
   const geometry = await dialog.evaluate((element) => {
     const box = element.getBoundingClientRect();
     const style = getComputedStyle(element);
@@ -343,6 +351,11 @@ test("card delete dialog fits its confirmation content at the desktop reference 
   expect(Math.abs(geometry.centerX - 1389 / 2)).toBeLessThanOrEqual(1);
   expect(Math.abs(geometry.centerY - 1379 / 2)).toBeLessThanOrEqual(1);
   expect(geometry.radius).toBe("12px");
+  const [cancelBox, removeBox] = await Promise.all([cancel.boundingBox(), remove.boundingBox()]);
+  expect(cancelBox).not.toBeNull();
+  expect(removeBox).not.toBeNull();
+  expect(Math.abs((cancelBox?.y ?? 0) - (removeBox?.y ?? 0))).toBeLessThanOrEqual(1);
+  expect((removeBox?.x ?? 0)).toBeGreaterThan(cancelBox?.x ?? 0);
 });
 
 test("card delete confirms, restores focus, and submits the protected native form", async ({ page }) => {
@@ -366,7 +379,7 @@ test("card delete confirms, restores focus, and submits the protected native for
   await opener.click();
   const deletion = page.waitForRequest((request) =>
     request.method() === "POST" && /\/repositories\/[0-9a-f-]+\/delete$/.test(new URL(request.url()).pathname));
-  await dialog.getByRole("button", { name: "삭제", exact: true }).click();
+  await dialog.getByRole("button", { name: "저장소 삭제", exact: true }).click();
   const request = await deletion;
   expect(request.postData()).toContain("confirm=yes");
   expect(request.postData()).toContain("csrf=");

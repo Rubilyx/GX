@@ -110,16 +110,19 @@ test("index exposes complete native forms and safe enhancement controls", () => 
     /<span class="repository-title"><span class="repository-owner">a\/b&lt;script&gt;\/<\/span><span class="repository-name">x\?y&quot;&gt;&lt;img src=x&gt;<\/span><\/span>/);
   assert.doesNotMatch(html, /data-repository-source-link|target="_blank"/);
   assert.match(html,
-    /<dl><dt>Primary category<\/dt><dd>[\s\S]*?<dt>Tags<\/dt>[\s\S]*?<dt>Stars<\/dt>[\s\S]*?<dt>Forks<\/dt>[\s\S]*?<dt>Language<\/dt>[\s\S]*?<dt>Analysis status<\/dt>/);
+    /<dl class="repository-metadata"><div data-repository-field="category"><dt>Primary category<\/dt><dd><span class="repository-badge repository-badge--primary">Backend&quot;&gt;&lt;script&gt;<\/span><\/dd><\/div>/);
+  assert.match(html,
+    /<div data-repository-field="tags"><dt>Tags<\/dt><dd><span class="repository-badge-list"><span class="repository-badge">tag&quot;&gt;&lt;script&gt;<\/span><\/span><\/dd><\/div>/);
   const card = html.match(/<article[^>]*>[\s\S]*?<\/article>/)?.[0] ?? "";
   assert.match(card, /^<article data-analysis-card-status="error">/);
-  assert.doesNotMatch(card, /data-repository-link/);
+  assert.match(card,
+    /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">Memo<\/a><\/div>/);
   assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
+  assert.doesNotMatch(card, /<dt>Analysis status<\/dt>/);
   assert.match(card,
     /<a data-repository-delete href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#delete-heading" aria-label="[^"]+ 삭제"><span aria-hidden="true">×<\/span><\/a>/);
   for (const korean of ["주 분류", "태그", "별", "포크", "언어", "분석 상태"])
     assert.doesNotMatch(card, new RegExp(`<dt>${korean}<\\/dt>`));
-  assert.match(html, /data-analysis-status="error"[^>]*><span class="status-marker" aria-hidden="true"><\/span>분석 오류<\/span>/);
   assert.match(html, /<dialog data-repository-dialog aria-labelledby="repository-dialog-heading">[\s\S]*<h2 id="repository-dialog-heading">저장소 상세<\/h2>/);
   const deleteDialog = html.match(
     /<dialog data-repository-delete-dialog[\s\S]*?<\/dialog>/,
@@ -195,14 +198,20 @@ test("index uses the terse analysis failure fallback", () => {
   assert.doesNotMatch(html, /AI 분석을 완료하지 못했습니다/);
 });
 
-test("index separates detail navigation from the memo dialog opener", () => {
+test("index compacts card metadata without replacing AI failure content", () => {
   const html = renderIndexPage({
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
     repositories: [
-      { ...repository, summary: null },
+      {
+        ...repository, summary: null, description: "GitHub fallback must stay hidden",
+        primaryCategory: null, tags: [], primaryLanguage: null,
+        stars: 999, forks: 1_000,
+      },
       {
         ...repository, id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         owner: "Ready", name: "repository", summary: "분석 완료 요약", analysisStatus: "ready",
+        primaryCategory: "Design", tags: ["safe", `tag<script>`],
+        primaryLanguage: "JavaScript", stars: 10_500, forks: 1_000_000,
       },
     ],
     filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
@@ -212,10 +221,19 @@ test("index separates detail navigation from the memo dialog opener", () => {
 
   assert.equal(cards.length, 2);
   assert.match(cards[0], /^<article data-analysis-card-status="error">/);
-  assert.doesNotMatch(cards[0], /class="repository-actions"/);
+  assert.match(cards[0], /<p data-analysis-summary-status="error">AI 분석 실패<\/p>/);
+  assert.doesNotMatch(cards[0], /GitHub fallback must stay hidden|<dt>Analysis status<\/dt>/);
+  assert.match(cards[0], /data-repository-field="stars"[\s\S]*?<dd>999<\/dd>/);
+  assert.match(cards[0], /data-repository-field="forks"[\s\S]*?<dd>1K<\/dd>/);
   assert.match(cards[1], /^<article>/);
-  assert.match(cards[1],
-    /<div class="repository-actions"><a href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">자세히 보기<\/a><a data-repository-link href="\/repositories\/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb">Memo<\/a><\/div>/);
+  assert.match(cards[1], /data-repository-field="stars"[\s\S]*?<dd>10\.5K<\/dd>/);
+  assert.match(cards[1], /data-repository-field="forks"[\s\S]*?<dd>1M<\/dd>/);
+  assert.match(cards[1], /<span class="repository-badge">tag&lt;script&gt;<\/span>/);
+  assert.doesNotMatch(cards[1], /tag<script>/);
+  for (const current of cards) {
+    assert.match(current,
+      /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Memo<\/a><\/div>/);
+  }
 });
 
 test("repository document renders canonical GitHub URL and all native mutation forms", () => {
@@ -256,8 +274,10 @@ test("analysis status hooks admit only fixed own values", () => {
     availableTags: [], page: 1, totalPages: 2, flash: "",
   });
   for (const status of ["ready", "pending", "error"])
-    assert.equal((html.match(new RegExp(`data-analysis-status="${status}"`, "g")) ?? []).length, 1);
-  assert.doesNotMatch(html, /data-analysis-status="constructor"|function Object|native code/);
+    assert.equal((html.match(new RegExp(`data-analysis-summary-status="${status}"`, "g")) ?? []).length, 1);
+  assert.equal((html.match(/data-analysis-card-status="error"/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /data-analysis-(?:summary-)?status="constructor"|function Object|native code/);
+  assert.doesNotMatch(html, /<dt>Analysis status<\/dt>|data-analysis-status=/);
   assert.match(html, /상태 확인 필요/);
   assert.match(html, /<p data-analysis-summary-status="error">AI 분석 실패<\/p>/);
   assert.match(html, /<nav aria-label="페이지">[\s\S]*<a rel="next"/);

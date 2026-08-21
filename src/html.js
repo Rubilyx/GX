@@ -113,6 +113,15 @@ export function renderLoginPage({ releaseId, errorCode = "" }) {
   });
 }
 
+/** @param {number} value */
+function compactMetric(value) {
+  if (value < 1_000) return String(value);
+  const divisor = value < 1_000_000 ? 1_000 : 1_000_000;
+  const suffix = value < 1_000_000 ? "K" : "M";
+  const scaled = Math.round((value / divisor) * 10) / 10;
+  return `${scaled}${suffix}`;
+}
+
 /** @param {any} repository */
 function repositoryCard(repository) {
   const analysisStatus = statusKey(repository.analysisStatus);
@@ -125,10 +134,14 @@ function repositoryCard(repository) {
   const label = `${repository.owner}/${repository.name} 삭제`;
   const remove = `<a data-repository-delete href="${htmlAttr(`${detail}#delete-heading`)}" aria-label="${htmlAttr(label)}"><span aria-hidden="true">×</span></a>`;
   const cardStatus = analysisStatus === "error" ? ' data-analysis-card-status="error"' : "";
-  const actions = analysisStatus === "error"
-    ? ""
-    : `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(detail)}">Memo</a></div>`;
-  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p><dl><dt>Primary category</dt><dd>${htmlText(repository.primaryCategory || "미분류")}</dd><dt>Tags</dt><dd>${htmlText(repository.tags?.join(", ") || "없음")}</dd><dt>Stars</dt><dd>${htmlText(repository.stars)}</dd><dt>Forks</dt><dd>${htmlText(repository.forks)}</dd><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd><dt>Analysis status</dt><dd>${statusBadge(repository.analysisStatus)}</dd></dl>${actions}</article>`;
+  const category = repository.primaryCategory || "미분류";
+  /** @type {string[]} */
+  const tags = repository.tags?.length ? repository.tags : ["없음"];
+  const tagBadges = tags.map((tag) =>
+    `<span class="repository-badge">${htmlText(tag)}</span>`).join("");
+  const metadata = `<dl class="repository-metadata"><div data-repository-field="category"><dt>Primary category</dt><dd><span class="repository-badge repository-badge--primary">${htmlText(category)}</span></dd></div><div data-repository-field="tags"><dt>Tags</dt><dd><span class="repository-badge-list">${tagBadges}</span></dd></div><div data-repository-field="stars"><dt>Stars</dt><dd>${htmlText(compactMetric(repository.stars))}</dd></div><div data-repository-field="forks"><dt>Forks</dt><dd>${htmlText(compactMetric(repository.forks))}</dd></div><div data-repository-field="language"><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd></div></dl>`;
+  const actions = `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(detail)}">Memo</a></div>`;
+  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p>${metadata}${actions}</article>`;
 }
 
 /** @param {{ q?: string, category?: string, tag?: string }} filters @param {number} page */

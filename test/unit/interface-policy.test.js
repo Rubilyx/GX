@@ -614,19 +614,40 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"] > p', {
     "background-color": "var(--color-bg-danger)",
   });
-  assertOwnRule(repositories, "repo-panel article dl", {
-    "grid-template-columns": "max-content minmax(0, 1fr)",
-    gap: "var(--space-1) var(--space-3)",
+  assertOwnRule(repositories, ".repository-metadata", {
+    display: "grid",
+    "grid-template-columns": "repeat(3, minmax(0, 1fr))",
+    gap: "var(--space-3)",
   });
-  assertOwnRule(repositories, "repo-panel article dl > :where(dt, dd)", {
-    "padding-block": "var(--space-2)",
+  assertOwnRule(repositories, ".repository-metadata > div", { "min-width": "0" });
+  assertOwnRule(repositories,
+    '.repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"])',
+    { "grid-column": "1 / -1" });
+  assertOwnRule(repositories, ".repository-metadata dt", {
+    color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
   });
-  assertOwnRule(repositories, "repo-panel article dl > dd", {
-    "border-bottom": "1px solid var(--color-border-subtle)",
+  assertOwnRule(repositories, ".repository-metadata dd", {
+    "margin-top": "var(--space-1)", "overflow-wrap": "anywhere",
   });
-  assertOwnRule(repositories, "repo-panel article dl > dd:last-of-type", {
-    "border-bottom": "0",
+  assertOwnRule(repositories, ".repository-badge-list", {
+    display: "flex", "flex-wrap": "wrap", gap: "var(--space-2)",
   });
+  assertOwnRule(repositories, ".repository-badge", {
+    display: "inline-flex", "align-items": "center", "max-width": "100%",
+    padding: "var(--space-1) var(--space-2)",
+    border: "1px solid var(--color-border-default)",
+    "border-radius": "999px", "font-size": "var(--text-sm)",
+  });
+  assertOwnRule(repositories, ".repository-badge--primary", {
+    color: "#ffffff", "background-color": "var(--color-action-primary)",
+    "border-color": "var(--color-action-primary)",
+  });
+  const metricFields = '.repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"])';
+  assertOwnRule(repositories, metricFields, {
+    "padding-block-start": "var(--space-3)",
+    "border-top": "1px solid var(--color-border-subtle)",
+  });
+  assertOwnRule(repositories, `${metricFields} dd`, { "font-weight": "650" });
 
   /** @type {Array<[string, { filter?: number, gallery: number }]>} */
   const responsiveRules = [

@@ -58,25 +58,14 @@ test("reference widths use the approved grid without horizontal overflow", async
       const card = avatar.closest("article");
       const searchLabel = search.closest("label");
       const tagLabel = tag.closest("label");
-      const factLabels = [...gallery.querySelectorAll("article:first-of-type dt")];
       if (!(searchLabel instanceof HTMLLabelElement) ||
           !(tagLabel instanceof HTMLLabelElement) ||
-          !(card instanceof HTMLElement) || factLabels.length === 0)
+          !(card instanceof HTMLElement))
         throw new Error("responsive_layout_nodes_missing");
-      let widestFactTextRight = 0;
-      let widestFactWidth = -1;
-      let factValue = null;
-      for (const factLabel of factLabels) {
-        const range = document.createRange();
-        range.selectNodeContents(factLabel);
-        const textBox = range.getBoundingClientRect();
-        if (textBox.width > widestFactWidth) {
-          widestFactWidth = textBox.width;
-          widestFactTextRight = textBox.right;
-          factValue = factLabel.nextElementSibling;
-        }
-      }
-      if (!(factValue instanceof HTMLElement)) throw new Error("responsive_fact_value_missing");
+      const metadata = card.querySelector(".repository-metadata");
+      const badges = [...card.querySelectorAll(".repository-badge")];
+      if (!(metadata instanceof HTMLElement) || badges.length === 0)
+        throw new Error("responsive_repository_metadata_missing");
       const headerBox = header.getBoundingClientRect();
       const headingBox = heading.getBoundingClientRect();
       const logoutBox = logout.getBoundingClientRect();
@@ -84,6 +73,7 @@ test("reference widths use the approved grid without horizontal overflow", async
       const nameBox = name.getBoundingClientRect();
       const avatarBox = avatar.getBoundingClientRect();
       const cardBox = card.getBoundingClientRect();
+      const metadataBox = metadata.getBoundingClientRect();
       const tagLabelBox = tagLabel.getBoundingClientRect();
       const searchControlBox = search.getBoundingClientRect();
       const tagControlBox = tag.getBoundingClientRect();
@@ -105,7 +95,9 @@ test("reference widths use the approved grid without horizontal overflow", async
         tagBottom: tagLabelBox.bottom,
         buttonTop: submitBox.top,
         buttonBottom: submitBox.bottom,
-        factColumnGap: factValue.getBoundingClientRect().left - widestFactTextRight,
+        metadataColumns: getComputedStyle(metadata).gridTemplateColumns.split(" ").length,
+        metadataInsideCard: metadataBox.left >= cardBox.left && metadataBox.right <= cardBox.right,
+        badgeOverflow: badges.some((badge) => badge.scrollWidth > badge.clientWidth),
         titleDecoration: getComputedStyle(title).textDecorationLine,
         headerRight: headerBox.right,
         headingTop: headingBox.top,
@@ -142,6 +134,9 @@ test("reference widths use the approved grid without horizontal overflow", async
       filter: scenario.filter,
       filterInsideHeader: true,
       gallery: scenario.gallery,
+      metadataColumns: 3,
+      metadataInsideCard: true,
+      badgeOverflow: false,
       titleDecoration: "none",
     });
     expect(layout.selectPaddingEnd).toBeGreaterThanOrEqual(32);
@@ -151,7 +146,6 @@ test("reference widths use the approved grid without horizontal overflow", async
     expect(layout.avatarRadius).toBe("50%");
     expect(layout.avatarLeft).toBeGreaterThanOrEqual(layout.cardLeft);
     expect(layout.avatarRight).toBeLessThanOrEqual(layout.cardRight);
-    expect(Math.abs(layout.factColumnGap - 12)).toBeLessThanOrEqual(1);
     expect(Math.abs(layout.main - scenario.max)).toBeLessThanOrEqual(1);
     expect(Math.abs(layout.logoutRight - layout.headerRight)).toBeLessThanOrEqual(1);
     expect(layout.captureStatusDisplay).toBe("none");

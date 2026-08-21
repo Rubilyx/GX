@@ -188,14 +188,59 @@
 
   .repository-actions > a:first-child:hover { color: var(--color-status-danger); }
 
-  repo-panel article dl {
+  .repository-metadata {
     display: grid;
-    grid-template-columns: max-content minmax(0, 1fr);
-    gap: var(--space-1) var(--space-3);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-3);
   }
 
-  repo-panel article dl > :where(dt, dd) {
-    padding-block: var(--space-2);
+  .repository-metadata > div { min-width: 0; }
+
+  .repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"]) {
+    grid-column: 1 / -1;
+  }
+
+  .repository-metadata dt {
+    color: var(--color-text-secondary);
+    font-size: var(--text-sm);
+  }
+
+  .repository-metadata dd {
+    margin-top: var(--space-1);
+    overflow-wrap: anywhere;
+  }
+
+  .repository-badge-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .repository-badge {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: var(--space-1) var(--space-2);
+    background-color: var(--color-bg-subtle);
+    border: 1px solid var(--color-border-default);
+    border-radius: 999px;
+    font-size: var(--text-sm);
+    overflow-wrap: anywhere;
+  }
+
+  .repository-badge--primary {
+    color: #ffffff;
+    background-color: var(--color-action-primary);
+    border-color: var(--color-action-primary);
+  }
+
+  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]) {
+    padding-block-start: var(--space-3);
+    border-top: 1px solid var(--color-border-subtle);
+  }
+
+  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]) dd {
+    font-weight: 650;
   }
 
   .repository-facts > dl {
@@ -203,11 +248,6 @@
     grid-template-columns: 1fr;
     margin-top: var(--space-4);
   }
-
-  repo-panel article dt { color: var(--color-text-secondary); font-size: var(--text-sm); }
-  repo-panel article dd { overflow-wrap: anywhere; }
-
-  repo-panel article dl > dd { border-bottom: 1px solid var(--color-border-subtle); }
 
   .repository-facts > dl dt,
   .repository-facts > dl dd {
@@ -223,8 +263,6 @@
     font-size: var(--text-sm);
     font-weight: 650;
   }
-
-  repo-panel article dl > dd:last-of-type { border-bottom: 0; }
 
   .repository-facts > dl dt:first-child,
   .repository-facts > dl dt:first-child + dd { border-top: 0; }

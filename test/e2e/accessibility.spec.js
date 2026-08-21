@@ -63,7 +63,7 @@ test("WebKit keeps dialog focus trapped and returns it after a pointer open", as
   await expect(opener).toBeFocused();
 });
 
-test("capture announces only changed live status text and status has non-color text", async ({ page }) => {
+test("capture announces only changed live status text and ready cards retain summary text", async ({ page }) => {
   await page.goto("/");
   const status = page.locator("[data-capture-status]");
   await expect(status).toHaveText("");
@@ -81,7 +81,8 @@ test("capture announces only changed live status text and status has non-color t
     await page.getByRole("button", { name: "저장" }).click();
     await expect(status).toHaveText("저장 중입니다.");
     await expect(page.getByRole("button", { name: "저장" })).toBeDisabled();
-    await expect(page.locator("[data-analysis-status='ready']")).toHaveText("분석 완료");
+    await expect(page.locator('[data-analysis-summary-status="ready"]'))
+      .toHaveText("예제 저장소의 핵심 사용법을 보여준다.");
   } finally {
     release();
   }

@@ -136,7 +136,7 @@ test("repository descriptions keep their bordered bubble spacing", async ({ page
   });
 });
 
-test("analysis failure cards keep red failure accents without a detail link", async ({ page, harness }) => {
+test("analysis failure cards keep one failure message and expose both actions", async ({ page, harness }) => {
   await loginAndSeed(page);
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB, {
@@ -149,14 +149,16 @@ test("analysis failure cards keep red failure accents without a detail link", as
 
   const card = page.locator('article[data-analysis-card-status="error"]');
   const description = card.locator('[data-analysis-summary-status="error"]');
-  const badge = card.locator('[data-analysis-status="error"]');
+  const detail = card.getByRole("link", { name: "자세히 보기", exact: true });
+  const memo = card.locator("[data-repository-link]");
   await expect(card).toHaveCSS("background-color", "rgb(241, 240, 237)");
   await expect(card).toHaveCSS("color", "rgb(107, 105, 99)");
   await expect(description).toHaveText("AI 분석 실패");
   await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
-  await expect(badge).toHaveCSS("background-color", "rgb(253, 235, 236)");
-  await expect(badge).toHaveCSS("color", "rgb(159, 47, 45)");
-  await expect(card.locator("[data-repository-link]")).toHaveCount(0);
+  await expect(card.locator('[data-analysis-status="error"]')).toHaveCount(0);
+  await expect(detail).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+  await expect(memo).toHaveText("Memo");
+  await expect(memo).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
 });
 
 test("repository card exposes separate detail and memo actions", async ({ page }) => {
@@ -202,8 +204,10 @@ test("repository actions stay 44px tall with uneven card content", async ({ page
   });
   await page.reload();
 
-  expect(await page.locator(".repository-actions > a").evaluateAll((links) =>
-    links.map((link) => link.getBoundingClientRect().height))).toEqual([44, 44, 44, 44]);
+  const heights = await page.locator(".repository-actions > a").evaluateAll((links) =>
+    links.map((link) => link.getBoundingClientRect().height));
+  expect(heights).toHaveLength(6);
+  expect(heights.every((height) => height === 44)).toBe(true);
 });
 
 test("repository summary boxes keep their top edge fixed with uneven text", async ({ page, harness }) => {
@@ -242,59 +246,48 @@ test("repository summary boxes keep their top edge fixed with uneven text", asyn
   expect(summaries["Pair/lengthy"].height).toBeGreaterThan(summaries["Pair/short"].height);
 });
 
-test("repository metadata keeps lighter dividers in the value column", async ({ page }) => {
+test("repository metadata presents taxonomy badges and compact metrics", async ({ page }) => {
   await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
-  const metadata = page.locator("repo-panel article > dl").first();
+  const metadata = page.locator(".repository-metadata").first();
 
   expect(await metadata.evaluate((element) => {
-    const firstLabel = element.firstElementChild;
-    const firstValue = firstLabel?.nextElementSibling;
-    const lastValue = element.lastElementChild;
-    const lastLabel = lastValue?.previousElementSibling;
-    if (!(firstLabel instanceof HTMLElement) || !(firstValue instanceof HTMLElement) ||
-        !(lastLabel instanceof HTMLElement) || !(lastValue instanceof HTMLElement))
+    const category = element.querySelector('[data-repository-field="category"]');
+    const tags = element.querySelector('[data-repository-field="tags"]');
+    const badgeList = element.querySelector(".repository-badge-list");
+    const primaryBadge = element.querySelector(".repository-badge--primary");
+    const metrics = [...element.querySelectorAll(
+      '[data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]',
+    )];
+    if (!(category instanceof HTMLElement) || !(tags instanceof HTMLElement) ||
+        !(badgeList instanceof HTMLElement) || !(primaryBadge instanceof HTMLElement) ||
+        metrics.length !== 3 || metrics.some((metric) => !(metric instanceof HTMLElement)))
       throw new Error("repository_metadata_nodes_missing");
     const style = getComputedStyle(element);
-    /** @param {HTMLElement} node */
-    const rowSpacing = (node) => {
-      const nodeStyle = getComputedStyle(node);
-      return {
-        borderStyle: nodeStyle.borderBottomStyle,
-        borderWidth: nodeStyle.borderBottomWidth,
-        paddingBottom: nodeStyle.paddingBottom,
-        paddingTop: nodeStyle.paddingTop,
-      };
-    };
-    /** @param {HTMLElement} node */
-    const dividedRowStyle = (node) => ({
-      ...rowSpacing(node), borderColor: getComputedStyle(node).borderBottomColor,
-    });
     return {
-      firstLabel: rowSpacing(firstLabel),
-      firstValue: dividedRowStyle(firstValue),
-      lastLabel: rowSpacing(lastLabel),
-      lastValue: rowSpacing(lastValue),
+      columns: style.gridTemplateColumns.split(" ").length,
       rowGap: style.rowGap,
+      categoryColumn: getComputedStyle(category).gridColumn,
+      tagsColumn: getComputedStyle(tags).gridColumn,
+      badgeListDisplay: getComputedStyle(badgeList).display,
+      badgeListWrap: getComputedStyle(badgeList).flexWrap,
+      primaryBadgeColor: getComputedStyle(primaryBadge).color,
+      metricBorders: metrics.map((metric) => getComputedStyle(metric).borderTopWidth),
+      metricWeights: metrics.map((metric) => {
+        const value = metric.querySelector("dd");
+        return value instanceof HTMLElement ? getComputedStyle(value).fontWeight : "";
+      }),
     };
   })).toEqual({
-    firstLabel: {
-      borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "8px", paddingTop: "8px",
-    },
-    firstValue: {
-      borderColor: "rgb(243, 242, 239)", borderStyle: "solid", borderWidth: "1px",
-      paddingBottom: "8px", paddingTop: "8px",
-    },
-    lastLabel: {
-      borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "8px", paddingTop: "8px",
-    },
-    lastValue: {
-      borderStyle: "none", borderWidth: "0px",
-      paddingBottom: "8px", paddingTop: "8px",
-    },
-    rowGap: "4px",
+    columns: 3,
+    rowGap: "12px",
+    categoryColumn: "1 / -1",
+    tagsColumn: "1 / -1",
+    badgeListDisplay: "flex",
+    badgeListWrap: "wrap",
+    primaryBadgeColor: "rgb(255, 255, 255)",
+    metricBorders: ["1px", "1px", "1px"],
+    metricWeights: ["650", "650", "650"],
   });
 });
 

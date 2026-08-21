@@ -17,6 +17,19 @@ export const CATEGORIES = Object.freeze([
 const TAG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EDIT_KEYS = new Set(["personalNote", "primaryCategory", "tags"]);
 
+/** @param {unknown} raw @param {string} errorCode */
+function normalizedPersonalNote(raw, errorCode) {
+  if (typeof raw !== "string") throw new AppError(errorCode, 400);
+  const personalNote = raw.trim().normalize("NFC");
+  if (personalNote.length > 4_000) throw new AppError(errorCode, 400);
+  return personalNote;
+}
+
+/** @param {unknown} raw */
+export function validatePersonalNote(raw) {
+  return normalizedPersonalNote(raw, "invalid_personal_note");
+}
+
 /** @param {unknown} raw */
 export function normalizeGitHubUrl(raw) {
   let url;
@@ -67,8 +80,8 @@ export function validateRepositoryEdit(input) {
     Object.keys(input).some((key) => !EDIT_KEYS.has(key)) ||
     typeof input.personalNote !== "string" || typeof input.primaryCategory !== "string" || !Array.isArray(input.tags))
     throw new AppError("invalid_repository_edit", 400);
-  const personalNote = input.personalNote.trim().normalize("NFC");
-  if (personalNote.length > 4_000 || !CATEGORIES.includes(input.primaryCategory))
+  const personalNote = normalizedPersonalNote(input.personalNote, "invalid_repository_edit");
+  if (!CATEGORIES.includes(input.primaryCategory))
     throw new AppError("invalid_repository_edit", 400);
   return { personalNote, primaryCategory: input.primaryCategory, tags: normalizeTags(input.tags) };
 }

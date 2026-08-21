@@ -394,6 +394,32 @@ test("desktop repository link opens the native detail dialog and restores focus"
   await expect(opener).toBeFocused();
 });
 
+test("desktop memo dialog saves an editable personal note and stays compact", async ({ page }) => {
+  test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+  await page.setViewportSize({ width: 1200, height: 900 });
+  await loginAndSeed(page);
+
+  await page.getByRole("link", { name: "Memo", exact: true }).first().click();
+  const dialog = page.locator("[data-repository-dialog]");
+  const note = dialog.getByRole("textbox", { name: "개인 메모", exact: true });
+  await note.fill("다시 확인할 개인 메모");
+  const saveResponse = page.waitForResponse((response) =>
+    /\/repositories\/[0-9a-f-]+\/note$/.test(new URL(response.url()).pathname));
+  await dialog.getByRole("button", { name: "저장", exact: true }).click();
+
+  expect((await saveResponse).status()).toBe(200);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("status")).toHaveText("저장 완료");
+  const box = await dialog.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box?.height).toBeLessThan(868);
+
+  await dialog.getByRole("button", { name: "닫기", exact: true }).click();
+  await page.getByRole("link", { name: "Memo", exact: true }).first().click();
+  await expect(dialog.getByRole("textbox", { name: "개인 메모", exact: true }))
+    .toHaveValue("다시 확인할 개인 메모");
+});
+
 test("desktop detail action navigates to the repository page", async ({ page }) => {
   test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
   await loginAndSeed(page);

@@ -196,6 +196,49 @@ test("enhanced detail and mutation routes return exact JSON shapes", async () =>
   })).status, 200);
 });
 
+test("memo route updates only the personal note and returns the saved repository", async () => {
+  const env = await harness.worker.getEnv();
+  const repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  await seedRepository(env.PROD_DB, {
+    id: repositoryId, personalNote: "이전 메모", primaryCategory: "Backend", tags: ["keep"],
+  });
+  const session = await login(harness.worker);
+
+  const response = await postForm(
+    harness.worker,
+    `/repositories/${repositoryId}/note`,
+    session,
+    { personalNote: "  새 개인 메모  " },
+    { Accept: "application/json" },
+  );
+
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(Object.keys(result), ["repository"]);
+  assert.equal(result.repository.personalNote, "새 개인 메모");
+  assert.equal(result.repository.primaryCategory, "Backend");
+  assert.deepEqual(result.repository.tags, ["keep"]);
+});
+
+test("memo route rejects notes over 4000 characters without changing stored data", async () => {
+  const env = await harness.worker.getEnv();
+  const repositoryId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  await seedRepository(env.PROD_DB, { id: repositoryId, personalNote: "보존할 메모" });
+  const session = await login(harness.worker);
+
+  const response = await postForm(
+    harness.worker,
+    `/repositories/${repositoryId}/note`,
+    session,
+    { personalNote: "x".repeat(4001) },
+    { Accept: "application/json" },
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { errorCode: "invalid_personal_note" });
+  assert.equal((await getRepository(env.PROD_DB, repositoryId))?.personalNote, "보존할 메모");
+});
+
 test("blank tags clear in JSON and native edits while internal empty entries stay invalid", async () => {
   const session = await login(harness.worker);
   const created = await postForm(harness.worker, "/repositories", session, {

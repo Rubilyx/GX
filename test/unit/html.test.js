@@ -123,18 +123,39 @@ test("index exposes complete native forms and safe enhancement controls", () => 
     /<a data-repository-delete href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#delete-heading" aria-label="[^"]+ 삭제"><span aria-hidden="true">×<\/span><\/a>/);
   for (const korean of ["주 분류", "태그", "별", "포크", "언어", "분석 상태"])
     assert.doesNotMatch(card, new RegExp(`<dt>${korean}<\\/dt>`));
-  assert.match(html, /<dialog data-repository-dialog aria-labelledby="repository-dialog-heading">[\s\S]*<h2 id="repository-dialog-heading">저장소 상세<\/h2>/);
+  const repositoryDialog = html.match(
+    /<dialog data-repository-dialog[\s\S]*?<\/dialog>/,
+  )?.[0] ?? "";
+  assert.match(repositoryDialog, /aria-labelledby="repository-dialog-heading"/);
+  assert.match(repositoryDialog, /<h2 id="repository-dialog-heading">저장소 상세<\/h2>/);
+  assert.match(repositoryDialog, /<textarea id="dialog-summary" data-repository-summary readonly><\/textarea>/);
+  assert.match(repositoryDialog,
+    /<form method="post" data-repository-note-form>[\s\S]*name="csrf" value="csrf&quot;x"/);
+  assert.match(repositoryDialog,
+    /<textarea id="dialog-note" name="personalNote" data-repository-note maxlength="4000"><\/textarea>/);
+  assert.match(repositoryDialog,
+    /<p data-repository-note-status role="status" aria-live="polite"><\/p>/);
+  assert.match(repositoryDialog, /<button type="submit" data-repository-note-save>저장<\/button>/);
+  assert.match(repositoryDialog, /<button type="button" data-repository-dialog-close>닫기<\/button>/);
+  assert.doesNotMatch(repositoryDialog, /data-repository-note[^>]*readonly/);
   const deleteDialog = html.match(
     /<dialog data-repository-delete-dialog[\s\S]*?<\/dialog>/,
   )?.[0] ?? "";
-  assert.match(deleteDialog, /aria-labelledby="repository-delete-dialog-heading"/);
-  assert.match(deleteDialog, /<strong data-repository-delete-name><\/strong>/);
+  assert.match(deleteDialog,
+    /aria-labelledby="repository-delete-dialog-heading" aria-describedby="repository-delete-dialog-warning"/);
+  assert.match(deleteDialog,
+    /<h2 id="repository-delete-dialog-heading">저장소를 삭제할까요\?<\/h2>/);
+  assert.match(deleteDialog,
+    /<p class="repository-delete-target"><span>삭제 대상<\/span><strong data-repository-delete-name><\/strong><\/p>/);
+  assert.match(deleteDialog,
+    /<p id="repository-delete-dialog-warning" class="repository-delete-warning">저장소와 개인 메모가 영구 삭제되며 복구할 수 없습니다\.<\/p>/);
   assert.match(deleteDialog, /<form method="post" data-repository-delete-form>/);
   assert.match(deleteDialog, /name="csrf" value="csrf&quot;x"/);
   assert.match(deleteDialog, /<input type="hidden" name="confirm" value="yes">/);
   assert.match(deleteDialog,
-    /<button type="submit" class="button-danger" data-repository-delete-confirm disabled>삭제<\/button>/);
-  assert.match(deleteDialog, /<form method="dialog"><button type="submit">취소<\/button><\/form>/);
+    /<button type="submit" class="button-danger" data-repository-delete-confirm disabled>저장소 삭제<\/button>/);
+  assert.match(deleteDialog,
+    /<div class="repository-delete-actions"><form method="dialog"><button type="submit" data-repository-delete-cancel autofocus>취소<\/button><\/form>[\s\S]*<form method="post" data-repository-delete-form>/);
   assert.doesNotMatch(deleteDialog, /<form[^>]+action=/);
   assert.match(html, /<a data-repository-detail-link hidden>상세 페이지 열기<\/a>/);
   assert.doesNotMatch(html, /data-repository-detail-link[^>]*href=|data-repository-link href="\/"/);

@@ -1,4 +1,6 @@
-import { AppError, normalizeGitHubUrl, validateRepositoryEdit } from "./domain.js";
+import {
+  AppError, normalizeGitHubUrl, validatePersonalNote, validateRepositoryEdit,
+} from "./domain.js";
 import { fetchRepositoryMetadata, fetchRepositoryReadme } from "./github.js";
 import { analyzeRepository, PROMPT_VERSION } from "./openai.js";
 
@@ -319,6 +321,20 @@ export async function updateRepository(db, id, patch) {
     const updated = mutationBatch(await db.batch(statements), statements.length);
     if (updated[0] > 1) invalidStorage();
     if (updated[0] !== 1) return null;
+    return getRepository(db, id);
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {string} id @param {unknown} personalNote */
+export async function updatePersonalNote(db, id, personalNote) {
+  const note = validatePersonalNote(personalNote);
+  try {
+    const updated = mutationChanges(await db.prepare(
+      `UPDATE repositories SET personal_note = ?, updated_at = unixepoch()
+       WHERE id = ?`,
+    ).bind(note, id).run());
+    if (updated > 1) invalidStorage();
+    if (updated !== 1) return null;
     return getRepository(db, id);
   } catch (error) { throw storageError(error); }
 }

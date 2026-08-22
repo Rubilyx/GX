@@ -8,7 +8,7 @@
     gap: var(--space-3);
   }
 
-  .index-header > h1 { grid-column: 1; grid-row: 1; font-size: 2rem; }
+  .index-header > h1 { grid-column: 1; grid-row: 1; font-size: 1.75rem; }
   .index-header > repo-filter { min-width: 0; }
   :where(.index-header) > form { justify-self: end; }
 
@@ -198,6 +198,10 @@
 
   .repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"]) {
     grid-column: 1 / -1;
+  }
+
+  .repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"]) dd {
+    padding-block: var(--space-2);
   }
 
   .repository-metadata dt {

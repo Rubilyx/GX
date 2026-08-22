@@ -256,11 +256,14 @@ test("repository metadata presents taxonomy badges and compact metrics", async (
     const tags = element.querySelector('[data-repository-field="tags"]');
     const badgeList = element.querySelector(".repository-badge-list");
     const primaryBadge = element.querySelector(".repository-badge--primary");
+    const categoryValue = category?.querySelector("dd");
+    const tagsValue = tags?.querySelector("dd");
     const metrics = [...element.querySelectorAll(
       '[data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]',
     )];
     if (!(category instanceof HTMLElement) || !(tags instanceof HTMLElement) ||
         !(badgeList instanceof HTMLElement) || !(primaryBadge instanceof HTMLElement) ||
+        !(categoryValue instanceof HTMLElement) || !(tagsValue instanceof HTMLElement) ||
         metrics.length !== 3 || metrics.some((metric) => !(metric instanceof HTMLElement)))
       throw new Error("repository_metadata_nodes_missing");
     const style = getComputedStyle(element);
@@ -271,6 +274,10 @@ test("repository metadata presents taxonomy badges and compact metrics", async (
       tagsColumn: getComputedStyle(tags).gridColumn,
       badgeListDisplay: getComputedStyle(badgeList).display,
       badgeListWrap: getComputedStyle(badgeList).flexWrap,
+      badgeValuePadding: [categoryValue, tagsValue].map((value) => {
+        const valueStyle = getComputedStyle(value);
+        return [valueStyle.paddingBlockStart, valueStyle.paddingBlockEnd];
+      }),
       primaryBadgeColor: getComputedStyle(primaryBadge).color,
       metricBorders: metrics.map((metric) => getComputedStyle(metric).borderTopWidth),
       metricWeights: metrics.map((metric) => {
@@ -285,6 +292,7 @@ test("repository metadata presents taxonomy badges and compact metrics", async (
     tagsColumn: "1 / -1",
     badgeListDisplay: "flex",
     badgeListWrap: "wrap",
+    badgeValuePadding: [["8px", "8px"], ["8px", "8px"]],
     primaryBadgeColor: "rgb(255, 255, 255)",
     metricBorders: ["1px", "1px", "1px"],
     metricWeights: ["650", "650", "650"],

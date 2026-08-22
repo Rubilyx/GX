@@ -425,7 +425,7 @@ test("index header places the filter responsively beside the title", async () =>
     gap: "var(--space-3)",
   });
   assertOwnRule(repositories, ".index-header > h1", {
-    "font-size": "2rem",
+    "font-size": "1.75rem",
     "grid-column": "1",
     "grid-row": "1",
   });
@@ -620,9 +620,10 @@ test("detail and status declarations belong to real rules in the required media 
     gap: "var(--space-3)",
   });
   assertOwnRule(repositories, ".repository-metadata > div", { "min-width": "0" });
-  assertOwnRule(repositories,
-    '.repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"])',
-    { "grid-column": "1 / -1" });
+  const badgeFields =
+    '.repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"])';
+  assertOwnRule(repositories, badgeFields, { "grid-column": "1 / -1" });
+  assertOwnRule(repositories, `${badgeFields} dd`, { "padding-block": "var(--space-2)" });
   assertOwnRule(repositories, ".repository-metadata dt", {
     color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
   });

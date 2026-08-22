@@ -140,7 +140,7 @@ test("reference widths use the approved grid without horizontal overflow", async
       titleDecoration: "none",
     });
     expect(layout.selectPaddingEnd).toBeGreaterThanOrEqual(32);
-    expect(layout.headingFontSize).toBe(32);
+    expect(layout.headingFontSize).toBe(28);
     expect(Math.abs(layout.avatarWidth - 48)).toBeLessThanOrEqual(1);
     expect(Math.abs(layout.avatarHeight - 48)).toBeLessThanOrEqual(1);
     expect(layout.avatarRadius).toBe("50%");

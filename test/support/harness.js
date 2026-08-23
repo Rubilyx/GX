@@ -1,5 +1,6 @@
 import { createTestHarness } from "wrangler";
 import { handleRequest } from "../../src/worker.js";
+import { validateCaptureMessage, validateMediaMessage } from "../../src/threads-domain.js";
 
 const secrets = Object.freeze({
   PROD_PIN_SALT: "cmVwby1hdGxhcy10ZXN0LXNhbHQ=",
@@ -329,6 +330,75 @@ export function providerFixture(options = {}) {
   };
 }
 
+/** @typedef {{ id: string, shortcode: string, threadsMediaId: string | null,
+ * submittedUrl: string, canonicalUrl: string | null, status: string,
+ * errorCode: string | null, syncGeneration: number, authorId: string,
+ * username: string, displayName: string, rootEntryId: string, rootText: string,
+ * rootPermalink: string, rootPublishedAt: string, rootMediaType: string,
+ * createdAt: number, updatedAt: number, withRoot: boolean, withJob: boolean,
+ * jobStatus: string, jobErrorCode: string | null }} SeedThreadsArchive */
+/** @type {Readonly<SeedThreadsArchive>} */
+const threadsArchiveDefaults = Object.freeze({
+  id: "threads-post-1", shortcode: "RootShort", threadsMediaId: "root-1",
+  submittedUrl: "https://www.threads.com/@meta/post/RootShort",
+  canonicalUrl: "https://www.threads.com/@meta/post/RootShort",
+  status: "ready", errorCode: null, syncGeneration: 1,
+  authorId: "author-1", username: "meta", displayName: "Meta",
+  rootEntryId: "threads-entry-root-1", rootText: "Archived root",
+  rootPermalink: "https://www.threads.com/@meta/post/RootShort",
+  rootPublishedAt: "2026-08-24T00:00:00Z", rootMediaType: "TEXT_POST",
+  createdAt: 1, updatedAt: 1, withRoot: true, withJob: true,
+  jobStatus: "ready", jobErrorCode: null,
+});
+
+/** @param {any} db @param {Partial<SeedThreadsArchive>} [overrides] */
+export async function seedThreadsArchive(db, overrides = {}) {
+  for (const key of Object.keys(overrides)) {
+    if (!(key in threadsArchiveDefaults)) throw new Error(`Unknown Threads seed override: ${key}`);
+  }
+  const row = { ...threadsArchiveDefaults, ...overrides };
+  await db.prepare(
+    `INSERT INTO threads_authors
+       (threads_user_id, username, display_name, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(threads_user_id) DO UPDATE SET
+       username = excluded.username, display_name = excluded.display_name,
+       updated_at = excluded.updated_at`,
+  ).bind(row.authorId, row.username, row.displayName, row.createdAt, row.updatedAt).run();
+  await db.prepare(
+    `INSERT INTO threads_posts
+       (id, shortcode, threads_media_id, submitted_url, canonical_url, root_author_id,
+        status, error_code, sync_generation, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    row.id, row.shortcode, row.threadsMediaId, row.submittedUrl, row.canonicalUrl,
+    row.authorId, row.status, row.errorCode, row.syncGeneration, row.createdAt, row.updatedAt,
+  ).run();
+  if (row.withRoot) {
+    await db.prepare(
+      `INSERT INTO threads_entries
+         (id, threads_post_id, source_media_id, kind, author_id, text, permalink,
+          published_at, media_type, first_seen_at, last_seen_at, created_at)
+       VALUES (?, ?, ?, 'root', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      row.rootEntryId, row.id, row.threadsMediaId, row.authorId, row.rootText,
+      row.rootPermalink, row.rootPublishedAt, row.rootMediaType,
+      row.createdAt, row.updatedAt, row.createdAt,
+    ).run();
+  }
+  if (row.withJob) {
+    await db.prepare(
+      `INSERT INTO threads_sync_jobs
+         (id, threads_post_id, generation, status, error_code, queued_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      `threads-job-${row.id}-${row.syncGeneration}`, row.id, row.syncGeneration,
+      row.jobStatus, row.jobErrorCode, row.createdAt, row.updatedAt,
+    ).run();
+  }
+  return row;
+}
+
 /** @param {any} worker @param {{ origin?: string, pin?: string, ip?: string }} [options] */
 export async function login(worker, {
   origin = "https://production.repo-atlas.test", pin = "123456", ip = "192.0.2.1",
@@ -390,6 +460,26 @@ export async function startHarness() {
   /** @type {import("wrangler").WorkerHandle<Env>} */
   const remoteWorker = server.getWorker();
   let providerMode = {};
+  /** @type {Record<string, unknown>[]} */
+  const captureMessages = [];
+  /** @type {Record<string, unknown>[]} */
+  const mediaMessages = [];
+  let queueMode = { captureReject: false, mediaReject: false };
+  /** @param {Record<string, unknown>[]} messages
+   * @param {(message: unknown) => Record<string, unknown>} validate
+   * @param {"captureReject" | "mediaReject"} rejected */
+  const queue = (messages, validate, rejected) => ({
+    messages,
+    /** @param {unknown} message @param {unknown} [options] */
+    async send(message, options) {
+      if (options !== undefined) structuredClone(options);
+      const copy = validate(structuredClone(message));
+      if (queueMode[rejected]) throw new Error("test_queue_rejection");
+      messages.push(copy);
+    },
+  });
+  const captureQueue = queue(captureMessages, validateCaptureMessage, "captureReject");
+  const mediaQueue = queue(mediaMessages, validateMediaMessage, "mediaReject");
   /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
   const outboundFetch = (input, init) => providerFixture(providerMode)(input, init);
   globalThis.fetch = outboundFetch;
@@ -423,6 +513,13 @@ export async function startHarness() {
   };
   /** @param {any} options */
   async function setProviderMode(options) { providerMode = { ...options }; }
+  /** @param {{ captureReject?: boolean, mediaReject?: boolean }} options */
+  async function setQueueMode(options) {
+    queueMode = {
+      captureReject: options.captureReject === true,
+      mediaReject: options.mediaReject === true,
+    };
+  }
   /** @param {{ reject?: boolean }} options */
   async function setAssetMode(options) { assetMode = { ...options }; }
   function providerCalls() {
@@ -433,6 +530,9 @@ export async function startHarness() {
     await server.reset();
     url = await listenForBrowser();
     providerMode = {};
+    captureMessages.length = 0;
+    mediaMessages.length = 0;
+    queueMode = { captureReject: false, mediaReject: false };
     assetMode = {};
     await remoteWorker.applyD1Migrations("PROD_DB");
     const env = await worker.getEnv();
@@ -446,6 +546,7 @@ export async function startHarness() {
   }
   return {
     get url() { return url; },
-    server, worker, setProviderMode, setAssetMode, providerCalls, reset, close,
+    server, worker, captureQueue, mediaQueue, captureMessages, mediaMessages,
+    setProviderMode, setQueueMode, setAssetMode, providerCalls, reset, close,
   };
 }

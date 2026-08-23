@@ -5,7 +5,15 @@ import {
   beginThreadsOAuth, disconnectThreads, finishThreadsOAuth, getThreadsAccessToken,
   refreshStoredThreadsCredential,
 } from "../../src/threads-oauth.js";
-import { providerFixture, startHarness } from "../support/harness.js";
+import {
+  claimThreadsJob, createThreadsSync, finalizeThreadsContent, getThreadsArchive,
+  listThreadsArchives, markThreadsJobError, recalculateThreadsStatus,
+  saveResolvedThreadsRoot, saveThreadsConversationPage, saveThreadsQuote,
+  startThreadsDeletion,
+} from "../../src/threads.js";
+import {
+  providerFixture, seedThreadsArchive, startHarness,
+} from "../support/harness.js";
 
 const TOKEN_KEY = "cmVwby1hdGxhcy10aHJlYWRzLXRlc3Qta2V5LTAwMDE=";
 const OTHER_TOKEN_KEY = "b3RoZXItYXRsYXMtdGhyZWFkcy10ZXN0LWtleS0wMDE=";
@@ -346,4 +354,267 @@ test("credential disconnect deletes only the singleton and retains Threads archi
   assert.equal(await disconnectThreads(db), true);
   assert.equal(await disconnectThreads(db), false);
   assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM threads_posts").first("count"), 1);
+});
+
+/** @param {string} [id] @param {string} [username] */
+const profile = (id = "author-1", username = "meta") => ({
+  id, username, name: username === "meta" ? "Meta" : username, profilePictureUrl:
+    `https://scontent.cdninstagram.com/${id}-avatar`,
+});
+/** @param {string} id @param {string} [ownerId] @param {Record<string, unknown>} [overrides] */
+const media = (id, ownerId = "author-1", overrides = {}) => ({
+  id, ownerId, username: ownerId === "author-1" ? "meta" : "other",
+  text: `Text ${id}`, permalink: `https://www.threads.com/@meta/post/${id}`,
+  timestamp: `2026-08-24T00:${String(Number(/\d+$/.exec(id)?.[0] ?? 0) % 60).padStart(2, "0")}:00Z`,
+  mediaType: "TEXT_POST", mediaUrl: null, thumbnailUrl: null, children: [],
+  quotedPostId: null, linkAttachmentUrl: null, altText: null,
+  rootPostId: "root-1", repliedToId: "root-1", ...overrides,
+});
+
+test("Threads sync creates one active generation, advances completed captures, and records enqueue failure", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const first = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/RootShort", 1_000,
+  );
+  assert.deepEqual(first, {
+    threadsPostId: first.threadsPostId, generation: 1, duplicate: false, status: "pending",
+  });
+  assert.deepEqual(harness.captureMessages, [{
+    version: 1, type: "resolve-post", postId: first.threadsPostId, generation: 1, cursor: null,
+  }]);
+  assert.deepEqual(await createThreadsSync(
+    db, harness.captureQueue, "https://threads.net/t/RootShort", 1_001,
+  ), { ...first, duplicate: true });
+  assert.equal(harness.captureMessages.length, 1);
+
+  await db.prepare(
+    "UPDATE threads_sync_jobs SET status = 'ready' WHERE threads_post_id = ? AND generation = 1",
+  ).bind(first.threadsPostId).run();
+  const second = await createThreadsSync(
+    db, harness.captureQueue, "https://threads.net/t/RootShort", 1_002,
+  );
+  assert.deepEqual(second, {
+    threadsPostId: first.threadsPostId, generation: 2, duplicate: false, status: "pending",
+  });
+
+  await harness.setQueueMode({ captureReject: true });
+  await assert.rejects(
+    createThreadsSync(db, harness.captureQueue, "https://threads.net/t/QueueFail", 1_003),
+    (error) => error instanceof AppError && error.code === "queue_unavailable" && error.status === 503,
+  );
+  assert.deepEqual(await db.prepare(
+    "SELECT p.status, p.error_code, j.status AS job_status, j.error_code AS job_error " +
+    "FROM threads_posts p JOIN threads_sync_jobs j ON j.threads_post_id = p.id " +
+    "WHERE p.shortcode = 'QueueFail'",
+  ).first(), { status: "error", error_code: "queue_unavailable",
+    job_status: "error", job_error: "queue_unavailable" });
+});
+
+test("immutable Threads writes add unseen author replies and scope repeated quotes by parent", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/RootShort", 2_000,
+  );
+  assert.ok(await claimThreadsJob(db, sync.threadsPostId, 1, "resolving"));
+  const root = media("root-1", "author-1", {
+    text: "Original archived text", rootPostId: null, repliedToId: null,
+    mediaType: "IMAGE", mediaUrl: "https://scontent.cdninstagram.com/root-image",
+    linkAttachmentUrl: "https://example.com/root",
+  });
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: sync.threadsPostId, generation: 1, profile: profile(), root,
+    profileCursor: null, conversationCursor: null, nowSeconds: 2_001,
+  }), true);
+  assert.deepEqual(await saveThreadsConversationPage(db, {
+    postId: sync.threadsPostId, generation: 1, entries: [
+      media("reply-1"), media("other-1", "author-2"),
+    ], nextCursor: null, nowSeconds: 2_002,
+  }), { accepted: 1, nextCursor: null });
+  const replyId = await db.prepare(
+    "SELECT id FROM threads_entries WHERE threads_post_id = ? AND source_media_id = 'reply-1'",
+  ).bind(sync.threadsPostId).first("id");
+  assert.equal(typeof replyId, "string");
+  if (typeof replyId !== "string") throw new Error("test_reply_id_missing");
+  await saveThreadsQuote(db, {
+    postId: sync.threadsPostId, generation: 1, parentEntryId: replyId,
+    profile: profile("quoted-author", "quoted"), quote: media("quote-1", "quoted-author", {
+      username: "quoted", rootPostId: null, repliedToId: null,
+    }), nowSeconds: 2_003,
+  });
+  await saveThreadsConversationPage(db, {
+    postId: sync.threadsPostId, generation: 1, entries: [media("reply-2")],
+    nextCursor: null, nowSeconds: 2_004,
+  });
+  const reply2Id = await db.prepare(
+    "SELECT id FROM threads_entries WHERE threads_post_id = ? AND source_media_id = 'reply-2'",
+  ).bind(sync.threadsPostId).first("id");
+  if (typeof reply2Id !== "string") throw new Error("test_reply_id_missing");
+  await saveThreadsQuote(db, {
+    postId: sync.threadsPostId, generation: 1, parentEntryId: reply2Id,
+    profile: profile("quoted-author", "quoted"), quote: media("quote-1", "quoted-author", {
+      username: "quoted", rootPostId: null, repliedToId: null,
+    }), nowSeconds: 2_005,
+  });
+  await saveResolvedThreadsRoot(db, {
+    postId: sync.threadsPostId, generation: 1, profile: profile(),
+    root: { ...root, text: "Provider edit must not overwrite" },
+    profileCursor: null, conversationCursor: null, nowSeconds: 2_006,
+  });
+  assert.deepEqual(await db.prepare(
+    `SELECT text, last_seen_at FROM threads_entries
+     WHERE threads_post_id = ? AND kind = 'root'`,
+  ).bind(sync.threadsPostId).first(), {
+    text: "Original archived text", last_seen_at: 2_006,
+  });
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = ? AND kind = 'author_reply'",
+  ).bind(sync.threadsPostId).first("count"), 2);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = ? AND kind = 'quote'",
+  ).bind(sync.threadsPostId).first("count"), 2);
+  await db.prepare(
+    "UPDATE threads_sync_jobs SET pending_quote_count = 1 WHERE threads_post_id = ? AND generation = 1",
+  ).bind(sync.threadsPostId).run();
+  assert.equal(await saveThreadsQuote(db, {
+    postId: sync.threadsPostId, generation: 1, parentEntryId: "missing-parent",
+    profile: profile("quoted-author", "quoted"), quote: media("missing-parent-quote", "quoted-author", {
+      username: "quoted", rootPostId: null, repliedToId: null,
+    }), nowSeconds: 2_007,
+  }), false);
+  assert.equal(await db.prepare(
+    "SELECT pending_quote_count FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 1",
+  ).bind(sync.threadsPostId).first("pending_quote_count"), 1);
+});
+
+test("Threads archive reads clamp ten-card pages and paginate twenty chronological replies", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  for (let index = 0; index < 12; index += 1) {
+    const suffix = String(index).padStart(2, "0");
+    await seedThreadsArchive(db, {
+      id: `post-${suffix}`, shortcode: `Short${suffix}`, threadsMediaId: `root-${suffix}`,
+      submittedUrl: `https://threads.net/t/Short${suffix}`,
+      canonicalUrl: `https://www.threads.com/@user${suffix}/post/Short${suffix}`,
+      authorId: `author-${suffix}`, username: `user${suffix}`, displayName: `User ${suffix}`,
+      rootEntryId: `root-entry-${suffix}`, rootText: `Root ${suffix}`,
+      rootPermalink: `https://www.threads.com/@user${suffix}/post/Short${suffix}`,
+      createdAt: index + 1, updatedAt: index + 1,
+    });
+  }
+  const firstPage = await listThreadsArchives(db, { page: 1 });
+  assert.equal(firstPage.archives.length, 10);
+  assert.deepEqual(firstPage.archives.map((archive) => archive.id),
+    ["post-11", "post-10", "post-09", "post-08", "post-07", "post-06",
+      "post-05", "post-04", "post-03", "post-02"]);
+  assert.deepEqual({ page: firstPage.page, totalPages: firstPage.totalPages, total: firstPage.total },
+    { page: 1, totalPages: 2, total: 12 });
+  assert.deepEqual((await listThreadsArchives(db, { page: 99 })).archives.map((archive) => archive.id),
+    ["post-01", "post-00"]);
+
+  const entries = Array.from({ length: 21 }, (_, index) => media(`reply-${index + 1}`, "author-11", {
+    username: "user11", timestamp: `2026-08-24T00:${String(index).padStart(2, "0")}:00Z`,
+  }));
+  await db.prepare(
+    "UPDATE threads_sync_jobs SET status = 'collecting' WHERE threads_post_id = 'post-11'",
+  ).run();
+  await saveThreadsConversationPage(db, {
+    postId: "post-11", generation: 1, entries, nextCursor: null, nowSeconds: 100,
+  });
+  const detail = await getThreadsArchive(db, "post-11", { repliesPage: 2 });
+  assert.ok(detail);
+  assert.equal(detail.replies.length, 1);
+  assert.equal(detail.replies[0].sourceMediaId, "reply-21");
+  assert.deepEqual({ page: detail.repliesPage, pages: detail.totalReplyPages, total: detail.totalReplies },
+    { page: 2, pages: 2, total: 21 });
+});
+
+test("Threads finalization is idempotent, stale generations cannot advance status, and deletion keeps rows", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/RootShort", 3_000,
+  );
+  await claimThreadsJob(db, sync.threadsPostId, 1, "resolving");
+  const root = media("root-1", "author-1", {
+    rootPostId: null, repliedToId: null, mediaType: "IMAGE",
+    mediaUrl: "https://scontent.cdninstagram.com/root-image", altText: "root alt",
+  });
+  await saveResolvedThreadsRoot(db, {
+    postId: sync.threadsPostId, generation: 1, profile: profile(), root,
+    profileCursor: null, conversationCursor: null, nowSeconds: 3_001,
+  });
+  const rootEntryId = await db.prepare(
+    "SELECT id FROM threads_entries WHERE threads_post_id = ? AND kind = 'root'",
+  ).bind(sync.threadsPostId).first("id");
+  const finalizeInput = {
+    postId: sync.threadsPostId, generation: 1, nowSeconds: 3_002,
+    media: [{ entryId: rootEntryId, sourceMediaId: "root-1", kind: "image",
+      ordinal: 0, altText: "root alt", sourceUrl: root.mediaUrl }],
+    profiles: [{ authorId: "author-1", sourceUrl: profile().profilePictureUrl }],
+  };
+  assert.equal((await finalizeThreadsContent(db, harness.mediaQueue, finalizeInput)).status, "media_pending");
+  assert.equal(harness.mediaMessages.length, 2);
+  await finalizeThreadsContent(db, harness.mediaQueue, finalizeInput);
+  assert.equal(harness.mediaMessages.length, 2);
+  const storedMedia = await db.prepare("SELECT id, alt_text FROM threads_media").first();
+  assert.equal(storedMedia?.alt_text, "root alt");
+  await db.prepare(
+    "UPDATE threads_media SET status = 'ready', r2_key = 'key', bytes = 4, etag = 'etag' WHERE id = ?",
+  ).bind(storedMedia?.id).run();
+  await db.prepare(
+    "UPDATE threads_authors SET profile_media_status = 'ready', profile_r2_key = 'profile-key' WHERE threads_user_id = 'author-1'",
+  ).run();
+  assert.equal((await recalculateThreadsStatus(db, {
+    postId: sync.threadsPostId, generation: 1, nowSeconds: 3_003,
+  })).status, "ready");
+  const next = await createThreadsSync(
+    db, harness.captureQueue, "https://threads.net/t/RootShort", 3_004,
+  );
+  assert.equal(next.generation, 2);
+  await markThreadsJobError(db, {
+    postId: sync.threadsPostId, generation: 1, errorCode: "threads_post_unavailable",
+    nowSeconds: 3_005,
+  });
+  assert.equal(await db.prepare("SELECT status FROM threads_posts WHERE id = ?")
+    .bind(sync.threadsPostId).first("status"), "pending");
+  await markThreadsJobError(db, {
+    postId: sync.threadsPostId, generation: 2, errorCode: "threads_post_unavailable",
+    nowSeconds: 3_006,
+  });
+  assert.equal(await db.prepare("SELECT status FROM threads_posts WHERE id = ?")
+    .bind(sync.threadsPostId).first("status"), "partial");
+  assert.equal(await db.prepare("SELECT text FROM threads_entries WHERE id = ?")
+    .bind(rootEntryId).first("text"), "Text root-1");
+
+  await seedThreadsArchive(db, {
+    id: "delete-queue-failure", shortcode: "DeleteQueueFailure",
+    threadsMediaId: "delete-root", submittedUrl: "https://threads.net/t/DeleteQueueFailure",
+    canonicalUrl: "https://www.threads.com/@delete/post/DeleteQueueFailure",
+    authorId: "delete-author", username: "delete", displayName: "Delete",
+    rootEntryId: "delete-root-entry", rootText: "Retain me",
+    rootPermalink: "https://www.threads.com/@delete/post/DeleteQueueFailure",
+    createdAt: 9, updatedAt: 9,
+  });
+  await harness.setQueueMode({ captureReject: true });
+  await assert.rejects(
+    startThreadsDeletion(db, harness.captureQueue, "delete-queue-failure", 3_007),
+    (error) => error instanceof AppError && error.code === "queue_unavailable",
+  );
+  assert.deepEqual(await db.prepare(
+    "SELECT status, error_code FROM threads_posts WHERE id = 'delete-queue-failure'",
+  ).first(), { status: "deleting", error_code: "queue_unavailable" });
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = 'delete-queue-failure'",
+  ).first("count"), 1);
+  await harness.setQueueMode({});
+
+  assert.deepEqual(await startThreadsDeletion(db, harness.captureQueue, sync.threadsPostId, 3_008),
+    { threadsPostId: sync.threadsPostId, status: "deleting", duplicate: false });
+  assert.deepEqual(harness.captureMessages.at(-1), {
+    version: 1, type: "delete-archive", postId: sync.threadsPostId,
+  });
+  assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = ?")
+    .bind(sync.threadsPostId).first("count"), 1);
+  await assert.rejects(
+    createThreadsSync(db, harness.captureQueue, "https://threads.net/t/RootShort", 3_009),
+    (error) => error instanceof AppError && error.code === "threads_archive_deleting",
+  );
 });

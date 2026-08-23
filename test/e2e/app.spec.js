@@ -1,5 +1,5 @@
 import { expect, loginAndSeed, test } from "./fixtures.js";
-import { seedNamedRepositories, seedRepository } from "../support/harness.js";
+import { seedNamedRepositories, seedRepository, seedRepositoryNote } from "../support/harness.js";
 
 test("invalid PIN reports the native authentication message", async ({ page }) => {
   await page.goto("/login");
@@ -406,6 +406,97 @@ test("card delete confirms, restores focus, and submits the protected native for
 test.describe("desktop Note manager", () => {
   test.describe.configure({ mode: "serial" });
 
+  test("renders native previous, numbered, and next links at pagination boundaries", async ({
+    page, harness,
+  }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    const opener = page.locator("[data-repository-link]").first();
+    const href = await opener.getAttribute("href");
+    const match = /^\/repositories\/([0-9a-f-]+)\/notes$/.exec(href ?? "");
+    expect(match).not.toBeNull();
+    const repositoryId = match?.[1] ?? "";
+    const env = await harness.worker.getEnv();
+    for (let number = 1; number <= 11; number += 1) {
+      await seedRepositoryNote(env.PROD_DB, {
+        id: crypto.randomUUID(), repositoryId, body: `페이지 Note ${number}`,
+        createdAt: number, updatedAt: number,
+      });
+    }
+
+    await opener.click();
+    const dialog = page.locator("[data-repository-dialog]");
+    const pagination = dialog.locator("[data-repository-note-pagination]");
+    await expect(pagination.getByRole("link", { name: "이전", exact: true })).toHaveCount(0);
+    await expect(pagination.getByRole("link", { name: "1", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    const firstNext = pagination.getByRole("link", { name: "다음", exact: true });
+    await expect(firstNext).toHaveAttribute("rel", "next");
+    await expect(firstNext).toHaveAttribute("href", `${href}?page=2`);
+
+    await firstNext.click();
+    const middlePrevious = pagination.getByRole("link", { name: "이전", exact: true });
+    const middleNext = pagination.getByRole("link", { name: "다음", exact: true });
+    await expect(middlePrevious).toHaveAttribute("rel", "prev");
+    await expect(middlePrevious).toHaveAttribute("href", `${href}?page=1`);
+    await expect(pagination.getByRole("link", { name: "2", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    await expect(middleNext).toHaveAttribute("href", `${href}?page=3`);
+
+    await middleNext.click();
+    await expect(pagination.getByRole("link", { name: "3", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    await expect(pagination.getByRole("link", { name: "이전", exact: true }))
+      .toHaveAttribute("href", `${href}?page=2`);
+    await expect(pagination.getByRole("link", { name: "다음", exact: true })).toHaveCount(0);
+  });
+
+  test("rejects a Note list response with a non-UUID Note id", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    const opener = page.locator("[data-repository-link]").first();
+    const href = await opener.getAttribute("href");
+    await page.route("**/repositories/*/notes", async (route) => {
+      if (route.request().method() !== "GET" ||
+        route.request().headers().accept !== "application/json") return route.continue();
+      const response = await route.fetch();
+      const result = await response.json();
+      result.notes = [{
+        id: "abc-def", repositoryId: result.repository.id, body: "잘못된 ID Note",
+        createdAt: 1, updatedAt: 1,
+      }];
+      result.page = 1;
+      result.totalPages = 1;
+      result.total = 1;
+      await route.fulfill({ response, json: result });
+    });
+
+    await opener.click();
+
+    await expect(page).toHaveURL(new RegExp(`${href}$`));
+    await expect(page.locator("[data-repository-dialog]:visible")).toHaveCount(0);
+  });
+
+  test("rejects a Note list response with unexpected keys", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    const opener = page.locator("[data-repository-link]").first();
+    const href = await opener.getAttribute("href");
+    await page.route("**/repositories/*/notes", async (route) => {
+      if (route.request().method() !== "GET" ||
+        route.request().headers().accept !== "application/json") return route.continue();
+      const response = await route.fetch();
+      const result = await response.json();
+      result.unexpected = true;
+      await route.fulfill({ response, json: result });
+    });
+
+    await opener.click();
+
+    await expect(page).toHaveURL(new RegExp(`${href}$`));
+    await expect(page.locator("[data-repository-dialog]:visible")).toHaveCount(0);
+  });
+
   test("creates, pages, edits, deletes, synchronizes the card, and restores focus", async ({ page }) => {
     test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
     await page.setViewportSize({ width: 1200, height: 900 });
@@ -507,6 +598,62 @@ test.describe("desktop Note manager", () => {
     await page.unroute("**/repositories/*/notes");
     await save.click();
     await expect(dialog.locator(".repository-note-body").first()).toHaveText("재시도할 Note");
+  });
+
+  test("failed update preserves the edit and re-enables retry", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    await page.locator("[data-repository-link]").first().click();
+    const dialog = page.locator("[data-repository-dialog]");
+    await dialog.getByRole("textbox", { name: "새 Note", exact: true }).fill("수정 전 Note");
+    await dialog.getByRole("button", { name: "저장", exact: true }).click();
+    const item = dialog.locator("[data-repository-note-item]").first();
+    await item.getByRole("button", { name: "수정", exact: true }).click();
+    const edit = item.getByRole("textbox", { name: "Note 수정", exact: true });
+    const save = item.getByRole("button", { name: "저장", exact: true });
+    await edit.fill("재시도한 수정 Note");
+    await page.route("**/repositories/*/notes/*", (route) => route.request().method() === "POST"
+      ? route.fulfill({
+        status: 503, contentType: "application/json",
+        body: JSON.stringify({ errorCode: "storage_unavailable" }),
+      }) : route.continue());
+
+    await save.click();
+    await expect(dialog.getByRole("status"))
+      .toHaveText("저장 공간을 사용할 수 없습니다. 다시 시도하세요.");
+    await expect(edit).toHaveValue("재시도한 수정 Note");
+    await expect(save).toBeEnabled();
+    await page.unroute("**/repositories/*/notes/*");
+    await save.click();
+    await expect(item.locator(".repository-note-body")).toHaveText("재시도한 수정 Note");
+  });
+
+  test("failed delete announces inside confirmation and re-enables retry", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    await page.locator("[data-repository-link]").first().click();
+    const dialog = page.locator("[data-repository-dialog]");
+    await dialog.getByRole("textbox", { name: "새 Note", exact: true }).fill("삭제 재시도 Note");
+    await dialog.getByRole("button", { name: "저장", exact: true }).click();
+    const item = dialog.locator("[data-repository-note-item]").first();
+    await item.getByRole("button", { name: "삭제", exact: true }).click();
+    const confirmation = page.locator("[data-repository-note-delete-dialog]");
+    const confirm = confirmation.getByRole("button", { name: "Note 삭제", exact: true });
+    await page.route("**/repositories/*/notes/*/delete", (route) => route.fulfill({
+      status: 503, contentType: "application/json",
+      body: JSON.stringify({ errorCode: "storage_unavailable" }),
+    }));
+
+    await confirm.click();
+    await expect(confirmation).toBeVisible();
+    await expect(confirmation.getByRole("status"))
+      .toHaveText("저장 공간을 사용할 수 없습니다. 다시 시도하세요.");
+    await expect(dialog.getByRole("status")).toHaveText("");
+    await expect(confirm).toBeEnabled();
+    await page.unroute("**/repositories/*/notes/*/delete");
+    await confirm.click();
+    await expect(confirmation).toBeHidden();
+    await expect(dialog.locator("[data-repository-note-item]")).toHaveCount(0);
   });
 });
 

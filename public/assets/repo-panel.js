@@ -28,7 +28,15 @@ function activityText(value, now = Date.now()) {
 
 /** @param {unknown} value */
 function validId(value) {
-  return typeof value === "string" && /^[0-9a-f-]+$/.test(value);
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(value);
+}
+
+/** @param {unknown} value @param {string[]} keys */
+function hasExactKeys(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
 /** @param {unknown} value */
@@ -39,7 +47,8 @@ function validNoteBody(value) {
 
 /** @param {unknown} value @param {string} repositoryId */
 function validatedNote(value, repositoryId) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_note");
+  if (!hasExactKeys(value, ["id", "repositoryId", "body", "createdAt", "updatedAt"]))
+    throw new Error("invalid_note");
   const note = /** @type {Record<string, unknown>} */ (value);
   if (!validId(note.id) || note.repositoryId !== repositoryId || !validNoteBody(note.body) ||
     !Number.isSafeInteger(note.createdAt) || Number(note.createdAt) < 0 ||
@@ -55,7 +64,7 @@ function validatedNote(value, repositoryId) {
 
 /** @param {unknown} value */
 function validatedNoteSummary(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_summary");
+  if (!hasExactKeys(value, ["noteCount", "latestNote"])) throw new Error("invalid_summary");
   const summary = /** @type {Record<string, unknown>} */ (value);
   if (!Number.isSafeInteger(summary.noteCount) || Number(summary.noteCount) < 0 ||
     !((summary.noteCount === 0 && summary.latestNote === null) ||
@@ -69,10 +78,11 @@ function validatedNoteSummary(value) {
 
 /** @param {unknown} value @param {string} repositoryId */
 function validatedNoteList(value, repositoryId) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_list");
+  if (!hasExactKeys(value, ["repository", "notes", "page", "totalPages", "total"]))
+    throw new Error("invalid_list");
   const result = /** @type {Record<string, unknown>} */ (value);
   const repository = result.repository;
-  if (!repository || typeof repository !== "object" || Array.isArray(repository))
+  if (!hasExactKeys(repository, ["id", "owner", "name", "summary"]))
     throw new Error("invalid_repository");
   const projected = /** @type {Record<string, unknown>} */ (repository);
   if (projected.id !== repositoryId || !validId(projected.id) ||
@@ -156,6 +166,7 @@ class RepoPanel extends HTMLElement {
     const noteDeleteForm = noteDeleteDialog?.querySelector("[data-repository-note-delete-form]");
     const noteDeleteConfirm = noteDeleteDialog?.querySelector("[data-repository-note-delete-confirm]");
     const noteDeleteCancel = noteDeleteDialog?.querySelector("[data-repository-note-delete-cancel]");
+    const noteDeleteStatus = noteDeleteDialog?.querySelector("[data-repository-note-delete-status]");
     const noteSupported = typeof HTMLDialogElement !== "undefined" &&
       dialog instanceof HTMLDialogElement && typeof dialog.showModal === "function" &&
       createForm instanceof HTMLFormElement && createSave instanceof HTMLButtonElement &&
@@ -163,7 +174,8 @@ class RepoPanel extends HTMLElement {
       noteList instanceof HTMLElement && pagination instanceof HTMLElement &&
       detailLink instanceof HTMLAnchorElement && noteDeleteDialog instanceof HTMLDialogElement &&
       typeof noteDeleteDialog.showModal === "function" && noteDeleteForm instanceof HTMLFormElement &&
-      noteDeleteConfirm instanceof HTMLButtonElement && noteDeleteCancel instanceof HTMLButtonElement;
+      noteDeleteConfirm instanceof HTMLButtonElement && noteDeleteCancel instanceof HTMLButtonElement &&
+      noteDeleteStatus instanceof HTMLElement;
     if (noteSupported) {
       noteDeleteConfirm.disabled = true;
       dialog.addEventListener("close", () => this.closeNotes(dialog));
@@ -174,6 +186,7 @@ class RepoPanel extends HTMLElement {
         noteDeleteConfirm.disabled = true;
         setText(noteDeleteDialog, "[data-repository-note-delete-date]", "");
         setText(noteDeleteDialog, "[data-repository-note-delete-excerpt]", "");
+        this.setNoteStatus(noteDeleteDialog, "");
         this.noteState.deleteOpener = null;
         opener?.focus();
       });
@@ -407,6 +420,13 @@ class RepoPanel extends HTMLElement {
 
     pagination.className = "repository-note-pagination";
     const links = [];
+    if (result.totalPages > 1 && result.page > 1) {
+      const previous = document.createElement("a");
+      previous.setAttribute("href", `${this.noteState.listUrl}?page=${result.page - 1}`);
+      previous.setAttribute("rel", "prev");
+      previous.textContent = "이전";
+      links.push(previous);
+    }
     for (let page = 1; page <= result.totalPages; page += 1) {
       const link = document.createElement("a");
       link.setAttribute("href", `${this.noteState.listUrl}?page=${page}`);
@@ -414,6 +434,14 @@ class RepoPanel extends HTMLElement {
       if (page === result.page) link.setAttribute("aria-current", "page");
       links.push(link);
     }
+    if (result.totalPages > 1 && result.page < result.totalPages) {
+      const next = document.createElement("a");
+      next.setAttribute("href", `${this.noteState.listUrl}?page=${result.page + 1}`);
+      next.setAttribute("rel", "next");
+      next.textContent = "다음";
+      links.push(next);
+    }
+    pagination.hidden = result.totalPages <= 1;
     pagination.replaceChildren(...links);
   }
 
@@ -457,6 +485,7 @@ class RepoPanel extends HTMLElement {
         this.setNoteStatus(dialog, noteMessage(result, NOTE_ERROR), "error");
         return;
       }
+      if (!hasExactKeys(result, ["note", "noteSummary"])) throw new Error("invalid_create_result");
       validatedNote(result?.note, this.noteState.repositoryId);
       const summary = validatedNoteSummary(result?.noteSummary);
       const article = this.noteState.opener?.closest("article");
@@ -550,6 +579,7 @@ class RepoPanel extends HTMLElement {
         this.setNoteStatus(dialog, noteMessage(result, NOTE_ERROR), "error");
         return;
       }
+      if (!hasExactKeys(result, ["note", "noteSummary"])) throw new Error("invalid_update_result");
       const note = validatedNote(result?.note, this.noteState.repositoryId);
       if (note.id !== match[1]) throw new Error("mismatched_note");
       const summary = validatedNoteSummary(result?.noteSummary);
@@ -592,6 +622,7 @@ class RepoPanel extends HTMLElement {
     excerpt.textContent = (body.textContent ?? "").slice(0, 80);
     form.setAttribute("action", `${this.noteState.listUrl}/${encodeURIComponent(noteId)}/delete`);
     confirm.disabled = false;
+    this.setNoteStatus(confirmation, "");
     this.noteState.deleteOpener = button;
     confirmation.showModal();
     cancel.focus();
@@ -607,7 +638,8 @@ class RepoPanel extends HTMLElement {
     const confirmation = form.closest("[data-repository-note-delete-dialog]");
     const confirm = form.querySelector("[data-repository-note-delete-confirm]");
     if (confirm instanceof HTMLButtonElement) confirm.disabled = true;
-    this.setNoteStatus(dialog, "Note를 삭제하는 중입니다.");
+    if (confirmation instanceof HTMLElement)
+      this.setNoteStatus(confirmation, "Note를 삭제하는 중입니다.");
     try {
       const source = new URL(form.action);
       const match = new RegExp(`^${this.noteState.listUrl}/([0-9a-f-]+)/delete$`).exec(source.pathname);
@@ -616,16 +648,18 @@ class RepoPanel extends HTMLElement {
       const response = await formJson(form, controller.signal);
       const result = await responseJson(response);
       if (!response.ok) {
-        this.setNoteStatus(dialog, noteMessage(result, NOTE_ERROR), "error");
+        if (confirmation instanceof HTMLElement)
+          this.setNoteStatus(confirmation, noteMessage(result, NOTE_ERROR), "error");
         return;
       }
-      if (!result || typeof result !== "object" || Array.isArray(result) ||
+      if (!hasExactKeys(result, ["repositoryId", "noteId", "noteSummary"]) ||
         result.repositoryId !== this.noteState.repositoryId || result.noteId !== match[1])
         throw new Error("invalid_delete_result");
       const summary = validatedNoteSummary(result.noteSummary);
       const article = this.noteState.opener?.closest("article");
       if (article instanceof HTMLElement) this.syncCardNotes(article, summary);
       this.noteState.deleteOpener = null;
+      if (confirmation instanceof HTMLElement) this.setNoteStatus(confirmation, "");
       if (confirmation instanceof HTMLDialogElement && confirmation.open) confirmation.close();
       this.setNoteStatus(dialog, "Note를 삭제했습니다.", "success");
       if (this.noteState.controller === controller) this.noteState.controller = null;
@@ -637,7 +671,8 @@ class RepoPanel extends HTMLElement {
         if (heading instanceof HTMLElement) heading.focus();
       }
     } catch {
-      if (!controller.signal.aborted) this.setNoteStatus(dialog, NOTE_ERROR, "error");
+      if (!controller.signal.aborted && confirmation instanceof HTMLElement)
+        this.setNoteStatus(confirmation, NOTE_ERROR, "error");
     } finally {
       if (this.noteState.controller === controller) this.noteState.controller = null;
       if (confirm instanceof HTMLButtonElement &&

@@ -63,9 +63,17 @@ The requested authorization scopes are exactly:
 
 Publishing, deletion, insight, mention, keyword-search, and reply-management scopes are not requested.
 
+### `src/threads-oauth.js`
+
+Owns the signed, session-bound OAuth state cookie, separate HKDF-derived HMAC/AES keys, encrypted credential persistence, connect/callback completion, access-token retrieval, scheduled refresh, and disconnect. It calls the token endpoints through `threads-api.js` and does not render pages or collect content.
+
 ### `src/threads.js`
 
 Owns D1 persistence, sync-generation leases, idempotent upserts, author-reply filtering, content-status aggregation, Queue message production, deletion coordination, and mapping storage rows into application objects. It communicates with Meta through the `threads-api.js` interface and with media storage through queue messages.
+
+### `src/threads-capture.js`
+
+Owns typed capture Queue/DLQ message dispatch, provider cursor continuation, root-author reply filtering, one-level quote barriers, finalization triggering, and transient-versus-terminal retry decisions. It depends only on the public interfaces of `threads-api.js`, `threads-oauth.js`, and `threads.js`.
 
 ### `src/thread-media.js`
 
@@ -86,7 +94,7 @@ Add these production and isolated test resources:
 - Dead-letter queues for capture and media jobs, each configured with an active consumer that records terminal job state rather than silently discarding messages.
 - A daily scheduled trigger used only to refresh an unexpired long-lived Meta token when it is within seven days of expiry.
 
-Add `THREADS_APP_ID` as a non-secret environment value and add `THREADS_APP_SECRET` plus a random 256-bit `THREADS_TOKEN_KEY` as Worker secrets. The test environment uses distinct non-production values and a provider fixture.
+Add `THREADS_APP_ID` plus the four exact capture/media primary/DLQ queue names as non-secret environment values. Add `THREADS_APP_SECRET` plus a random 256-bit `THREADS_TOKEN_KEY` as Worker secrets. Derive distinct state-HMAC and token-AES keys from the master key with HKDF-SHA-256 and fixed, versioned context strings. The test environment uses distinct non-production values and a provider fixture.
 
 ## URL Contract and Post Resolution
 
@@ -163,6 +171,7 @@ Links are extracted from text and the API's link-attachment field. Exact duplica
 - `source_media_id`: child/provider media ID used to reacquire a fresh CDN URL.
 - `kind`: `image`, `video`, or `video_thumbnail`.
 - `ordinal`: media order within the entry.
+- `alt_text`: provider alt text for this exact media object, nullable.
 - `status`: `pending`, `ready`, or `error`.
 - `r2_key`, `content_type`, `bytes`, `etag`: set only after a completed R2 write.
 - `error_code`, `attempt_count`, `created_at`, `updated_at`.
@@ -243,9 +252,9 @@ Every Threads application route except the OAuth callback requires the existing 
 
 ### Pages and data
 
-- `GET /threads?page=N`: list ten archives newest-created-first. It accepts only one positive `page` parameter and clamps an out-of-range page to the final logical page.
+- `GET /threads?page=N&flash=KEY`: list ten archives newest-created-first. It accepts one positive `page` and one optional fixed allowlisted `flash`; the Worker removes `flash` before domain query parsing and clamps an out-of-range page to the final logical page.
 - `POST /threads`: accept exact fields `csrf` and `url`; create or queue an additive sync.
-- `GET /threads/:id?repliesPage=N`: render a complete detail page with twenty author replies per page. Enhanced JSON returns root, quote, first/current reply page, media states, progress counts, and fixed action URLs; it never returns provider tokens or CDN URLs.
+- `GET /threads/:id?repliesPage=N&flash=KEY`: render a complete detail page with twenty author replies per page. It accepts one positive `repliesPage` and one optional fixed allowlisted `flash`; the Worker removes `flash` before domain query parsing. Enhanced JSON returns root, quote, first/current reply page, media states, progress counts, and fixed action URLs; it never returns provider tokens or CDN URLs.
 - `POST /threads/:id/sync`: accept exact field `csrf` and queue the next generation.
 - `POST /threads/:id/delete`: accept exact fields `csrf` and `confirm=yes`, mark the archive `deleting`, and queue cleanup.
 - `POST /threads/:id/media/:mediaId/retry`: accept exact field `csrf` and retry only a failed media item scoped to that archive.
@@ -256,7 +265,7 @@ The enhanced list polls `GET /threads/:id` with `Accept: application/json` only 
 ### OAuth
 
 - `GET /threads/connect`
-- `GET /threads/oauth/callback?code=...&state=...` or the provider's exact denied-error form
+- `GET /threads/oauth/callback?code={CODE}&state={STATE}` or the provider's exact denied-error form
 - `POST /threads/disconnect` with exact field `csrf`
 
 Unknown nested routes, malformed IDs, duplicated/unknown fields or query keys, invalid media types, and unsupported methods continue through the current safe routing boundary.

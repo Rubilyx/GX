@@ -224,6 +224,7 @@ function ownerCorrectionStatements(db, winner, loser, providerId, claim, now) {
            WHERE winner_job.threads_post_id = winner.id
              AND winner_job.generation = ? AND winner_job.generation = winner.sync_generation
              AND winner_job.status = ?
+             AND winner_job.status IN ('queued','resolving','collecting')
          )
          AND EXISTS (
            SELECT 1 FROM threads_posts loser

@@ -620,14 +620,14 @@ test("Threads finalization is idempotent, stale generations cannot advance statu
   );
 });
 
-/** @param {D1Database} db @param {string} id @param {number} createdAt */
-async function seedCollisionCandidate(db, id, createdAt) {
+/** @param {D1Database} db @param {string} id @param {number} createdAt @param {string} [jobStatus] */
+async function seedCollisionCandidate(db, id, createdAt, jobStatus = "resolving") {
   return seedThreadsArchive(db, {
     id, shortcode: `${id}Short`, threadsMediaId: null,
     submittedUrl: `https://threads.net/t/${id}Short`, canonicalUrl: null,
     status: "collecting", authorId: `${id}-seed-author`, username: id,
     displayName: id, rootEntryId: `${id}-unused-root`, withRoot: false,
-    jobStatus: "resolving", createdAt, updatedAt: createdAt,
+    jobStatus, createdAt, updatedAt: createdAt,
   });
 }
 
@@ -746,6 +746,44 @@ async function collisionPairSnapshot(db) {
        ORDER BY threads_post_id, generation`,
     ).all().then((result) => result.results),
   };
+}
+
+/** @param {D1Database} db @param {string} winnerJobStatus */
+async function assertTerminalWinnerJobCannotClaim(db, winnerJobStatus) {
+  await seedCollisionCandidate(db, "older-local", 10, winnerJobStatus);
+  await seedCollisionCandidate(db, "newer-local", 20);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "newer-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 21,
+  }), true);
+  const initialSnapshot = await collisionPairSnapshot(db);
+  let beforeBatchSnapshot;
+  const intercepted = interceptFirstBatch(db, async () => {
+    beforeBatchSnapshot = await collisionPairSnapshot(db);
+  });
+  assert.equal(await saveResolvedThreadsRoot(intercepted, {
+    postId: "older-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 22,
+  }), false);
+  if (!beforeBatchSnapshot) throw new Error("test_collision_claim_snapshot_missing");
+  assert.deepEqual(beforeBatchSnapshot, initialSnapshot);
+  assert.deepEqual(await collisionPairSnapshot(db), beforeBatchSnapshot);
+  assert.equal(await db.prepare(
+    "SELECT threads_media_id FROM threads_posts WHERE id = 'older-local'",
+  ).first("threads_media_id"), null);
+  assert.equal(await db.prepare(
+    "SELECT threads_media_id FROM threads_posts WHERE id = 'newer-local'",
+  ).first("threads_media_id"), "provider-shared-root");
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE threads_media_id LIKE 'claim:%'",
+  ).first("count"), 0);
+}
+
+for (const winnerJobStatus of ["media_pending", "ready", "partial", "error"]) {
+  test(`Threads collision claim rejects initial ${winnerJobStatus} winner job before batch`, async () => {
+    const db = (await harness.worker.getEnv()).PROD_DB;
+    await assertTerminalWinnerJobCannotClaim(db, winnerJobStatus);
+  });
 }
 
 /** @param {D1Database} db @param {() => Promise<unknown>} mutateLoser */

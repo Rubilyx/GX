@@ -13,7 +13,10 @@ const badUrl = () => { throw new AppError("invalid_threads_url", 400); };
 /** @param {unknown} raw @returns {ThreadsUrl} */
 export function normalizeThreadsUrl(raw) {
   const submitted = String(raw).trim();
-  const authority = submitted.match(/^https:\/\/([^/?#]*)/i)?.[1] ?? "";
+  const authorityStart = submitted.slice(0, 8).toLowerCase() === "https://" ? 8 : -1;
+  const separators = authorityStart >= 0 ? [submitted.indexOf("/", authorityStart), submitted.indexOf("?", authorityStart), submitted.indexOf("#", authorityStart)].filter((index) => index >= 0) : [];
+  const authorityEnd = separators.length ? Math.min(...separators) : submitted.length;
+  const authority = authorityStart >= 0 ? submitted.slice(authorityStart, authorityEnd) : "";
   const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
   if (hostPort.includes(":")) return badUrl();
   let url;

@@ -1,4 +1,5 @@
 import { createTestHarness } from "wrangler";
+import { handleThreadsCaptureMessage } from "../../src/threads-capture.js";
 import { handleRequest } from "../../src/worker.js";
 import { validateCaptureMessage, validateMediaMessage } from "../../src/threads-domain.js";
 
@@ -114,8 +115,14 @@ function fixturePage(pages, after, path) {
 /** @param {unknown} status @param {string} route */
 function fixtureStatus(status, route) {
   if (typeof status === "number") return status;
-  const routes = status && typeof status === "object" ? /** @type {Record<string, number>} */ (status) : null;
-  return routes && Number.isInteger(routes[route]) ? routes[route] : 200;
+  const routes = status && typeof status === "object" ?
+    /** @type {Record<string, number | number[]>} */ (status) : null;
+  const value = routes?.[route];
+  if (Array.isArray(value)) {
+    const next = value.length > 1 ? value.shift() : value[0];
+    return Number.isInteger(next) ? next : 200;
+  }
+  return Number.isInteger(value) ? value : 200;
 }
 
 /** @typedef {{ id: string, githubId: string, owner: string, name: string, htmlUrl: string, description: string | null, homepageUrl: string | null, defaultBranch: string, primaryLanguage: string | null, stars: number, forks: number, licenseSpdx: string | null, topics: string[], githubUpdatedAt: string, githubPushedAt: string | null, activityRefreshedAt: number | null, activityRefreshGeneration: number, readmeSha: string | null, readmeStatus: string, summary: string | null, problem: string | null, values: string[], audience: string | null, cautions: string | null, primaryCategory: string | null, analysisStatus: string, analysisErrorCode: string | null, analysisModel: string | null, promptVersion: string | null, analysisStartedAt: number | null, personalNote: string, analysisGeneration: number, tags: string[], createdAt: number | null }} SeedRepository */
@@ -197,7 +204,7 @@ export async function seedNamedRepositories(db, count, options = {}) {
   }
 }
 
-/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number>, threadsRetryAfter?: string, threadsDebug?: Record<string, any>, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
+/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number | number[]>, threadsRetryAfter?: string, threadsDebug?: Record<string, any>, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
 export function providerFixture(options = {}) {
   const {
   metadata = metadataFixture,
@@ -270,7 +277,10 @@ export function providerFixture(options = {}) {
       const status = fixtureStatus(threadsStatus, route);
       return status === 200 ? null : new Response(null, { status, headers: threadsRetryAfter ? { "Retry-After": threadsRetryAfter } : {} });
     };
-    if (url.origin === "https://www.threads.com" && method === "GET" && url.pathname === "/t/RootShort" && !url.search && !request.headers.get("authorization")) {
+    if (["https://www.threads.com", "https://threads.com", "https://www.threads.net",
+      "https://threads.net"].includes(url.origin) && method === "GET" &&
+      url.pathname === "/t/RootShort" && !url.search &&
+      !request.headers.get("authorization")) {
       calls?.push({ method, path });
       return new Response(null, { status: 302, headers: { Location: "https://www.threads.com/@meta/post/RootShort" } });
     }
@@ -522,6 +532,28 @@ export async function startHarness() {
   }
   /** @param {{ reject?: boolean }} options */
   async function setAssetMode(options) { assetMode = { ...options }; }
+  /** @param {{ getAccessToken?: () => Promise<Record<string, unknown>>, nowSeconds?: number, signal?: AbortSignal, deleteArchive?: (message: Record<string, unknown>) => Promise<unknown> }} [options] */
+  async function drainCaptureQueue(options = {}) {
+    const env = await worker.getEnv();
+    let processed = 0;
+    let retries = 0;
+    while (captureMessages.length) {
+      if (processed >= 500) throw new Error("test_capture_queue_did_not_quiesce");
+      const message = captureMessages.shift();
+      const result = await handleThreadsCaptureMessage(message, {
+        db: env.PROD_DB, captureQueue, mediaQueue, fetcher: outboundFetch,
+        getAccessToken: options.getAccessToken ?? (async () => ({ accessToken: "long-token" })),
+        nowSeconds: options.nowSeconds ?? 4_000, signal: options.signal,
+        deleteArchive: options.deleteArchive ?? (async () => ({ action: "ack" })),
+      });
+      processed += 1;
+      if (result.action === "retry") {
+        retries += 1;
+        captureMessages.push(validateCaptureMessage(structuredClone(message)));
+      } else if (result.action !== "ack") throw new Error("test_invalid_capture_action");
+    }
+    return { processed, retries };
+  }
   function providerCalls() {
     return server.getLogs().flatMap((entry) =>
       JSON.stringify(entry).match(/provider_fixture:[a-z_]+/g) ?? []);
@@ -547,6 +579,7 @@ export async function startHarness() {
   return {
     get url() { return url; },
     server, worker, captureQueue, mediaQueue, captureMessages, mediaMessages,
-    setProviderMode, setQueueMode, setAssetMode, providerCalls, reset, close,
+    setProviderMode, setQueueMode, setAssetMode, drainCaptureQueue,
+    providerCalls, reset, close,
   };
 }

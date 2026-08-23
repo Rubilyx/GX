@@ -296,13 +296,21 @@ async function currentState(db, postId, generation) {
   return row;
 }
 const AGGREGATE_KEYS = [
-  "error_code", "root_count", "entry_count", "media_count", "ready_count",
-  "failed_count", "pending_count",
+  "error_code", "quote_error_code", "quote_error_count", "root_count", "entry_count",
+  "media_count", "ready_count", "failed_count", "pending_count",
 ];
 /** @param {any} db @param {string} postId @param {number} generation */
 async function aggregateRow(db, postId, generation) {
   const row = await db.prepare(
     `SELECT j.error_code,
+       (SELECT MIN(e.quote_error_code) FROM threads_entries e
+        WHERE e.threads_post_id = p.id AND e.kind IN ('root','author_reply')
+          AND e.quote_status = 'error' AND e.quote_generation = j.generation
+       ) AS quote_error_code,
+       (SELECT COUNT(*) FROM threads_entries e
+        WHERE e.threads_post_id = p.id AND e.kind IN ('root','author_reply')
+          AND e.quote_status = 'error' AND e.quote_generation = j.generation
+       ) AS quote_error_count,
        (SELECT COUNT(*) FROM threads_entries e
         WHERE e.threads_post_id = p.id AND e.kind = 'root') AS root_count,
        (SELECT COUNT(*) FROM threads_entries e
@@ -335,9 +343,12 @@ async function aggregateRow(db, postId, generation) {
   ).bind(generation, postId, generation).first();
   if (row === null) return null;
   const result = exactRow(row, AGGREGATE_KEYS);
-  if (!(result.error_code === null || typeof result.error_code === "string")) invalidStorage();
+  if (!(result.error_code === null || typeof result.error_code === "string") ||
+    !(result.quote_error_code === null || typeof result.quote_error_code === "string"))
+    invalidStorage();
   for (const key of ["root_count", "entry_count", "media_count", "ready_count",
-    "failed_count", "pending_count"]) d1NonnegativeInteger(result[key]);
+    "failed_count", "pending_count", "quote_error_count"])
+    d1NonnegativeInteger(result[key]);
   return result;
 }
 
@@ -356,7 +367,8 @@ export async function recalculateThreadsStatus(db, input) {
     }
     let status;
     if (aggregate.root_count === 0) status = "error";
-    else if (aggregate.failed_count > 0 || aggregate.error_code !== null) status = "partial";
+    else if (aggregate.failed_count > 0 || aggregate.error_code !== null ||
+      aggregate.quote_error_count > 0) status = "partial";
     else if (aggregate.pending_count > 0) status = "media_pending";
     else status = "ready";
     const postStatus = status === "media_pending" ? "collecting" : status;
@@ -375,12 +387,13 @@ export async function recalculateThreadsStatus(db, input) {
                AND profile_cursor IS NULL AND conversation_cursor IS NULL
                AND pending_quote_count = 0
            )`,
-      ).bind(postStatus, postStatus, aggregate.error_code, postStatus, now, now,
+      ).bind(postStatus, postStatus,
+        aggregate.error_code ?? aggregate.quote_error_code, postStatus, now, now,
         postId, generation, postId, generation),
       db.prepare(
         `UPDATE threads_sync_jobs SET status = ?, expected_entry_count = ?,
            expected_media_count = ?, ready_media_count = ?, failed_media_count = ?,
-           completed_at = ?, updated_at = ?
+           error_code = ?, completed_at = ?, updated_at = ?
          WHERE threads_post_id = ? AND generation = ? AND status = 'media_pending'
            AND content_completed_at IS NOT NULL AND profile_cursor IS NULL
            AND conversation_cursor IS NULL AND pending_quote_count = 0
@@ -389,7 +402,8 @@ export async function recalculateThreadsStatus(db, input) {
                AND status <> 'deleting'
            )`,
       ).bind(status, aggregate.entry_count, aggregate.media_count,
-        aggregate.ready_count, aggregate.failed_count, completed, now,
+        aggregate.ready_count, aggregate.failed_count,
+        aggregate.error_code ?? aggregate.quote_error_code, completed, now,
         postId, generation, postId, generation),
     ]), 2);
     if (changes.some((count) => count > 1) || changes[0] !== changes[1]) invalidStorage();

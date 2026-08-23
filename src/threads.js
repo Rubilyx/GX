@@ -1,5 +1,6 @@
 export {
-  failThreadsQuote, saveResolvedThreadsRoot, saveThreadsConversationPage, saveThreadsQuote,
+  failThreadsQuote, listThreadsPendingQuoteWork, saveResolvedThreadsRoot,
+  saveThreadsConversationPage, saveThreadsQuote,
 } from "./threads-storage.js";
 export { listThreadsArchives, getThreadsArchive } from "./threads-reads.js";
 export {

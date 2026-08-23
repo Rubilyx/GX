@@ -85,6 +85,7 @@ test("reference widths use the approved grid without horizontal overflow", async
         gutter: Number.parseFloat(root.getPropertyValue("--layout-gutter")),
         gap: Number.parseFloat(root.getPropertyValue("--layout-gap")),
         main: main.getBoundingClientRect().width,
+        captureWidth: capture.getBoundingClientRect().width,
         filter: getComputedStyle(filter).gridTemplateColumns.split(" ").length,
         filterInsideHeader: header.contains(filter),
         gallery: getComputedStyle(gallery).gridTemplateColumns.split(" ").length,
@@ -140,13 +141,15 @@ test("reference widths use the approved grid without horizontal overflow", async
       titleDecoration: "none",
     });
     expect(layout.selectPaddingEnd).toBeGreaterThanOrEqual(32);
-    expect(layout.headingFontSize).toBe(28);
+    expect(layout.headingFontSize).toBe(24);
     expect(Math.abs(layout.avatarWidth - 48)).toBeLessThanOrEqual(1);
     expect(Math.abs(layout.avatarHeight - 48)).toBeLessThanOrEqual(1);
     expect(layout.avatarRadius).toBe("50%");
     expect(layout.avatarLeft).toBeGreaterThanOrEqual(layout.cardLeft);
     expect(layout.avatarRight).toBeLessThanOrEqual(layout.cardRight);
     expect(Math.abs(layout.main - scenario.max)).toBeLessThanOrEqual(1);
+    const expectedCaptureWidth = scenario.width >= 840 ? layout.main * 0.6 : layout.main;
+    expect(Math.abs(layout.captureWidth - expectedCaptureWidth)).toBeLessThanOrEqual(1);
     expect(Math.abs(layout.logoutRight - layout.headerRight)).toBeLessThanOrEqual(1);
     expect(layout.captureStatusDisplay).toBe("none");
     expect(layout.filterBottom).toBeLessThanOrEqual(layout.captureTop);

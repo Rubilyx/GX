@@ -425,7 +425,7 @@ test("index header places the filter responsively beside the title", async () =>
     gap: "var(--space-3)",
   });
   assertOwnRule(repositories, ".index-header > h1", {
-    "font-size": "1.75rem",
+    "font-size": "1.5rem",
     "grid-column": "1",
     "grid-row": "1",
   });
@@ -783,6 +783,7 @@ test("detail and status declarations belong to real rules in the required media 
       "grid-template-columns": `repeat(${expected.gallery}, minmax(0, 1fr))`,
     });
     if (width === "840px") {
+      assertOwnRule(media[0].children, "repo-capture", { "inline-size": "60%" });
       assertOwnRule(media[0].children, ".repository-facts > dl", {
         "grid-template-columns": "minmax(7rem, 0.28fr) minmax(0, 1fr)",
       });

@@ -8,7 +8,7 @@
     gap: var(--space-3);
   }
 
-  .index-header > h1 { grid-column: 1; grid-row: 1; font-size: 1.75rem; }
+  .index-header > h1 { grid-column: 1; grid-row: 1; font-size: 1.5rem; }
   .index-header > repo-filter { min-width: 0; }
   :where(.index-header) > form { justify-self: end; }
 
@@ -616,6 +616,7 @@
     .index-header { grid-template-columns: max-content minmax(0, 1fr) max-content; }
     .index-header > repo-filter { grid-column: 2; grid-row: 1; }
     :where(.index-header) > form { grid-column: 3; grid-row: 1; }
+    repo-capture { inline-size: 60%; }
     repo-panel > section { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .repository-facts > dl { grid-template-columns: minmax(7rem, 0.28fr) minmax(0, 1fr); }
     .repository-facts > dl dd {

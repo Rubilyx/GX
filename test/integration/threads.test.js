@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { startHarness } from "../support/harness.js";
 
+/** @type {Awaited<ReturnType<typeof startHarness>>} */
 let harness;
 before(async () => { harness = await startHarness(); });
 beforeEach(async () => { await harness.reset(); });
@@ -12,25 +13,27 @@ test("0004 creates the normalized Threads archive schema", async () => {
   const tables = await env.PROD_DB.prepare(
     "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 'threads_%' ORDER BY name",
   ).all();
-  assert.deepEqual(tables.results.map((row) => row.name), [
+  assert.deepEqual(tables.results.map(/** @param {Record<string, unknown>} row */ (row) => String(row.name)), [
     "threads_authors", "threads_entries", "threads_links", "threads_media",
     "threads_oauth_credentials", "threads_posts", "threads_sync_jobs",
   ]);
   const indexes = await env.PROD_DB.prepare(
     "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'threads_entries' ORDER BY name",
   ).all();
-  assert.ok(indexes.results.some((row) => row.name === "threads_entries_primary_source_idx"));
-  assert.ok(indexes.results.some((row) => row.name === "threads_entries_quote_source_idx"));
+  assert.ok(indexes.results.some(/** @param {Record<string, unknown>} row */ (row) => row.name === "threads_entries_primary_source_idx"));
+  assert.ok(indexes.results.some(/** @param {Record<string, unknown>} row */ (row) => row.name === "threads_entries_quote_source_idx"));
   for (const table of ["threads_entries", "threads_media", "threads_links", "threads_sync_jobs"]) {
     const foreignKeys = await env.PROD_DB.prepare(`PRAGMA foreign_key_list(${table})`).all();
-    assert.ok(foreignKeys.results.some((row) => row.on_delete === "CASCADE"), table);
+    assert.ok(foreignKeys.results.some(/** @param {Record<string, unknown>} row */ (row) => row.on_delete === "CASCADE"), table);
   }
 });
 
 test("Threads entries enforce identity, quote parents, cascades, and OAuth singleton", async () => {
-  const db = await harness.worker.getEnv().then((env) => env.PROD_DB);
+  const env = await harness.worker.getEnv();
+  const db = env.PROD_DB;
   await db.prepare("INSERT INTO threads_authors (threads_user_id, username, display_name) VALUES ('author', 'author', 'Author'), ('reply', 'reply', 'Reply')").run();
   await db.prepare("INSERT INTO threads_posts (id, shortcode, submitted_url, status, root_author_id) VALUES ('post', 'short', 'https://www.threads.net/t/short', 'ready', 'author')").run();
+  /** @param {string} id @param {string} source @param {'root' | 'author_reply' | 'quote'} kind @param {string | null} [parent] @param {string} [author] @param {string} [post] */
   const entry = (id, source, kind, parent = null, author = "author", post = "post") => db.prepare(
     `INSERT INTO threads_entries (id, threads_post_id, source_media_id, kind, parent_entry_id, author_id, text, published_at, media_type, first_seen_at, last_seen_at)
      VALUES (?, ?, ?, ?, ?, ?, '', '2026-08-24T00:00:00Z', 'TEXT_POST', 1, 1)`,

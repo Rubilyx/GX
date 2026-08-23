@@ -18,6 +18,7 @@ function normalizedMetadata(metadata) {
     defaultBranch: nfc(metadata.defaultBranch), primaryLanguage: nfc(metadata.primaryLanguage),
     licenseSpdx: nfc(metadata.licenseSpdx),
     topics: metadata.topics.map(nfc), githubUpdatedAt: nfc(metadata.githubUpdatedAt),
+    githubPushedAt: nfc(metadata.githubPushedAt),
   };
 }
 
@@ -64,6 +65,68 @@ function sourceRow(value) {
     typeof value.name !== "string" || !value.name ||
     typeof value.github_id !== "string" || !value.github_id) invalidStorage();
   return value;
+}
+
+/** @param {any} value */
+function activityLeaseRow(value) {
+  const row = sourceRow(value);
+  if (row === null) return null;
+  if (!Number.isInteger(row.activity_refresh_generation) || row.activity_refresh_generation < 1)
+    invalidStorage();
+  return row;
+}
+
+/** @param {any} db @param {string} id */
+async function claimActivityRefresh(db, id) {
+  try {
+    return activityLeaseRow(await db.prepare(
+      `UPDATE repositories
+       SET activity_refresh_generation = activity_refresh_generation + 1
+       WHERE id = ?
+       RETURNING owner, name, github_id, activity_refresh_generation`,
+    ).bind(id).first());
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {string} id @param {number} generation */
+async function releaseActivityRefresh(db, id, generation) {
+  try {
+    const released = mutationChanges(await db.prepare(
+      `UPDATE repositories
+       SET activity_refresh_generation = activity_refresh_generation - 1
+       WHERE id = ? AND activity_refresh_generation = ?`,
+    ).bind(id, generation).run());
+    if (released > 1) invalidStorage();
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {string} id @param {any} lease @param {typeof fetch} fetcher @param {{ owner: string, name: string }} [repositoryRef] */
+async function fetchClaimedActivity(db, id, lease, fetcher, repositoryRef = lease) {
+  try {
+    const metadata = normalizedMetadata(await fetchRepositoryMetadata(
+      fetcher, repositoryRef, AbortSignal.timeout(8_000),
+    ));
+    if (metadata.githubId !== lease.github_id) throw new AppError("github_not_found", 404);
+    return metadata;
+  } catch (error) {
+    await releaseActivityRefresh(db, id, lease.activity_refresh_generation);
+    throw error;
+  }
+}
+
+/** @param {any} db @param {string} id @param {any} lease @param {any} metadata */
+async function persistClaimedActivity(db, id, lease, metadata) {
+  try {
+    const updated = mutationChanges(await db.prepare(
+      `UPDATE repositories
+       SET github_pushed_at = ?, activity_refreshed_at = unixepoch()
+       WHERE id = ? AND github_id = ? AND activity_refresh_generation = ?`,
+    ).bind(
+      metadata.githubPushedAt, id, lease.github_id, lease.activity_refresh_generation,
+    ).run());
+    if (updated > 1) invalidStorage();
+    return updated === 1;
+  } catch (error) { throw storageError(error); }
 }
 
 /** @param {any} db @param {string} repositoryId @param {number} generation @param {any} repository @param {any} readme @param {Dependencies} dependencies */
@@ -140,10 +203,12 @@ export async function collectRepository(db, rawUrl, dependencies) {
       `INSERT INTO repositories (
         id, github_id, owner, name, html_url, description, homepage_url,
         default_branch, primary_language, stars, forks, license_spdx,
-        topics_json, github_updated_at, readme_status, source_refreshed_at,
+        topics_json, github_updated_at, github_pushed_at, activity_refreshed_at,
+        activity_refresh_generation,
+        readme_status, source_refreshed_at,
         values_json, analysis_status, analysis_started_at, analysis_generation
       )
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unavailable',
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), 1, 'unavailable',
         unixepoch(), '[]', 'pending', unixepoch(), 1
       WHERE (SELECT COUNT(*) FROM repositories) < 1000
       ON CONFLICT(github_id) DO NOTHING
@@ -152,7 +217,7 @@ export async function collectRepository(db, rawUrl, dependencies) {
       repositoryId, metadata.githubId, metadata.owner, metadata.name, metadata.htmlUrl,
       metadata.description, metadata.homepageUrl, metadata.defaultBranch,
       metadata.primaryLanguage, metadata.stars, metadata.forks, metadata.licenseSpdx,
-      JSON.stringify(metadata.topics), metadata.githubUpdatedAt,
+      JSON.stringify(metadata.topics), metadata.githubUpdatedAt, metadata.githubPushedAt,
     ).first(), true);
     if (!inserted) {
       const existing = await db.prepare(
@@ -163,10 +228,18 @@ export async function collectRepository(db, rawUrl, dependencies) {
         !["pending", "ready", "error"].includes(existing.analysis_status) ||
         !(existing.analysis_error_code === null || typeof existing.analysis_error_code === "string"))
         invalidStorage();
+      const activityLease = await claimActivityRefresh(db, existing.id);
+      if (!activityLease) throw new AppError("github_not_found", 404);
+      const currentMetadata = await fetchClaimedActivity(
+        db, existing.id, activityLease, dependencies.fetcher, metadata,
+      );
       if (mutationChanges(await db.prepare(
         "UPDATE repositories SET owner = ?, name = ?, html_url = ?, updated_at = unixepoch() WHERE id = ?",
-      ).bind(metadata.owner, metadata.name, metadata.htmlUrl, existing.id).run()) !== 1)
+      ).bind(
+        currentMetadata.owner, currentMetadata.name, currentMetadata.htmlUrl, existing.id,
+      ).run()) !== 1)
         invalidStorage();
+      await persistClaimedActivity(db, existing.id, activityLease, currentMetadata);
       return result(existing.id, existing.analysis_status, existing.analysis_error_code, true);
     }
   } catch (error) {
@@ -205,6 +278,7 @@ function mapRepository(row, tags = []) {
     defaultBranch: row.default_branch, primaryLanguage: row.primary_language,
     stars: row.stars, forks: row.forks, licenseSpdx: row.license_spdx,
     topics: jsonArray(row.topics_json), githubUpdatedAt: row.github_updated_at,
+    githubPushedAt: row.github_pushed_at, activityRefreshedAt: row.activity_refreshed_at,
     readmeSha: row.readme_sha, readmeStatus: row.readme_status,
     sourceRefreshedAt: row.source_refreshed_at, summary: row.summary,
     problem: row.problem, values: jsonArray(row.values_json), audience: row.audience,
@@ -349,19 +423,21 @@ export async function deleteRepository(db, id) {
   } catch (error) { throw storageError(error); }
 }
 
+/** @param {any} db @param {string} id @param {typeof fetch} fetcher */
+export async function refreshRepositoryActivity(db, id, fetcher) {
+  const current = await claimActivityRefresh(db, id);
+  if (!current) throw new AppError("github_not_found", 404);
+  const metadata = await fetchClaimedActivity(db, id, current, fetcher);
+  await persistClaimedActivity(db, id, current, metadata);
+  return getRepository(db, id);
+}
+
 /** @param {any} db @param {string} id @param {Dependencies} dependencies */
 export async function refreshRepository(db, id, dependencies) {
-  let current;
-  try {
-    current = sourceRow(await db.prepare(
-      "SELECT owner, name, github_id FROM repositories WHERE id = ?",
-    ).bind(id).first());
-  } catch (error) { throw storageError(error); }
+  const current = await claimActivityRefresh(db, id);
   if (!current) throw new AppError("github_not_found", 404);
-  const metadata = normalizedMetadata(await fetchRepositoryMetadata(
-    dependencies.fetcher, current, AbortSignal.timeout(8_000),
-  ));
-  if (metadata.githubId !== current.github_id) throw new AppError("github_not_found", 404);
+  const metadata = await fetchClaimedActivity(db, id, current, dependencies.fetcher);
+  await persistClaimedActivity(db, id, current, metadata);
   const readme = await fetchRepositoryReadme(
     dependencies.fetcher, metadata, AbortSignal.timeout(8_000),
   );

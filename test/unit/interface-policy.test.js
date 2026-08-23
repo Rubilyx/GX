@@ -538,10 +538,10 @@ test("each navigation selector owns its normalized 44px target declarations", as
   assertOwnRule(repositories, ".repository-actions > [data-repository-link]", {
     "margin-inline-start": "auto",
   });
-  const detailHover = assertOwnRule(repositories, ".repository-actions > a:first-child:hover", {
+  const actionHover = assertOwnRule(repositories, ".repository-actions > a:hover", {
     color: "var(--color-status-danger)",
   });
-  assert.deepEqual([...detailHover.declarations.keys()], ["color"]);
+  assert.deepEqual([...actionHover.declarations.keys()], ["color"]);
   assertOwnRule(repositories, ".category-filter", {
     display: "flex",
     gap: "var(--space-2)",
@@ -603,15 +603,19 @@ test("detail and status declarations belong to real rules in the required media 
   assertOwnRule(repositories,
     "repo-capture [data-capture-status]:has([data-capture-message]:empty)", { display: "none" });
   assertOwnRule(repositories, 'main > p[role="status"]:empty', { display: "none" });
-  assertOwnRule(repositories, "repo-panel article > p", {
+  assertOwnRule(repositories, "repo-panel article > [data-analysis-summary-status]", {
     "background-color": "var(--color-bg-subtle)",
     "font-weight": "500",
+  });
+  assertOwnRule(repositories, ".repository-memo > h3", {
+    margin: "0", color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
   });
   assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"]', {
     color: "var(--color-text-secondary)",
     "background-color": "var(--color-bg-subtle)",
   });
-  assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"] > p', {
+  assertOwnRule(repositories,
+    'repo-panel article[data-analysis-card-status="error"] > [data-analysis-summary-status]', {
     "background-color": "var(--color-bg-danger)",
   });
   assertOwnRule(repositories, ".repository-metadata", {
@@ -623,6 +627,27 @@ test("detail and status declarations belong to real rules in the required media 
   const badgeFields =
     '.repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"])';
   assertOwnRule(repositories, badgeFields, { "grid-column": "1 / -1" });
+  assertOwnRule(repositories, '.repository-metadata > [data-repository-field="activity"]', {
+    "grid-column": "1 / -1",
+  });
+  assertOwnRule(repositories, ':where([data-repository-field="activity"]) > dd', {
+    display: "flex", "align-items": "center", gap: "var(--space-2)", "margin-top": "0",
+  });
+  assertOwnRule(repositories, "[data-repository-activity-form]", {
+    display: "block", margin: "0",
+  });
+  assertOwnRule(repositories, "[data-repository-activity-refresh]", {
+    display: "inline-flex", "align-items": "center", "justify-content": "center",
+    "flex-shrink": "0", "inline-size": "1.75rem", "block-size": "1.75rem",
+    "min-inline-size": "1.75rem", "min-block-size": "1.75rem",
+    padding: "0", color: "var(--color-text-primary)", background: "transparent",
+    border: "0", "border-radius": "0",
+  });
+  const activityHover = assertOwnRule(repositories,
+    "[data-repository-activity-refresh]:hover", {
+      color: "var(--color-status-danger)", background: "transparent",
+    });
+  assert.deepEqual([...activityHover.declarations.keys()], ["color", "background"]);
   assertOwnRule(repositories, `${badgeFields} dd`, { "padding-block": "var(--space-2)" });
   assertOwnRule(repositories, ".repository-metadata dt", {
     color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
@@ -643,12 +668,16 @@ test("detail and status declarations belong to real rules in the required media 
     color: "#ffffff", "background-color": "var(--color-action-primary)",
     "border-color": "var(--color-action-primary)",
   });
-  const metricFields = '.repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"])';
+  const metricFields = '.repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"], [data-repository-field="activity"])';
   assertOwnRule(repositories, metricFields, {
     "padding-block-start": "var(--space-3)",
     "border-top": "1px solid var(--color-border-subtle)",
   });
   assertOwnRule(repositories, `${metricFields} dd`, { "font-weight": "650" });
+  assertOwnRule(repositories,
+    '[data-repository-field="activity"] [data-repository-activity-value] time', {
+      "font-size": "var(--text-sm)", "font-weight": "400",
+    });
 
   /** @type {Array<[string, { filter?: number, gallery: number }]>} */
   const responsiveRules = [

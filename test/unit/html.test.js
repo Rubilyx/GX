@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assetHref, htmlAttr, htmlText, renderIndexPage, renderLoginPage, renderRepositoryPage,
+  repositoryActivity,
 } from "../../src/html.js";
 
 const repository = {
@@ -9,7 +10,9 @@ const repository = {
   name: `x?y"><img src=x>`, description: `<script>alert("description")</script>`,
   homepageUrl: `https://example.test/?x=" onclick="alert(1)`, defaultBranch: `main<&`,
   primaryLanguage: `JS<script>`, stars: 1, forks: 2, licenseSpdx: `MIT<&`,
-  topics: [`topic<script>`], githubUpdatedAt: `today<&`, readmeSha: `sha<script>`,
+  topics: [`topic<script>`], githubUpdatedAt: `today<&`, githubPushedAt: null,
+  activityRefreshedAt: null,
+  readmeSha: `sha<script>`,
   readmeStatus: "ready", sourceRefreshedAt: 1, summary: `<b>summary</b>`, problem: `<i>problem</i>`,
   values: [`<em>value</em>`], audience: `<u>audience</u>`, cautions: `<strong>cautions</strong>`,
   primaryCategory: `Backend"><script>`, analysisStatus: "error", analysisErrorCode: `native secret <x>`,
@@ -116,7 +119,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   const card = html.match(/<article[^>]*>[\s\S]*?<\/article>/)?.[0] ?? "";
   assert.match(card, /^<article data-analysis-card-status="error">/);
   assert.match(card,
-    /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">Memo<\/a><\/div>/);
+    /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">Note 1<\/a><\/div>/);
   assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.doesNotMatch(card, /<dt>Analysis status<\/dt>/);
   assert.match(card,
@@ -251,10 +254,87 @@ test("index compacts card metadata without replacing AI failure content", () => 
   assert.match(cards[1], /data-repository-field="forks"[\s\S]*?<dd>1M<\/dd>/);
   assert.match(cards[1], /<span class="repository-badge">tag&lt;script&gt;<\/span>/);
   assert.doesNotMatch(cards[1], /tag<script>/);
-  for (const current of cards) {
-    assert.match(current,
-      /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Memo<\/a><\/div>/);
-  }
+  assert.match(cards[0],
+    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Note 1<\/a><\/div>/);
+  assert.match(cards[1],
+    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Note 1<\/a><\/div>/);
+});
+
+test("index cards show only a saved memo directly after the description", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [
+      { ...repository, personalNote: "첫 줄\n둘째 줄" },
+      {
+        ...repository, id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        githubId: "43", owner: "Empty", name: "note", personalNote: "",
+      },
+    ],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+  });
+  const [savedCard = "", emptyCard = ""] =
+    html.match(/<article[^>]*>[\s\S]*?<\/article>/g) ?? [];
+
+  assert.match(savedCard,
+    /<p data-analysis-summary-status="error">[\s\S]*?<\/p><div class="repository-memo"><h3>Note<\/h3><p data-repository-memo>첫 줄\n둘째 줄<\/p><\/div>/);
+  assert.match(savedCard, /<a data-repository-link href="[^"]+">Note 1<\/a>/);
+  assert.doesNotMatch(emptyCard, /repository-memo|data-repository-memo|>None</);
+  assert.match(emptyCard, /<a data-repository-link href="[^"]+">Note<\/a>/);
+});
+
+test("index cards show pushed activity with an accessible metadata-only refresh form", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [{
+      ...repository, githubPushedAt: "2026-08-20T00:00:00Z", activityRefreshedAt: 1,
+    }],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+    now: Date.parse("2026-08-23T00:00:00Z"),
+  });
+
+  assert.match(html,
+    /<div data-repository-field="activity"><dt class="visually-hidden">Repository Activity<\/dt><dd><span data-repository-activity-value><time datetime="2026-08-20T00:00:00Z">3일 전 활동<\/time><\/span><form method="post" action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/activity" data-repository-activity-form><input type="hidden" name="csrf" value="csrf"><button type="submit" data-repository-activity-refresh aria-label="a\/b&lt;script&gt;\/x\?y&quot;&gt;&lt;img src=x&gt; 활동 새로고침"><svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 0 0-9-9 9\.75 9\.75 0 0 0-6\.74 2\.74L3 8"\/><path d="M3 3v5h5"\/><path d="M3 12a9 9 0 0 0 9 9 9\.75 9\.75 0 0 0 6\.74-2\.74L21 16"\/><path d="M16 16h5v5"\/><\/svg><\/button><\/form><span class="visually-hidden" data-repository-activity-status role="status" aria-live="polite"><\/span><\/dd><\/div>/);
+});
+
+test("index cards mark pre-migration activity as requiring synchronization", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [{ ...repository, githubPushedAt: null, activityRefreshedAt: null }],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+  });
+
+  assert.match(html,
+    /<span data-repository-activity-value>활동 동기화 필요<\/span>/);
+});
+
+test("index cards distinguish a synchronized repository with no pushes", () => {
+  const html = renderIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repositories: [{ ...repository, githubPushedAt: null, activityRefreshedAt: 1 }],
+    filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
+    availableTags: [], page: 1, totalPages: 1, flash: "",
+  });
+
+  assert.match(html,
+    /<span data-repository-activity-value>활동 내역 없음<\/span>/);
+});
+
+test("repository activity formats invalid, future, and exact unit boundaries", () => {
+  const now = Date.parse("2026-08-23T00:00:00Z");
+  assert.equal(repositoryActivity("invalid", now), null);
+  assert.equal(repositoryActivity("2026-08-24T00:00:00Z", now), "방금 활동");
+  /** @type {Array<[number, string]>} */
+  const boundaries = [
+    [60_000, "1분 전 활동"],
+    [60 * 60_000, "1시간 전 활동"],
+    [30 * 24 * 60 * 60_000, "1개월 전 활동"],
+    [365 * 24 * 60 * 60_000, "1년 전 활동"],
+  ];
+  for (const [elapsed, expected] of boundaries)
+    assert.equal(repositoryActivity(new Date(now - elapsed).toISOString(), now), expected);
 });
 
 test("repository document renders canonical GitHub URL and all native mutation forms", () => {

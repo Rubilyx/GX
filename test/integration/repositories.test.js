@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { after, before, beforeEach, test } from "node:test";
 import {
   providerFixture, seedNamedRepositories, seedRepository, startHarness,
 } from "../support/harness.js";
 import {
   collectRepository, deleteRepository, getRepository, listRepositories,
-  refreshRepository, updateRepository,
+  refreshRepository, refreshRepositoryActivity, updateRepository,
 } from "../../src/repositories.js";
 
 const metadataFixture = {
@@ -22,6 +23,7 @@ const metadataFixture = {
   license: { spdx_id: "MIT" },
   topics: ["example"],
   updated_at: "2026-08-09T00:00:00Z",
+  pushed_at: "2026-08-08T00:00:00Z",
 };
 
 /** @type {{ summary: string, problem: string, values: string[], audience: string, cautions: string, primaryCategory: string, tags: string[] }} */
@@ -92,6 +94,10 @@ test("migration creates four tables and enforces five tags", async () => {
   assert.deepEqual(rows.results.map((row) => row.name), [
     "auth_attempts", "repositories", "repository_tags", "telemetry_daily",
   ]);
+  const columns = await env.PROD_DB.prepare("PRAGMA table_info(repositories)").all();
+  assert.equal(columns.results.some((column) => column.name === "github_pushed_at"), true);
+  assert.equal(columns.results.some((column) => column.name === "activity_refreshed_at"), true);
+  assert.equal(columns.results.some((column) => column.name === "activity_refresh_generation"), true);
 
   await env.PROD_DB.prepare(
     `INSERT INTO repositories
@@ -125,9 +131,10 @@ test("persists GitHub metadata before calling OpenAI", async () => {
     if (url.hostname === "api.github.com") return new Response("# Example");
     if (url.hostname === "api.openai.com") {
       const row = await env.PROD_DB.prepare(
-        "SELECT analysis_status FROM repositories WHERE github_id = ?",
+        "SELECT analysis_status, github_pushed_at FROM repositories WHERE github_id = ?",
       ).bind(String(metadataFixture.id)).first();
-      sawPersisted = row?.analysis_status === "pending";
+      sawPersisted = row?.analysis_status === "pending" &&
+        row.github_pushed_at === metadataFixture.pushed_at;
       return Response.json({
         model: "gpt-5.6-terra-test-snapshot",
         output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify(analysisFixture) }] }],
@@ -160,19 +167,114 @@ test("duplicate canonical rename preserves note analysis and tags", async () => 
   };
   const duplicate = await collectRepository(env.PROD_DB, "https://github.com/old/name", dependencies(fetcher));
   const row = await env.PROD_DB.prepare(
-    "SELECT owner, name, html_url, personal_note, summary FROM repositories WHERE id = ?",
+    "SELECT owner, name, html_url, github_pushed_at, personal_note, summary FROM repositories WHERE id = ?",
   ).bind("existing").first();
   assert.deepEqual(duplicate, {
     repositoryId: "existing", analysisStatus: "ready", errorCode: null, duplicate: true,
   });
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   assert.deepEqual(row, {
     owner: "Renamed", name: "renamed", html_url: "https://github.com/Renamed/renamed",
+    github_pushed_at: "2026-08-08T00:00:00Z",
     personal_note: "보존할 메모", summary: "보존할 요약이다.",
   });
   assert.equal(await env.PROD_DB.prepare(
     "SELECT COUNT(*) AS count FROM repository_tags WHERE repository_id = ?",
   ).bind("existing").first("count"), 1);
+});
+
+test("duplicate save refetches activity after claiming the newest write generation", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    id: "existing", githubId: String(metadataFixture.id), githubPushedAt: "2026-08-01T00:00:00Z",
+  });
+  let announceFirst = () => {};
+  let releaseFirst = () => {};
+  const firstStarted = new Promise((resolve) => { announceFirst = () => resolve(undefined); });
+  const firstGate = new Promise((resolve) => { releaseFirst = () => resolve(undefined); });
+  let metadataCalls = 0;
+  /** @type {typeof fetch} */
+  const duplicateFetcher = async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.hostname !== "api.github.com" || url.pathname.endsWith("/readme"))
+      throw new Error("duplicate path reached a forbidden provider call");
+    metadataCalls += 1;
+    if (metadataCalls === 1) {
+      announceFirst();
+      await firstGate;
+      return Response.json({ ...metadataFixture, pushed_at: "2026-08-02T00:00:00Z" });
+    }
+    return Response.json({ ...metadataFixture, pushed_at: "2026-08-20T00:00:00Z" });
+  };
+  const duplicate = collectRepository(
+    env.PROD_DB, "https://github.com/OpenAI/example", dependencies(duplicateFetcher),
+  );
+  await firstStarted;
+  await refreshRepositoryActivity(env.PROD_DB, "existing", providerFixture({
+    metadata: { ...metadataFixture, pushed_at: "2026-08-10T00:00:00Z" },
+  }));
+  releaseFirst();
+  await duplicate;
+
+  assert.equal(metadataCalls, 2);
+  assert.equal((await getRepository(env.PROD_DB, "existing"))?.githubPushedAt,
+    "2026-08-20T00:00:00Z");
+});
+
+test("newer overlapping activity refresh wins regardless of response order", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    githubId: String(metadataFixture.id), githubPushedAt: "2026-08-01T00:00:00Z",
+  });
+  let announceOld = () => {};
+  let releaseOld = () => {};
+  const oldStarted = new Promise((resolve) => { announceOld = () => resolve(undefined); });
+  const oldGate = new Promise((resolve) => { releaseOld = () => resolve(undefined); });
+  const old = refreshRepositoryActivity(env.PROD_DB, "repo-1", async () => {
+    announceOld();
+    await oldGate;
+    return Response.json({ ...metadataFixture, pushed_at: "2026-08-02T00:00:00Z" });
+  });
+  await oldStarted;
+  await refreshRepositoryActivity(env.PROD_DB, "repo-1", providerFixture({
+    metadata: { ...metadataFixture, pushed_at: "2026-08-20T00:00:00Z" },
+  }));
+  releaseOld();
+  await old;
+
+  assert.equal((await getRepository(env.PROD_DB, "repo-1"))?.githubPushedAt,
+    "2026-08-20T00:00:00Z");
+});
+
+test("activity icon wins over an older full refresh delayed before metadata", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    githubId: String(metadataFixture.id), githubPushedAt: "2026-08-01T00:00:00Z",
+  });
+  let announceFull = () => {};
+  let releaseFull = () => {};
+  const fullStarted = new Promise((resolve) => { announceFull = () => resolve(undefined); });
+  const fullGate = new Promise((resolve) => { releaseFull = () => resolve(undefined); });
+  const base = providerFixture({
+    metadata: { ...metadataFixture, pushed_at: "2026-08-02T00:00:00Z" },
+  });
+  const full = refreshRepository(env.PROD_DB, "repo-1", dependencies(async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.hostname === "api.github.com" && !url.pathname.endsWith("/readme")) {
+      announceFull();
+      await fullGate;
+    }
+    return base(input, init);
+  }));
+  await fullStarted;
+  await refreshRepositoryActivity(env.PROD_DB, "repo-1", providerFixture({
+    metadata: { ...metadataFixture, pushed_at: "2026-08-20T00:00:00Z" },
+  }));
+  releaseFull();
+  await full;
+
+  assert.equal((await getRepository(env.PROD_DB, "repo-1"))?.githubPushedAt,
+    "2026-08-20T00:00:00Z");
 });
 
 test("record 1000 completes and record 1001 stops after metadata", async () => {
@@ -450,6 +552,7 @@ test("successful refresh preserves note and replaces at most five tags", async (
   const row = await getRepository(env.PROD_DB, "repo-1");
   assert.ok(row);
   assert.equal(row.personalNote, "keep");
+  assert.equal(row.githubPushedAt, "2026-08-08T00:00:00Z");
   assert.deepEqual(row.tags, ["five", "four", "one", "three", "two"]);
 });
 
@@ -601,7 +704,12 @@ test("fails closed on malformed D1 mutation results", async (context) => {
   await context.test("duplicate canonical update missing meta", async () => {
     await rejectsStorage(collectRepository(
       d1Stub({
-        first: [null, { id: "repo-1", analysis_status: "ready", analysis_error_code: null }],
+        first: [
+          null,
+          { id: "repo-1", analysis_status: "ready", analysis_error_code: null },
+          { owner: "owner", name: "repository", github_id: "9007199254740000",
+            activity_refresh_generation: 2 },
+        ],
         run: [{ success: true }],
       }),
       "https://github.com/OpenAI/example", dependencies(provider),
@@ -651,9 +759,54 @@ test("fails closed on malformed D1 mutation results", async (context) => {
     let calls = 0;
     const baseFetcher = providerFixture({ metadata: { ...metadataFixture, id: 1 } });
     await rejectsStorage(refreshRepository(
-      d1Stub({ first: [{ owner: "owner", name: "repository", github_id: "1" }, {}] }),
+      d1Stub({
+        first: [{ owner: "owner", name: "repository", github_id: "1",
+          activity_refresh_generation: 2 }, {}],
+        run: [changed(1)],
+      }),
       "repo-1", dependencies(async (input, init) => { calls += 1; return baseFetcher(input, init); }),
     ));
     assert.equal(calls, 2);
+  });
+  await context.test("activity refresh update reports unsuccessful", async () => {
+    let calls = 0;
+    const baseFetcher = providerFixture({ metadata: { ...metadataFixture, id: 1 } });
+    await rejectsStorage(refreshRepositoryActivity(
+      d1Stub({
+        first: [{ owner: "owner", name: "repository", github_id: "1",
+          activity_refresh_generation: 2 }],
+        run: [{ success: false, meta: { changes: 1 } }],
+      }),
+      "repo-1", async (input, init) => { calls += 1; return baseFetcher(input, init); },
+    ));
+    assert.equal(calls, 1);
+  });
+});
+
+test("activity migration preserves populated v1 rows as unsynchronized", async () => {
+  const env = await harness.worker.getEnv();
+  await env.PROD_DB.exec("DROP TABLE repository_tags; DROP TABLE repositories;");
+  const initial = await readFile("migrations/0001_initial.sql", "utf8");
+  const repositoryTable = /CREATE TABLE repositories \([\s\S]*?\n\);/.exec(initial)?.[0];
+  assert.ok(repositoryTable);
+  await env.PROD_DB.prepare(repositoryTable).run();
+  await env.PROD_DB.prepare(
+    `INSERT INTO repositories
+      (id, github_id, owner, name, html_url, default_branch, stars, forks,
+       topics_json, github_updated_at, readme_status, source_refreshed_at,
+       values_json, analysis_status, analysis_generation)
+     VALUES ('legacy', '1', 'owner', 'repo', 'https://github.com/owner/repo', 'main',
+       0, 0, '[]', '2026-08-01T00:00:00Z', 'missing', unixepoch(), '[]', 'ready', 1)`,
+  ).run();
+
+  const activityMigration = await readFile("migrations/0002_repository_activity.sql", "utf8");
+  for (const statement of activityMigration.split(";").map((value) => value.trim()).filter(Boolean))
+    await env.PROD_DB.prepare(statement).run();
+
+  assert.deepEqual(await env.PROD_DB.prepare(
+    `SELECT github_pushed_at, activity_refreshed_at, activity_refresh_generation
+     FROM repositories WHERE id = 'legacy'`,
+  ).first(), {
+    github_pushed_at: null, activity_refreshed_at: null, activity_refresh_generation: 0,
   });
 });

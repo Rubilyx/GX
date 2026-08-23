@@ -45,6 +45,7 @@ const metadataFixture = Object.freeze({
   license: { spdx_id: "MIT" },
   topics: ["example"],
   updated_at: "2026-08-09T00:00:00Z",
+  pushed_at: "2026-08-08T00:00:00Z",
 });
 
 /** @type {{ summary: string, problem: string, values: string[], audience: string, cautions: string, primaryCategory: string, tags: string[] }} */
@@ -58,14 +59,15 @@ const analysisFixture = Object.freeze({
   tags: ["example"],
 });
 
-/** @typedef {{ id: string, githubId: string, owner: string, name: string, htmlUrl: string, description: string | null, homepageUrl: string | null, defaultBranch: string, primaryLanguage: string | null, stars: number, forks: number, licenseSpdx: string | null, topics: string[], githubUpdatedAt: string, readmeSha: string | null, readmeStatus: string, summary: string | null, problem: string | null, values: string[], audience: string | null, cautions: string | null, primaryCategory: string | null, analysisStatus: string, analysisErrorCode: string | null, analysisModel: string | null, promptVersion: string | null, analysisStartedAt: number | null, personalNote: string, analysisGeneration: number, tags: string[], createdAt: number | null }} SeedRepository */
+/** @typedef {{ id: string, githubId: string, owner: string, name: string, htmlUrl: string, description: string | null, homepageUrl: string | null, defaultBranch: string, primaryLanguage: string | null, stars: number, forks: number, licenseSpdx: string | null, topics: string[], githubUpdatedAt: string, githubPushedAt: string | null, activityRefreshedAt: number | null, activityRefreshGeneration: number, readmeSha: string | null, readmeStatus: string, summary: string | null, problem: string | null, values: string[], audience: string | null, cautions: string | null, primaryCategory: string | null, analysisStatus: string, analysisErrorCode: string | null, analysisModel: string | null, promptVersion: string | null, analysisStartedAt: number | null, personalNote: string, analysisGeneration: number, tags: string[], createdAt: number | null }} SeedRepository */
 /** @type {Readonly<SeedRepository>} */
 const seedDefaults = Object.freeze({
   id: "repo-1", githubId: "1", owner: "owner", name: "repository",
   htmlUrl: "https://github.com/owner/repository", description: "description",
   homepageUrl: null, defaultBranch: "main", primaryLanguage: "JavaScript",
   stars: 1, forks: 1, licenseSpdx: "MIT", topics: ["topic"],
-  githubUpdatedAt: "2026-08-09T00:00:00Z", readmeSha: null,
+  githubUpdatedAt: "2026-08-09T00:00:00Z", githubPushedAt: "2026-08-08T00:00:00Z",
+  activityRefreshedAt: 1, activityRefreshGeneration: 1, readmeSha: null,
   readmeStatus: "missing", summary: "기존 요약이다.", problem: "기존 문제다.",
   values: ["기존 가치다."], audience: "개발자", cautions: "주의한다.",
   primaryCategory: "Backend", analysisStatus: "ready", analysisErrorCode: null,
@@ -84,18 +86,20 @@ export async function seedRepository(db, overrides = {}) {
     `INSERT INTO repositories (
       id, github_id, owner, name, html_url, description, homepage_url,
       default_branch, primary_language, stars, forks, license_spdx, topics_json,
-      github_updated_at, readme_sha, readme_status, source_refreshed_at,
+      github_updated_at, github_pushed_at, activity_refreshed_at, activity_refresh_generation,
+      readme_sha, readme_status, source_refreshed_at,
       summary, problem, values_json, audience, cautions, primary_category,
       analysis_status, analysis_error_code, analysis_model, prompt_version,
       analysis_started_at, analyzed_at, personal_note, analysis_generation,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(),
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(),
       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?,
       COALESCE(?, unixepoch()), unixepoch())`,
   ).bind(
     row.id, row.githubId, row.owner, row.name, row.htmlUrl, row.description,
     row.homepageUrl, row.defaultBranch, row.primaryLanguage, row.stars, row.forks,
-    row.licenseSpdx, JSON.stringify(row.topics), row.githubUpdatedAt, row.readmeSha,
+    row.licenseSpdx, JSON.stringify(row.topics), row.githubUpdatedAt, row.githubPushedAt,
+    row.activityRefreshedAt, row.activityRefreshGeneration, row.readmeSha,
     row.readmeStatus, row.summary, row.problem, JSON.stringify(row.values), row.audience,
     row.cautions, row.primaryCategory, row.analysisStatus, row.analysisErrorCode,
     row.analysisModel, row.promptVersion, row.analysisStartedAt, row.personalNote,

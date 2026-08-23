@@ -7,11 +7,11 @@ import { AppError, CATEGORIES, parseListQuery } from "./domain.js";
 import { renderIndexPage, renderLoginPage, renderRepositoryPage } from "./html.js";
 import {
   collectRepository, deleteRepository, getRepository, listRepositories, refreshRepository,
-  updatePersonalNote, updateRepository,
+  refreshRepositoryActivity, updatePersonalNote, updateRepository,
 } from "./repositories.js";
 import { parseCspReport, parseTelemetry, recordTelemetry } from "./telemetry.js";
 
-const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(note|refresh|delete))?$/;
+const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(note|activity|refresh|delete))?$/;
 const ASSET_PATH = /^\/assets\/([^/]+)\/([^/]+)$/;
 const ASSETS = new Set([
   "layers.css", "tokens.css", "core.css", "login.css", "repositories.css",
@@ -19,7 +19,8 @@ const ASSETS = new Set([
 ]);
 const FLASH = new Set([
   "repository_created", "repository_already_saved", "repository_updated", "repository_note_updated",
-  "repository_refreshed", "repository_analysis_error", "repository_deleted",
+  "repository_activity_refreshed", "repository_refreshed", "repository_analysis_error",
+  "repository_deleted",
 ]);
 const COOKIE_EXPIRED = "__Host-repo_atlas_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
 const LOGIN_CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; connect-src 'none'; report-uri /csp-report";
@@ -475,10 +476,12 @@ function captureJson(result) {
 async function mutate(request, runtime, fetcher, id, action, wantsJson) {
   const schema = action === "edit" ? new Set(["csrf", "personalNote", "primaryCategory", "tags"])
     : action === "note" ? new Set(["csrf", "personalNote"])
+      : action === "activity" ? new Set(["csrf"])
       : new Set(["csrf", "confirm"]);
   const form = await parseForm(request, 16_384, schema);
   await requireAuthenticatedMutation(request, runtime, form);
-  if (action !== "edit" && action !== "note" && requiredString(form, "confirm") !== "yes")
+  if (!["edit", "note", "activity"].includes(action) &&
+    requiredString(form, "confirm") !== "yes")
     appError("confirmation_required", 400);
   if (action === "edit") {
     const rawTags = requiredString(form, "tags");
@@ -495,6 +498,11 @@ async function mutate(request, runtime, fetcher, id, action, wantsJson) {
     if (!repository) appError("repository_not_found", 404);
     return wantsJson ? json({ repository })
       : redirect(`/repositories/${id}?flash=repository_note_updated`);
+  }
+  if (action === "activity") {
+    const repository = await refreshRepositoryActivity(runtime.db, id, fetcher);
+    if (!repository) appError("repository_not_found", 404);
+    return wantsJson ? json({ repository }) : redirect("/?flash=repository_activity_refreshed");
   }
   if (action === "refresh") {
     const result = await refreshRepository(runtime.db, id, dependencies(runtime, fetcher));

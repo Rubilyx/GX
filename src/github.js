@@ -132,12 +132,15 @@ function validateMetadata(value) {
     : isPlainObject(value.license) ? stringField(value.license.spdx_id, true) : undefined;
   const topics = value.topics;
   const githubUpdatedAt = value.updated_at;
+  const githubPushedAt = stringField(value.pushed_at, true);
   if (!id || !owner || !name || !defaultBranch ||
     description === undefined || homepageUrl === undefined || primaryLanguage === undefined ||
     typeof stars !== "number" || !Number.isSafeInteger(stars) || stars < 0 ||
     typeof forks !== "number" || !Number.isSafeInteger(forks) || forks < 0 ||
     licenseSpdx === undefined || !Array.isArray(topics) ||
-    topics.some((topic) => typeof topic !== "string") || !validTimestamp(githubUpdatedAt))
+    topics.some((topic) => typeof topic !== "string") || !validTimestamp(githubUpdatedAt) ||
+    githubPushedAt === undefined ||
+    (githubPushedAt !== null && !validTimestamp(githubPushedAt)))
     throw new AppError("github_unavailable", 503);
   return {
     githubId: id,
@@ -153,6 +156,7 @@ function validateMetadata(value) {
     licenseSpdx,
     topics,
     githubUpdatedAt,
+    githubPushedAt,
   };
 }
 

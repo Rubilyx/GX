@@ -20,6 +20,7 @@ const metadata = {
   license: { spdx_id: "Apache-2.0" },
   topics: ["openai", "api"],
   updated_at: "2026-08-01T00:00:00Z",
+  pushed_at: "2026-07-31T23:00:00Z",
 };
 
 /** @param {string} code @param {number} status */
@@ -40,6 +41,7 @@ test("requests only the fixed GitHub API origin with encoded path components", a
   assert.equal(result.githubId, "123456789012");
   assert.equal(result.owner, "OpenAI");
   assert.equal(result.htmlUrl, "https://github.com/OpenAI/openai-node");
+  assert.equal(result.githubPushedAt, "2026-07-31T23:00:00Z");
   assert.ok(seen[0]);
   assert.equal(seen[0].request.url, "https://api.github.com/repos/Open%20AI/node%23sdk");
   assert.equal(seen[0].init?.redirect, "manual");
@@ -106,13 +108,14 @@ test("maps GitHub metadata failures without leaking native or response errors", 
 test("rejects malformed metadata and accepts nullable documented fields", async () => {
   const result = await fetchRepositoryMetadata(async () => Response.json({
     ...metadata, id: "99999999999999999999", description: null, homepage: null,
-    language: null, license: null,
+    language: null, license: null, pushed_at: null,
   }), { owner: "a", name: "b" });
   assert.deepEqual(
     { githubId: result.githubId, description: result.description, homepageUrl: result.homepageUrl,
-      primaryLanguage: result.primaryLanguage, licenseSpdx: result.licenseSpdx },
+      primaryLanguage: result.primaryLanguage, licenseSpdx: result.licenseSpdx,
+      githubPushedAt: result.githubPushedAt },
     { githubId: "99999999999999999999", description: null, homepageUrl: null,
-      primaryLanguage: null, licenseSpdx: null },
+      primaryLanguage: null, licenseSpdx: null, githubPushedAt: null },
   );
 
   for (const bad of [
@@ -124,6 +127,7 @@ test("rejects malformed metadata and accepts nullable documented fields", async 
     { ...metadata, updated_at: "not-a-date" },
     { ...metadata, updated_at: "2026-02-30T00:00:00Z" },
     { ...metadata, updated_at: "2026-08-01T24:00:00Z" },
+    { ...metadata, pushed_at: "not-a-date" },
   ]) {
     await assert.rejects(
       fetchRepositoryMetadata(async () => Response.json(bad), { owner: "a", name: "b" }),

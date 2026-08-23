@@ -101,7 +101,25 @@
     padding-inline-end: 2.75rem;
   }
 
-  repo-panel article > p {
+  .repository-memo {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+
+  .repository-memo > h3 {
+    margin: 0;
+    color: var(--color-text-secondary);
+    font-size: var(--text-sm);
+  }
+
+  .repository-memo > p {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  repo-panel article > [data-analysis-summary-status] {
     margin-block: var(--space-2);
     padding: var(--space-3) var(--space-4);
     background-color: var(--color-bg-subtle);
@@ -110,7 +128,7 @@
     font-weight: 500;
   }
 
-  repo-panel article[data-analysis-card-status="error"] > p {
+  repo-panel article[data-analysis-card-status="error"] > [data-analysis-summary-status] {
     background-color: var(--color-bg-danger);
   }
 
@@ -186,7 +204,7 @@
     text-decoration: none;
   }
 
-  .repository-actions > a:first-child:hover { color: var(--color-status-danger); }
+  .repository-actions > a:hover { color: var(--color-status-danger); }
 
   .repository-metadata {
     display: grid;
@@ -198,6 +216,41 @@
 
   .repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"]) {
     grid-column: 1 / -1;
+  }
+
+  .repository-metadata > [data-repository-field="activity"] { grid-column: 1 / -1; }
+
+  :where([data-repository-field="activity"]) > dd {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: 0;
+  }
+
+  [data-repository-activity-form] {
+    display: block;
+    margin: 0;
+  }
+
+  [data-repository-activity-refresh] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    inline-size: 1.75rem;
+    block-size: 1.75rem;
+    min-inline-size: 1.75rem;
+    min-block-size: 1.75rem;
+    padding: 0;
+    color: var(--color-text-primary);
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+  }
+
+  [data-repository-activity-refresh]:hover {
+    color: var(--color-status-danger);
+    background: transparent;
   }
 
   .repository-metadata > :where([data-repository-field="category"], [data-repository-field="tags"]) dd {
@@ -238,13 +291,18 @@
     border-color: var(--color-action-primary);
   }
 
-  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]) {
+  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"], [data-repository-field="activity"]) {
     padding-block-start: var(--space-3);
     border-top: 1px solid var(--color-border-subtle);
   }
 
-  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"]) dd {
+  .repository-metadata > :where([data-repository-field="stars"], [data-repository-field="forks"], [data-repository-field="language"], [data-repository-field="activity"]) dd {
     font-weight: 650;
+  }
+
+  [data-repository-field="activity"] [data-repository-activity-value] time {
+    font-size: var(--text-sm);
+    font-weight: 400;
   }
 
   .repository-facts > dl {

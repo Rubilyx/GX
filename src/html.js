@@ -12,6 +12,7 @@ const MESSAGE = Object.freeze({
   repository_already_saved: "이미 저장된 저장소입니다.",
   repository_updated: "분류와 메모를 저장했습니다.",
   repository_note_updated: "개인 메모를 저장했습니다.",
+  repository_activity_refreshed: "저장소 활동을 새로고쳤습니다.",
   repository_refreshed: "GitHub 정보와 분석을 새로고쳤습니다.",
   repository_analysis_error: "분석을 완료하지 못했지만 GitHub 정보는 저장했습니다.",
   repository_deleted: "저장소를 삭제했습니다.",
@@ -123,8 +124,24 @@ function compactMetric(value) {
   return `${scaled}${suffix}`;
 }
 
-/** @param {any} repository */
-function repositoryCard(repository) {
+/** @param {unknown} value @param {number} now */
+export function repositoryActivity(value, now) {
+  const updatedAt = Date.parse(String(value ?? ""));
+  if (!Number.isFinite(updatedAt)) return null;
+  const elapsed = Math.max(0, now - updatedAt);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (elapsed < minute) return "방금 활동";
+  if (elapsed < hour) return `${Math.floor(elapsed / minute)}분 전 활동`;
+  if (elapsed < day) return `${Math.floor(elapsed / hour)}시간 전 활동`;
+  if (elapsed < 30 * day) return `${Math.floor(elapsed / day)}일 전 활동`;
+  if (elapsed < 365 * day) return `${Math.floor(elapsed / (30 * day))}개월 전 활동`;
+  return `${Math.floor(elapsed / (365 * day))}년 전 활동`;
+}
+
+/** @param {any} repository @param {number} now @param {string} csrfToken */
+function repositoryCard(repository, now, csrfToken) {
   const analysisStatus = statusKey(repository.analysisStatus);
   const summary = repository.summary || (analysisStatus === "error"
     ? "AI 분석 실패"
@@ -140,9 +157,24 @@ function repositoryCard(repository) {
   const tags = repository.tags?.length ? repository.tags : ["없음"];
   const tagBadges = tags.map((tag) =>
     `<span class="repository-badge">${htmlText(tag)}</span>`).join("");
-  const metadata = `<dl class="repository-metadata"><div data-repository-field="category"><dt>Primary category</dt><dd><span class="repository-badge repository-badge--primary">${htmlText(category)}</span></dd></div><div data-repository-field="tags"><dt>Tags</dt><dd><span class="repository-badge-list">${tagBadges}</span></dd></div><div data-repository-field="stars"><dt>Stars</dt><dd>${htmlText(compactMetric(repository.stars))}</dd></div><div data-repository-field="forks"><dt>Forks</dt><dd>${htmlText(compactMetric(repository.forks))}</dd></div><div data-repository-field="language"><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd></div></dl>`;
-  const actions = `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(detail)}">Memo</a></div>`;
-  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p>${metadata}${actions}</article>`;
+  const activity = repositoryActivity(repository.githubPushedAt, now);
+  const activityValue = repository.activityRefreshedAt === null ||
+    repository.activityRefreshedAt === undefined
+    ? "활동 동기화 필요"
+    : activity
+      ? `<time datetime="${htmlAttr(repository.githubPushedAt)}">${htmlText(activity)}</time>`
+      : "활동 내역 없음";
+  const activityLabel = `${repository.owner}/${repository.name} 활동 새로고침`;
+  const activityIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>';
+  const activityForm = `<form method="post" action="${htmlAttr(`${detail}/activity`)}" data-repository-activity-form>${csrf(csrfToken)}<button type="submit" data-repository-activity-refresh aria-label="${htmlAttr(activityLabel)}">${activityIcon}</button></form>`;
+  const activityStatus = '<span class="visually-hidden" data-repository-activity-status role="status" aria-live="polite"></span>';
+  const metadata = `<dl class="repository-metadata"><div data-repository-field="category"><dt>Primary category</dt><dd><span class="repository-badge repository-badge--primary">${htmlText(category)}</span></dd></div><div data-repository-field="tags"><dt>Tags</dt><dd><span class="repository-badge-list">${tagBadges}</span></dd></div><div data-repository-field="stars"><dt>Stars</dt><dd>${htmlText(compactMetric(repository.stars))}</dd></div><div data-repository-field="forks"><dt>Forks</dt><dd>${htmlText(compactMetric(repository.forks))}</dd></div><div data-repository-field="language"><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd></div><div data-repository-field="activity"><dt class="visually-hidden">Repository Activity</dt><dd><span data-repository-activity-value>${activityValue}</span>${activityForm}${activityStatus}</dd></div></dl>`;
+  const memo = repository.personalNote
+    ? `<div class="repository-memo"><h3>Note</h3><p data-repository-memo>${htmlText(repository.personalNote)}</p></div>`
+    : "";
+  const noteAction = repository.personalNote ? "Note 1" : "Note";
+  const actions = `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(detail)}">${noteAction}</a></div>`;
+  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p>${memo}${metadata}${actions}</article>`;
 }
 
 /** @param {{ q?: string, category?: string, tag?: string }} filters @param {number} page */
@@ -178,9 +210,10 @@ function categoryFilter(categories, filter, counts = {}) {
 /** @param {any} view */
 export function renderIndexPage(view) {
   const repositories = view.repositories ?? [];
+  const now = Number.isFinite(view.now) ? view.now : Date.now();
   const filter = view.filters ?? { q: "", category: "", tag: "" };
   const list = repositories.length
-    ? `<section aria-labelledby="results"><h2 id="results">Repository</h2>${repositories.map(repositoryCard).join("")}</section>`
+    ? `<section aria-labelledby="results"><h2 id="results">Repository</h2>${repositories.map((/** @type {any} */ repository) => repositoryCard(repository, now, view.csrfToken)).join("")}</section>`
     : `<section><h2>저장한 저장소가 없습니다</h2><p role="status">${statusMarker}위 입력란에 공개 GitHub 저장소 URL을 넣어 첫 저장소를 추가하세요.</p></section>`;
   const deleteDialog = `<dialog data-repository-delete-dialog aria-labelledby="repository-delete-dialog-heading" aria-describedby="repository-delete-dialog-warning"><h2 id="repository-delete-dialog-heading">저장소를 삭제할까요?</h2><p class="repository-delete-target"><span>삭제 대상</span><strong data-repository-delete-name></strong></p><p id="repository-delete-dialog-warning" class="repository-delete-warning">저장소와 개인 메모가 영구 삭제되며 복구할 수 없습니다.</p><div class="repository-delete-actions"><form method="dialog"><button type="submit" data-repository-delete-cancel autofocus>취소</button></form><form method="post" data-repository-delete-form>${csrf(view.csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger" data-repository-delete-confirm disabled>저장소 삭제</button></form></div></dialog>`;
   const pagination = view.totalPages > 1 ? `<nav aria-label="페이지">${view.page > 1 ? `<a rel="prev" href="${pageHref(filter, view.page - 1)}">이전</a>` : ""}<span>${htmlText(view.page)} / ${htmlText(view.totalPages)}</span>${view.page < view.totalPages ? `<a rel="next" href="${pageHref(filter, view.page + 1)}">다음</a>` : ""}</nav>` : "";

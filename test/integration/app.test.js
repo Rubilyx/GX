@@ -239,6 +239,70 @@ test("memo route rejects notes over 4000 characters without changing stored data
   assert.equal((await getRepository(env.PROD_DB, repositoryId))?.personalNote, "보존할 메모");
 });
 
+test("activity refresh synchronizes pushed activity with one GitHub metadata request", async () => {
+  const env = await harness.worker.getEnv();
+  const repositoryId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+  await seedRepository(env.PROD_DB, {
+    id: repositoryId, githubId: "9007199254740000", owner: "OpenAI", name: "example",
+    htmlUrl: "https://github.com/OpenAI/example", githubPushedAt: null,
+    activityRefreshedAt: null,
+    personalNote: "보존할 메모", tags: ["keep"], stars: 10,
+  });
+  await env.PROD_DB.prepare(
+    "UPDATE repositories SET updated_at = 123 WHERE id = ?",
+  ).bind(repositoryId).run();
+  const before = await env.PROD_DB.prepare(
+    "SELECT * FROM repositories WHERE id = ?",
+  ).bind(repositoryId).first();
+  /** @type {Array<{ method: string, path: string }>} */
+  const calls = [];
+  await harness.setProviderMode({
+    calls,
+    metadata: {
+      id: 9007199254740000, owner: { login: "OpenAI" }, name: "example",
+      html_url: "https://github.com/OpenAI/example", description: "changed",
+      homepage: null, default_branch: "main", language: "TypeScript",
+      stargazers_count: 999, forks_count: 888, license: { spdx_id: "MIT" },
+      topics: ["changed"], updated_at: "2026-08-23T01:00:00Z",
+      pushed_at: "2026-08-22T12:00:00Z",
+    },
+  });
+  const session = await login(harness.worker);
+
+  const response = await postForm(
+    harness.worker, `/repositories/${repositoryId}/activity`, session, {},
+    { Accept: "application/json" },
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(Object.keys(body), ["repository"]);
+  assert.equal(body.repository.githubPushedAt, "2026-08-22T12:00:00Z");
+  assert.deepEqual(calls, [{ method: "GET", path: "/repos/OpenAI/example" }]);
+  const after = await env.PROD_DB.prepare(
+    "SELECT * FROM repositories WHERE id = ?",
+  ).bind(repositoryId).first();
+  assert.ok(before);
+  assert.ok(after);
+  for (const key of ["github_pushed_at", "activity_refreshed_at", "activity_refresh_generation"])
+    delete before[key], delete after[key];
+  assert.deepEqual(after, before);
+  const stored = await getRepository(env.PROD_DB, repositoryId);
+  assert.ok(stored);
+  assert.equal(stored.githubPushedAt, "2026-08-22T12:00:00Z");
+  assert.equal(typeof stored.activityRefreshedAt, "number");
+  assert.equal(stored.stars, 10);
+  assert.equal(stored.primaryLanguage, "JavaScript");
+  assert.equal(stored.personalNote, "보존할 메모");
+  assert.deepEqual(stored.tags, ["keep"]);
+
+  const native = await postForm(
+    harness.worker, `/repositories/${repositoryId}/activity`, session, {},
+  );
+  assert.equal(native.status, 303);
+  assert.equal(native.headers.get("location"), "/?flash=repository_activity_refreshed");
+});
+
 test("blank tags clear in JSON and native edits while internal empty entries stay invalid", async () => {
   const session = await login(harness.worker);
   const created = await postForm(harness.worker, "/repositories", session, {

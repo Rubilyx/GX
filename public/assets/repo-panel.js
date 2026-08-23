@@ -5,6 +5,49 @@ const NOTE_MESSAGE = Object.freeze({
   session_expired: "세션이 만료되었습니다. 다시 로그인하세요.",
 });
 const NOTE_ERROR = "메모를 저장하지 못했습니다. 다시 시도하세요.";
+const ACTIVITY_ERROR = "활동을 새로고치지 못했습니다.";
+
+/** @param {unknown} value @param {number} [now] */
+function activityText(value, now = Date.now()) {
+  const pushedAt = Date.parse(String(value ?? ""));
+  if (!Number.isFinite(pushedAt)) return null;
+  const elapsed = Math.max(0, now - pushedAt);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (elapsed < minute) return "방금 활동";
+  if (elapsed < hour) return `${Math.floor(elapsed / minute)}분 전 활동`;
+  if (elapsed < day) return `${Math.floor(elapsed / hour)}시간 전 활동`;
+  if (elapsed < 30 * day) return `${Math.floor(elapsed / day)}일 전 활동`;
+  if (elapsed < 365 * day) return `${Math.floor(elapsed / (30 * day))}개월 전 활동`;
+  return `${Math.floor(elapsed / (365 * day))}년 전 활동`;
+}
+
+/** @param {HTMLElement} article @param {string} note */
+function syncCardMemo(article, note) {
+  setText(article, "[data-repository-link]", note ? "Note 1" : "Note");
+  const current = article.querySelector(".repository-memo");
+  if (!note) {
+    current?.remove();
+    return;
+  }
+  if (current instanceof HTMLElement) {
+    setText(current, "[data-repository-memo]", note);
+    return;
+  }
+  const metadata = article.querySelector(".repository-metadata");
+  if (!(metadata instanceof HTMLElement)) return;
+  const memo = document.createElement("div");
+  memo.className = "repository-memo";
+  const heading = document.createElement("h3");
+  heading.textContent = "Note";
+  const content = document.createElement("p");
+  content.dataset.repositoryMemo = "";
+  content.textContent = note;
+  memo.insertAdjacentElement("beforeend", heading);
+  memo.insertAdjacentElement("beforeend", content);
+  metadata.insertAdjacentElement("beforebegin", memo);
+}
 
 /** @param {MouseEvent} event */
 function plainPrimaryClick(event) {
@@ -65,6 +108,11 @@ class RepoPanel extends HTMLElement {
     this.addEventListener("click", (event) => {
       if (deleteSupported && this.openDelete(event, deleteDialog)) return;
       if (detailSupported) this.open(event, dialog);
+    });
+    this.addEventListener("submit", (event) => {
+      const form = event.target;
+      if (form instanceof HTMLFormElement && form.hasAttribute("data-repository-activity-form"))
+        this.refreshActivity(event, form);
     });
   }
 
@@ -192,6 +240,9 @@ class RepoPanel extends HTMLElement {
       const note = form.querySelector("[data-repository-note]");
       if (!(note instanceof HTMLTextAreaElement)) throw new Error("missing_note");
       note.value = repository.personalNote;
+      const article = this.opener?.closest("article");
+      if (article instanceof HTMLElement)
+        syncCardMemo(article, repository.personalNote);
       this.setNoteStatus(dialog, "저장 완료", "success");
     } catch {
       if (!controller.signal.aborted) this.setNoteStatus(dialog, NOTE_ERROR, "error");
@@ -200,6 +251,50 @@ class RepoPanel extends HTMLElement {
         this.noteController = null;
         if (save instanceof HTMLButtonElement) save.disabled = false;
       }
+    }
+  }
+
+  /** @param {SubmitEvent} event @param {HTMLFormElement} form */
+  async refreshActivity(event, form) {
+    event.preventDefault();
+    const button = form.querySelector("[data-repository-activity-refresh]");
+    const field = form.closest('[data-repository-field="activity"]');
+    const value = field?.querySelector("[data-repository-activity-value]");
+    const status = field?.querySelector("[data-repository-activity-status]");
+    if (!(button instanceof HTMLButtonElement) || !(value instanceof HTMLElement) ||
+      !(status instanceof HTMLElement)) return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    status.textContent = "";
+    try {
+      const response = await formJson(form);
+      let result;
+      try { result = await response.json(); }
+      catch { throw new Error("invalid_json"); }
+      const repository = result?.repository;
+      const source = new URL(form.action);
+      if (!response.ok || !repository || typeof repository !== "object" ||
+        typeof repository.id !== "string" || !/^[0-9a-f-]+$/.test(repository.id) ||
+        !(repository.githubPushedAt === null || typeof repository.githubPushedAt === "string") ||
+        typeof repository.activityRefreshedAt !== "number" ||
+        source.origin !== location.origin ||
+        source.pathname !== `/repositories/${encodeURIComponent(repository.id)}/activity`)
+        throw new Error("invalid_result");
+      if (repository.githubPushedAt === null) {
+        value.textContent = "활동 내역 없음";
+      } else {
+        const label = activityText(repository.githubPushedAt);
+        if (!label) throw new Error("invalid_activity");
+        const time = document.createElement("time");
+        time.dateTime = repository.githubPushedAt;
+        time.textContent = label;
+        value.replaceChildren(time);
+      }
+    } catch {
+      status.textContent = ACTIVITY_ERROR;
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
     }
   }
 }

@@ -157,11 +157,11 @@ test("analysis failure cards keep one failure message and expose both actions", 
   await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
   await expect(card.locator('[data-analysis-status="error"]')).toHaveCount(0);
   await expect(detail).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
-  await expect(memo).toHaveText("Memo");
+  await expect(memo).toHaveText("Note");
   await expect(memo).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
 });
 
-test("repository card exposes separate detail and memo actions", async ({ page }) => {
+test("repository card exposes separate detail and note actions", async ({ page }) => {
   await page.setViewportSize({ width: 1389, height: 1379 });
   await loginAndSeed(page);
   const card = page.locator("repo-panel article").first();
@@ -172,9 +172,13 @@ test("repository card exposes separate detail and memo actions", async ({ page }
 
   await expect(detail).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+$/);
   await expect(detail).toHaveCSS("text-decoration-line", "none");
-  await expect(memo).toHaveText("Memo");
+  await expect(memo).toHaveText("Note");
   await expect(memo).toHaveCSS("text-decoration-line", "none");
   await expect(summary).toHaveCSS("font-weight", "500");
+  await expect(card.locator("[data-repository-memo]")).toHaveCount(0);
+  await expect(card.locator('[data-repository-field="activity"]')).toContainText("활동");
+  await expect(card.getByRole("button", { name: "OpenAI/example 활동 새로고침" }))
+    .toHaveText("");
   const [actionsBox, memoBox] = await Promise.all([actions.boundingBox(), memo.boundingBox()]);
   expect(actionsBox).not.toBeNull();
   expect(memoBox).not.toBeNull();
@@ -182,6 +186,8 @@ test("repository card exposes separate detail and memo actions", async ({ page }
   expect(Math.abs((actionsBox.x + actionsBox.width) - (memoBox.x + memoBox.width))).toBeLessThanOrEqual(1);
   await detail.hover();
   await expect(detail).toHaveCSS("color", "rgb(159, 47, 45)");
+  await memo.hover();
+  await expect(memo).toHaveCSS("color", "rgb(159, 47, 45)");
 });
 
 test("repository actions stay 44px tall with uneven card content", async ({ page, harness }) => {
@@ -398,7 +404,7 @@ test("card delete confirms, restores focus, and submits the protected native for
 test("desktop repository link opens the native detail dialog and restores focus", async ({ page }) => {
   test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
   await loginAndSeed(page);
-  const opener = page.getByRole("link", { name: "Memo", exact: true }).first();
+  const opener = page.getByRole("link", { name: "Note", exact: true }).first();
   await opener.focus();
   await opener.click();
   const dialog = page.locator("[data-repository-dialog]");
@@ -420,7 +426,12 @@ test("desktop memo dialog saves an editable personal note and stays compact", as
   await page.setViewportSize({ width: 1200, height: 900 });
   await loginAndSeed(page);
 
-  await page.getByRole("link", { name: "Memo", exact: true }).first().click();
+  const cardMemo = page.locator("[data-repository-memo]").first();
+  await expect(cardMemo).toHaveCount(0);
+
+  const noteAction = page.locator("[data-repository-link]").first();
+  await expect(noteAction).toHaveText("Note");
+  await noteAction.click();
   const dialog = page.locator("[data-repository-dialog]");
   const note = dialog.getByRole("textbox", { name: "개인 메모", exact: true });
   await note.fill("다시 확인할 개인 메모");
@@ -431,14 +442,91 @@ test("desktop memo dialog saves an editable personal note and stays compact", as
   expect((await saveResponse).status()).toBe(200);
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("status")).toHaveText("저장 완료");
+  await expect(cardMemo).toHaveText("다시 확인할 개인 메모");
+  await expect(noteAction).toHaveText("Note 1");
   const box = await dialog.boundingBox();
   expect(box).not.toBeNull();
   expect(box?.height).toBeLessThan(868);
 
   await dialog.getByRole("button", { name: "닫기", exact: true }).click();
-  await page.getByRole("link", { name: "Memo", exact: true }).first().click();
+  await page.getByRole("link", { name: "Note 1", exact: true }).first().click();
   await expect(dialog.getByRole("textbox", { name: "개인 메모", exact: true }))
     .toHaveValue("다시 확인할 개인 메모");
+
+  await note.fill("");
+  const clearResponse = page.waitForResponse((response) =>
+    /\/repositories\/[0-9a-f-]+\/note$/.test(new URL(response.url()).pathname));
+  await dialog.getByRole("button", { name: "저장", exact: true }).click();
+  expect((await clearResponse).status()).toBe(200);
+  await expect(cardMemo).toHaveCount(0);
+  await expect(noteAction).toHaveText("Note");
+});
+
+test("activity button refreshes only pushed activity in place", async ({ page, harness }) => {
+  test.skip(test.info().project.name === "chromium-no-js");
+  await loginAndSeed(page);
+  const env = await harness.worker.getEnv();
+  await env.PROD_DB.prepare(
+    "UPDATE repositories SET github_pushed_at = NULL, activity_refreshed_at = NULL",
+  ).run();
+  await page.reload();
+  const card = page.locator("repo-panel article").first();
+  const button = card.getByRole("button", { name: "OpenAI/example 활동 새로고침" });
+  const activity = card.locator("[data-repository-activity-value]");
+  await expect(activity).toHaveText("활동 동기화 필요");
+  await expect(button).toHaveText("");
+  const icon = button.locator("svg");
+  await expect(icon).toHaveAttribute("viewBox", "0 0 24 24");
+  await expect(icon).toHaveAttribute("aria-hidden", "true");
+  await expect(icon.locator("path")).toHaveCount(4);
+  const buttonBox = await button.boundingBox();
+  const iconBox = await icon.boundingBox();
+  expect(buttonBox).not.toBeNull();
+  expect(iconBox).not.toBeNull();
+  expect(buttonBox?.width).toBe(28);
+  expect(buttonBox?.height).toBe(28);
+  expect(iconBox?.width).toBe(18);
+  expect(iconBox?.height).toBe(18);
+  await expect(button).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(button).toHaveCSS("border-top-width", "0px");
+  await expect(button).toHaveCSS("color", "rgb(37, 37, 34)");
+  await button.hover();
+  await expect(button).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(button).toHaveCSS("color", "rgb(159, 47, 45)");
+
+  const refreshed = page.waitForResponse((response) =>
+    /\/repositories\/[0-9a-f-]+\/activity$/.test(new URL(response.url()).pathname));
+  await button.click();
+
+  expect((await refreshed).status()).toBe(200);
+  await expect(activity.locator("time")).toHaveAttribute("datetime", "2026-08-08T00:00:00Z");
+  await expect(activity.locator("time")).toHaveCSS("font-size", "12px");
+  await expect(activity.locator("time")).toHaveCSS("font-weight", "400");
+  await expect(activity).toContainText("활동");
+  await expect(card.locator('[data-repository-field="stars"] dd')).toHaveText("10");
+  expect(harness.providerCalls()).toEqual([
+    "provider_fixture:github_metadata",
+    "provider_fixture:github_readme",
+    "provider_fixture:openai_response",
+    "provider_fixture:github_metadata",
+  ]);
+});
+
+test("failed activity enhancement preserves the last accurate value", async ({ page }) => {
+  test.skip(test.info().project.name === "chromium-no-js");
+  await loginAndSeed(page);
+  const card = page.locator("repo-panel article").first();
+  const value = card.locator("[data-repository-activity-value]");
+  const previous = await value.textContent();
+  await page.route("**/repositories/*/activity", (route) => route.fulfill({
+    status: 503, contentType: "application/json", body: JSON.stringify({ errorCode: "github_unavailable" }),
+  }));
+
+  await card.getByRole("button", { name: "OpenAI/example 활동 새로고침" }).click();
+
+  await expect(value).toHaveText(previous ?? "");
+  await expect(card.locator("[data-repository-activity-status]"))
+    .toHaveText("활동을 새로고치지 못했습니다.");
 });
 
 test("desktop detail action navigates to the repository page", async ({ page }) => {

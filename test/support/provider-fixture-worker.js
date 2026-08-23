@@ -4,7 +4,7 @@ const metadata = {
   html_url: "https://github.com/OpenAI/example", description: "Example repository",
   homepage: null, default_branch: "main", language: "JavaScript",
   stargazers_count: 10, forks_count: 2, license: { spdx_id: "MIT" }, topics: ["example"],
-  updated_at: "2026-08-09T00:00:00Z",
+  updated_at: "2026-08-09T00:00:00Z", pushed_at: "2026-08-08T00:00:00Z",
 };
 
 const analysis = {

@@ -25,6 +25,11 @@ test("extracts safe normalized links deterministically", () => {
   assert.deepEqual(extractThreadsLinks("https://example.com/a_(b) https://example.com/a_[b] https://example.com/a_{b}", null), [
     {url:"https://example.com/a_(b)",source:"body",ordinal:0}, {url:"https://example.com/a_[b]",source:"body",ordinal:1}, {url:"https://example.com/a_%7Bb%7D",source:"body",ordinal:2},
   ]);
+  assert.deepEqual(extractThreadsLinks("(https://example.com/a.) [https://example.com/b!] {https://example.com/c;}", null), [
+    {url:"https://example.com/a",source:"body",ordinal:0}, {url:"https://example.com/b",source:"body",ordinal:1}, {url:"https://example.com/c",source:"body",ordinal:2},
+  ]);
+  assert.deepEqual(extractThreadsLinks(null, "https://meta.com"), [{url:"https://meta.com/",source:"attachment",ordinal:0}]);
+  assert.deepEqual(extractThreadsLinks({}, 42), []);
 });
 
 test("validates closed capture and media queue messages", () => {

@@ -50,19 +50,25 @@ function safeLink(value) {
 }
 /** @param {string} value @returns {string} */
 function trimLinkPunctuation(value) {
-  let result = value.replace(/[.,!?;:]+$/, "");
+  let result = value;
   const pairs = [["(", ")"], ["[", "]"], ["{", "}"]];
-  while (result && pairs.some(([open, close]) => result.endsWith(close) && [...result].filter((char) => char === close).length > [...result].filter((char) => char === open).length)) result = result.slice(0, -1);
+  let changed = true;
+  while (result && changed) {
+    const before = result;
+    result = result.replace(/[.,!?;:]+$/, "");
+    while (result && pairs.some(([open, close]) => result.endsWith(close) && [...result].filter((char) => char === close).length > [...result].filter((char) => char === open).length)) result = result.slice(0, -1);
+    changed = result !== before;
+  }
   return result;
 }
 
-/** @param {string} text @param {string | null | undefined} attachmentUrl @returns {ThreadsLink[]} */
+/** @param {unknown} text @param {unknown} attachmentUrl @returns {ThreadsLink[]} */
 export function extractThreadsLinks(text, attachmentUrl) {
   /** @type {ThreadsLink[]} */ const out = [];
   const seen = new Set();
   /** @param {string} value @param {"body" | "attachment"} source */
   const add = (value, source) => { const url = safeLink(value); if (!url || seen.has(url)) return; seen.add(url); out.push({ url, source, ordinal: out.length }); };
-  for (const match of text.match(/https?:\/\/[^\s<>"']+/gi) ?? []) add(trimLinkPunctuation(match), "body");
+  if (typeof text === "string") for (const match of text.match(/https?:\/\/[^\s<>"']+/gi) ?? []) add(trimLinkPunctuation(match), "body");
   if (typeof attachmentUrl === "string") add(attachmentUrl.trim(), "attachment");
   return out;
 }

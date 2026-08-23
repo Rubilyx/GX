@@ -472,6 +472,37 @@
 
   [data-repository-note-edit-cancel]:hover { background: var(--color-bg-subtle); }
 
+  [data-repository-note-native-delete] {
+    display: grid;
+    gap: var(--space-2);
+  }
+
+  [data-repository-note-native-delete] > summary {
+    display: list-item;
+    width: fit-content;
+    min-block-size: 2.75rem;
+    padding: var(--space-2) var(--space-4);
+    color: #ffffff;
+    background: var(--color-status-danger);
+    border: 1px solid var(--color-status-danger);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+
+  [data-repository-note-native-delete] > summary:hover {
+    background: var(--color-action-danger-hover);
+    border-color: var(--color-action-danger-hover);
+  }
+
+  [data-repository-note-native-confirmation] {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-4);
+    background-color: var(--color-bg-subtle);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-control);
+  }
+
   .repository-note-pagination {
     display: flex;
     flex-wrap: wrap;

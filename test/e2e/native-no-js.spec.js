@@ -49,8 +49,13 @@ test("native Note forms create, page, edit, and delete without JavaScript", asyn
   }
 
   await expect(page.locator("[data-repository-note-item]")).toHaveCount(5);
-  const pageTwo = page.getByRole("link", { name: "2", exact: true });
+  const pagination = page.locator(".repository-note-pagination");
+  const pageTwo = pagination.getByRole("link", { name: "2", exact: true });
   await expect(pageTwo).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+\/notes\?page=2$/);
+  expect((await pageTwo.boundingBox())?.height).toBeGreaterThanOrEqual(44);
+  const metadata = page.locator(".repository-note-meta").first();
+  await expect(metadata).toHaveCSS("font-size", "12px");
+  await expect(metadata).toHaveCSS("color", "rgb(107, 105, 99)");
   await pageTwo.click();
   await expect(page).toHaveURL(/\/notes\?page=2$/);
   let noteOne = page.locator("[data-repository-note-item]").filter({ hasText: "Note 1" });
@@ -63,7 +68,21 @@ test("native Note forms create, page, edit, and delete without JavaScript", asyn
   noteOne = page.locator("[data-repository-note-item]").filter({ hasText: "Note 1 수정" });
   await expect(noteOne.locator(".repository-note-body")).toHaveText("Note 1 수정");
 
-  await noteOne.getByRole("button", { name: "삭제", exact: true }).click();
+  const beforeConfirmation = page.url();
+  const deleteDisclosure = noteOne.locator("[data-repository-note-native-delete]");
+  await deleteDisclosure.locator("summary").click();
+  await expect(page).toHaveURL(beforeConfirmation);
+  await expect(noteOne.locator(".repository-note-body").first()).toHaveText("Note 1 수정");
+  await expect(deleteDisclosure).toHaveAttribute("open", "");
+  const confirmation = deleteDisclosure.locator("[data-repository-note-native-confirmation]");
+  await expect(confirmation).toContainText("OpenAI/example Note");
+  await expect(confirmation.locator("time")).toHaveText(/^\d{4}\.\d{2}\.\d{2}$/);
+  await expect(confirmation.locator("[data-repository-note-native-delete-excerpt]"))
+    .toHaveText("Note 1 수정");
+  const deletion = page.waitForRequest((request) => request.method() === "POST" &&
+    /\/repositories\/[0-9a-f-]+\/notes\/[0-9a-f-]+\/delete$/.test(new URL(request.url()).pathname));
+  await confirmation.getByRole("button", { name: "Note 영구 삭제", exact: true }).click();
+  expect((await deletion).postData()).toContain("confirm=yes");
   await expect(page).toHaveURL(/\/notes\?flash=repository_note_deleted$/);
   await expect(page.getByRole("status")).toContainText("Note를 삭제했습니다.");
   await expect(page.locator("[data-repository-note-item]")).toHaveCount(5);

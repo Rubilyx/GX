@@ -628,6 +628,29 @@ test.describe("desktop Note manager", () => {
     await expect(item.locator(".repository-note-body")).toHaveText("재시도한 수정 Note");
   });
 
+  test("inline editing disables Delete until cancel or successful replacement", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    await page.locator("[data-repository-link]").first().click();
+    const dialog = page.locator("[data-repository-dialog]");
+    await dialog.getByRole("textbox", { name: "새 Note", exact: true }).fill("편집 상태 Note");
+    await dialog.getByRole("button", { name: "저장", exact: true }).click();
+    let item = dialog.locator("[data-repository-note-item]").first();
+    const edit = item.getByRole("button", { name: "수정", exact: true });
+    const remove = item.getByRole("button", { name: "삭제", exact: true });
+
+    await edit.click();
+    await expect(remove).toBeDisabled();
+    await item.getByRole("button", { name: "취소", exact: true }).click();
+    await expect(remove).toBeEnabled();
+
+    await edit.click();
+    await item.getByRole("textbox", { name: "Note 수정", exact: true }).fill("편집 완료 Note");
+    await item.getByRole("button", { name: "저장", exact: true }).click();
+    item = dialog.locator("[data-repository-note-item]").filter({ hasText: "편집 완료 Note" });
+    await expect(item.getByRole("button", { name: "삭제", exact: true })).toBeEnabled();
+  });
+
   test("failed delete announces inside confirmation and re-enables retry", async ({ page }) => {
     test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
     await loginAndSeed(page);
@@ -657,7 +680,7 @@ test.describe("desktop Note manager", () => {
   });
 });
 
-test("mobile Note action opens the native Note page without a modal", async ({ page }) => {
+test("mobile Note action uses the native page and confirms deletion before POST", async ({ page }) => {
   test.skip(!["mobile-chrome", "mobile-safari"].includes(test.info().project.name));
   await loginAndSeed(page);
 
@@ -667,6 +690,32 @@ test("mobile Note action opens the native Note page without a modal", async ({ p
   await expect(page.getByRole("heading", { name: "OpenAI/example Note" })).toBeVisible();
   await expect(page.locator("[data-repository-dialog]:visible")).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+  const body = `모바일 삭제 확인 ${"가".repeat(90)}`;
+  const create = page.locator("[data-repository-note-create-form]");
+  await create.getByRole("textbox", { name: "새 Note", exact: true }).fill(body);
+  await create.getByRole("button", { name: "저장", exact: true }).click();
+  const item = page.locator("[data-repository-note-item]").first();
+  const disclosure = item.locator("[data-repository-note-native-delete]");
+  const trigger = disclosure.locator("summary");
+  expect((await trigger.boundingBox())?.height).toBeGreaterThanOrEqual(44);
+  const beforeConfirmation = page.url();
+  await trigger.click();
+
+  await expect(page).toHaveURL(beforeConfirmation);
+  await expect(item.locator(".repository-note-body").first()).toHaveText(body);
+  const confirmation = disclosure.locator("[data-repository-note-native-confirmation]");
+  await expect(confirmation).toContainText("OpenAI/example Note");
+  await expect(confirmation.locator("time")).toHaveText(/^\d{4}\.\d{2}\.\d{2}$/);
+  const excerpt = confirmation.locator("[data-repository-note-native-delete-excerpt]");
+  await expect(excerpt).toHaveText(body.slice(0, 80));
+  expect((await excerpt.textContent())?.length).toBeLessThanOrEqual(80);
+
+  await confirmation.getByRole("button", { name: "Note 영구 삭제", exact: true }).click();
+  await expect(page).toHaveURL(/\/notes\?flash=repository_note_deleted$/);
+  const empty = page.locator('[data-repository-note-list][data-empty="true"]');
+  await expect(empty).toBeVisible();
+  await expect(empty).toHaveCSS("background-color", "rgb(241, 240, 237)");
 });
 
 test("activity button refreshes only pushed activity in place", async ({ page, harness }) => {

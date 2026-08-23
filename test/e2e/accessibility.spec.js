@@ -27,6 +27,16 @@ test("index, Note manager, Note confirmation, and repository confirmation pass a
   if (["mobile-chrome", "mobile-safari"].includes(test.info().project.name)) {
     await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+\/notes$/);
     await expectNoBlockingAxe(page);
+    const create = page.locator("[data-repository-note-create-form]");
+    await create.getByRole("textbox", { name: "새 Note", exact: true }).fill("native 삭제 확인용 Note");
+    await create.getByRole("button", { name: "저장", exact: true }).click();
+    const nativeDelete = page.locator("[data-repository-note-native-delete]").first();
+    const summary = nativeDelete.locator("summary");
+    await summary.focus();
+    await expect(summary).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(nativeDelete.locator("[data-repository-note-native-confirmation]")).toBeVisible();
+    await expectNoBlockingAxe(page);
   } else {
     const manager = page.locator("[data-repository-dialog]");
     await expect(manager).toBeVisible();

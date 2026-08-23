@@ -250,12 +250,12 @@ function noteDateTime(formatted) {
 
 /** @param {string} body */
 function noteExcerpt(body) {
-  return body.length > 80 ? `${body.slice(0, 80)}…` : body;
+  return body.slice(0, 80);
 }
 
 /** @param {any} view */
 function noteListMarkup(view) {
-  if (!view.notes.length) return `<section data-repository-note-list><h2 id="repository-note-list-heading" data-repository-note-list-heading>저장한 Note가 없습니다</h2><p>첫 Note를 작성하세요.</p></section>`;
+  if (!view.notes.length) return `<section data-repository-note-list data-empty="true"><h2 id="repository-note-list-heading" data-repository-note-list-heading>저장한 Note가 없습니다</h2><p>첫 Note를 작성하세요.</p></section>`;
   const repositoryPath = `/repositories/${encodeURIComponent(view.repository.id)}/notes`;
   const items = view.notes.map((/** @type {any} */ note) => {
     const itemPath = `${repositoryPath}/${encodeURIComponent(note.id)}`;
@@ -264,10 +264,11 @@ function noteListMarkup(view) {
     const modified = note.updatedAt > note.createdAt
       ? ` · 수정 <time datetime="${htmlAttr(noteDateTime(updated))}">${htmlText(updated)}</time>` : "";
     const textareaId = `note-body-${note.id}`;
-    return `<li data-repository-note-item data-note-id="${htmlAttr(note.id)}"><p class="repository-note-body">${htmlText(note.body)}</p><p>작성 <time datetime="${htmlAttr(noteDateTime(created))}">${htmlText(created)}</time>${modified}</p><form method="post" action="${htmlAttr(itemPath)}" data-repository-note-update-form>${csrf(view.csrfToken)}<label class="visually-hidden" for="${htmlAttr(textareaId)}">Note 수정</label><textarea id="${htmlAttr(textareaId)}" name="body" maxlength="4000" required>${htmlText(note.body)}</textarea><button type="submit">저장</button></form><form method="post" action="${htmlAttr(`${itemPath}/delete`)}" data-repository-note-delete-form>${csrf(view.csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger" data-repository-note-delete data-note-date="${htmlAttr(created)}" data-note-excerpt="${htmlAttr(noteExcerpt(note.body))}">삭제</button></form></li>`;
+    const deleteHeadingId = `note-delete-heading-${note.id}`;
+    return `<li data-repository-note-item data-note-id="${htmlAttr(note.id)}"><p class="repository-note-body">${htmlText(note.body)}</p><p class="repository-note-meta">작성 <time datetime="${htmlAttr(noteDateTime(created))}">${htmlText(created)}</time>${modified}</p><form method="post" action="${htmlAttr(itemPath)}" data-repository-note-update-form>${csrf(view.csrfToken)}<label class="visually-hidden" for="${htmlAttr(textareaId)}">Note 수정</label><textarea id="${htmlAttr(textareaId)}" name="body" maxlength="4000" required>${htmlText(note.body)}</textarea><button type="submit">저장</button></form><details data-repository-note-native-delete><summary data-repository-note-delete>삭제</summary><div data-repository-note-native-confirmation role="group" aria-labelledby="${htmlAttr(deleteHeadingId)}"><h3 id="${htmlAttr(deleteHeadingId)}">${htmlText(view.repository.owner)}/${htmlText(view.repository.name)} Note를 삭제할까요?</h3><p>작성 <time datetime="${htmlAttr(noteDateTime(created))}">${htmlText(created)}</time></p><p data-repository-note-delete-excerpt data-repository-note-native-delete-excerpt>${htmlText(noteExcerpt(note.body))}</p><p>이 Note가 영구 삭제되며 복구할 수 없습니다.</p><form method="post" action="${htmlAttr(`${itemPath}/delete`)}" data-repository-note-delete-form>${csrf(view.csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">Note 영구 삭제</button></form></div></details></li>`;
   }).join("");
   const pagination = view.totalPages > 1
-    ? `<nav data-repository-note-pagination aria-label="Note 페이지">${view.page > 1 ? `<a rel="prev" href="${notePageHref(view.repository.id, view.page - 1)}">이전</a>` : ""}${Array.from({ length: view.totalPages }, (_, index) => index + 1).map((page) => `<a href="${notePageHref(view.repository.id, page)}"${page === view.page ? ' aria-current="page"' : ""}>${htmlText(page)}</a>`).join("")}${view.page < view.totalPages ? `<a rel="next" href="${notePageHref(view.repository.id, view.page + 1)}">다음</a>` : ""}</nav>` : "";
+    ? `<nav class="repository-note-pagination" data-repository-note-pagination aria-label="Note 페이지">${view.page > 1 ? `<a rel="prev" href="${notePageHref(view.repository.id, view.page - 1)}">이전</a>` : ""}${Array.from({ length: view.totalPages }, (_, index) => index + 1).map((page) => `<a href="${notePageHref(view.repository.id, page)}"${page === view.page ? ' aria-current="page"' : ""}>${htmlText(page)}</a>`).join("")}${view.page < view.totalPages ? `<a rel="next" href="${notePageHref(view.repository.id, view.page + 1)}">다음</a>` : ""}</nav>` : "";
   return `<section data-repository-note-list><h2 id="repository-note-list-heading" data-repository-note-list-heading>Note ${htmlText(view.total)}</h2><ol class="repository-note-list">${items}</ol>${pagination}</section>`;
 }
 

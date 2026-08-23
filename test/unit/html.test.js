@@ -379,7 +379,8 @@ test("repository Note page renders escaped CRUD forms, Seoul dates, and numbered
   const notes = Array.from({ length: 5 }, (_, index) => ({
     id: `${index + 1}`.repeat(8) + "-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     repositoryId: repository.id,
-    body: index === 0 ? `<script>alert("note")</script>` : `Note ${index + 1}`,
+    body: index === 0 ? `<script>alert("note")</script>`
+      : index === 1 ? "가".repeat(90) : `Note ${index + 1}`,
     createdAt: 1_787_410_800 - index,
     updatedAt: index === 0 ? 1_787_410_801 : 1_787_410_800 - index,
   }));
@@ -402,16 +403,31 @@ test("repository Note page renders escaped CRUD forms, Seoul dates, and numbered
   assert.match(html, /<p class="repository-note-body">&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/p>/);
   assert.match(html, /<time datetime="2026-08-23">2026\.08\.23<\/time>/);
   assert.match(html, /수정 <time datetime="2026-08-23">2026\.08\.23<\/time>/);
+  assert.equal((html.match(/<p class="repository-note-meta">/g) ?? []).length, 5);
   assert.match(html,
     /action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes\/11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/);
   assert.match(html,
     /<textarea id="note-body-11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa" name="body" maxlength="4000" required>&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/textarea>/);
-  assert.match(html,
+  const nativeDelete = html.match(
+    /<details data-repository-note-native-delete[\s\S]*?<\/details>/,
+  )?.[0] ?? "";
+  assert.match(nativeDelete, /<summary data-repository-note-delete>삭제<\/summary>/);
+  assert.match(nativeDelete,
+    /role="group" aria-labelledby="note-delete-heading-11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/);
+  assert.match(nativeDelete, /Note를 삭제할까요\?/);
+  assert.match(nativeDelete, /작성 <time datetime="2026-08-23">2026\.08\.23<\/time>/);
+  assert.match(nativeDelete, /data-repository-note-native-delete-excerpt/);
+  assert.match(nativeDelete,
     /action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes\/11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/delete"/);
-  assert.match(html, /<input type="hidden" name="confirm" value="yes">/);
-  assert.match(html,
-    /data-repository-note-delete data-note-date="2026\.08\.23" data-note-excerpt="&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;"/);
-  const pagination = html.match(/<nav data-repository-note-pagination[\s\S]*?<\/nav>/)?.[0] ?? "";
+  assert.match(nativeDelete, /<input type="hidden" name="confirm" value="yes">/);
+  assert.match(nativeDelete, /<button type="submit" class="button-danger">Note 영구 삭제<\/button>/);
+  assert.match(html, new RegExp(
+    `<p data-repository-note-delete-excerpt data-repository-note-native-delete-excerpt>${"가".repeat(80)}<\\/p>`,
+  ));
+  assert.doesNotMatch(html, new RegExp(`${"가".repeat(80)}…`));
+  const pagination = html.match(
+    /<nav class="repository-note-pagination" data-repository-note-pagination[\s\S]*?<\/nav>/,
+  )?.[0] ?? "";
   assert.match(pagination, /<a rel="prev" href="[^\"]+\?page=1">이전<\/a>/);
   assert.match(pagination, /href="[^\"]+\?page=1">1<\/a>/);
   assert.match(pagination, /href="[^\"]+\?page=2" aria-current="page">2<\/a>/);
@@ -428,7 +444,7 @@ test("repository Note page renders an actionable empty state", () => {
     flash: "",
   });
   assert.match(html,
-    /<section data-repository-note-list><h2 id="repository-note-list-heading" data-repository-note-list-heading>저장한 Note가 없습니다<\/h2>/);
+    /<section data-repository-note-list data-empty="true"><h2 id="repository-note-list-heading" data-repository-note-list-heading>저장한 Note가 없습니다<\/h2>/);
   assert.match(html, /첫 Note를 작성하세요/);
   assert.doesNotMatch(html, /<li data-repository-note-item|data-repository-note-pagination/);
 });

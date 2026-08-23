@@ -510,10 +510,12 @@ class RepoPanel extends HTMLElement {
     event.preventDefault();
     const item = button.closest("[data-repository-note-item]");
     const body = item?.querySelector(".repository-note-body");
+    const remove = item?.querySelector("[data-repository-note-delete]");
     const noteId = item?.getAttribute("data-note-id") ?? "";
     const token = dialog.querySelector('[data-repository-note-create-form] input[name="csrf"]');
     if (!(item instanceof HTMLElement) || !(body instanceof HTMLParagraphElement) ||
-      !(token instanceof HTMLInputElement) || !validId(noteId)) return true;
+      !(remove instanceof HTMLButtonElement) || !(token instanceof HTMLInputElement) ||
+      !validId(noteId)) return true;
     const form = document.createElement("form");
     form.dataset.repositoryNoteUpdateForm = "";
     form.setAttribute("method", "post");
@@ -549,10 +551,12 @@ class RepoPanel extends HTMLElement {
     form.appendChild(textarea);
     form.appendChild(actions);
     button.disabled = true;
+    remove.disabled = true;
     body.replaceWith(form);
     cancel.addEventListener("click", () => {
       form.replaceWith(body);
       button.disabled = false;
+      remove.disabled = false;
       button.focus();
     });
     textarea.focus();

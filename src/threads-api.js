@@ -12,6 +12,7 @@ export const THREADS_SCOPES = Object.freeze([
 
 const GRAPH = "https://graph.threads.net/v1.0";
 const JSON_MAXIMUM_BYTES = 1_048_576;
+const ERROR_MAXIMUM_BYTES = 16_384;
 const PROFILE_FIELDS = "id,username,name,threads_profile_picture_url";
 const MEDIA_FIELDS = [
   "id", "media_product_type", "media_type", "media_url", "permalink", "owner",
@@ -41,6 +42,13 @@ function protocolError() { throw new AppError("threads_provider_protocol_error",
 function providerId(value) {
   if (typeof value !== "string" || !value || value.length > 256) protocolError();
   return value;
+}
+
+/** @param {unknown} value */
+function mediaId(value) {
+  const id = providerId(value);
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) protocolError();
+  return id;
 }
 
 /** @param {unknown} value @param {boolean} [nullable] */
@@ -105,15 +113,25 @@ export async function readJsonAtMost(response, maximumBytes = JSON_MAXIMUM_BYTES
 }
 
 /** @param {Response} response */
-function threadsProviderError(response) {
+async function threadsProviderError(response) {
   const retry = response.headers.get("retry-after");
   /** @type {Record<string, string | number>} */
   const retryAfter = {};
   if (retry !== null && /^\d+$/.test(retry) && Number.isSafeInteger(Number(retry)))
     retryAfter.retryAfter = Number(retry);
+  /** @type {{ code: number | null, subcode: number | null }} */
+  const graphError = { code: null, subcode: null };
+  try {
+    const body = await readJsonAtMost(response, ERROR_MAXIMUM_BYTES);
+    const error = plainObject(body) && plainObject(body.error) ? body.error : null;
+    if (error && typeof error.code === "number" && Number.isSafeInteger(error.code)) graphError.code = error.code;
+    if (error && typeof error.error_subcode === "number" && Number.isSafeInteger(error.error_subcode)) graphError.subcode = error.error_subcode;
+  } catch {}
   if (response.status === 429) return new AppError("threads_rate_limited", 429, retryAfter);
-  if (response.status === 401 || response.status === 403) return new AppError("threads_reconnect_required", response.status);
-  if (response.status === 404) return new AppError("threads_post_unavailable", 404);
+  if (response.status === 401 || [190, 10, 200].includes(graphError.code ?? -1))
+    return new AppError("threads_reconnect_required", 401);
+  if (response.status === 404 || response.status === 403 || [100, 803].includes(graphError.code ?? -1))
+    return new AppError("threads_post_unavailable", 404);
   return new AppError("threads_provider_unavailable", 503);
 }
 
@@ -130,7 +148,7 @@ function cancelUnused(body) { if (body) void body.cancel().catch(() => {}); }
 async function request(fetcher, url, init) {
   let response;
   try { response = await fetcher(url, { ...init, redirect: "manual" }); }
-  catch (error) { throw threadsError(error); }
+  catch { throw new AppError("threads_provider_unavailable", 503); }
   if (!(response instanceof Response)) throw new AppError("threads_provider_unavailable", 503);
   return response;
 }
@@ -141,8 +159,7 @@ async function graphGet(fetcher, path, query, accessToken, signal) {
   url.search = query.toString();
   const response = await request(fetcher, url, { headers: { Authorization: `Bearer ${providerId(accessToken)}` }, signal });
   if (!response.ok) {
-    cancelUnused(response.body);
-    throw threadsProviderError(response);
+    throw await threadsProviderError(response);
   }
   return readJsonAtMost(response, JSON_MAXIMUM_BYTES);
 }
@@ -152,13 +169,13 @@ function childIds(value) {
   if (value === undefined || value === null) return [];
   const children = exactKnownKeys(value, ["data"]);
   if (!Array.isArray(children.data)) protocolError();
-  return children.data.map((item) => providerId(exactKnownKeys(item, ["id"]).id));
+  return children.data.map((item) => mediaId(exactKnownKeys(item, ["id"]).id));
 }
 
-/** @param {unknown} value @param {string} field */
-function relatedId(value, field) {
+/** @param {unknown} value */
+function relatedMediaId(value) {
   if (value === undefined || value === null) return null;
-  return providerId(exactKnownKeys(value, ["id"])[field === "id" ? "id" : field]);
+  return mediaId(exactKnownKeys(value, ["id"]).id);
 }
 
 /** @param {unknown} value @returns {ThreadsMedia} */
@@ -179,16 +196,16 @@ function mapMedia(value) {
   catch { protocolError(); }
   if (normalizedPermalink.kind !== "canonical" || !normalizedPermalink.canonicalUrl) protocolError();
   if (raw.is_quote_post !== undefined && typeof raw.is_quote_post !== "boolean") protocolError();
-  const quotedPostId = relatedId(raw.quoted_post, "id");
+  const quotedPostId = relatedMediaId(raw.quoted_post);
   if (raw.is_quote_post === true && !quotedPostId) protocolError();
   return {
-    id: providerId(raw.id), ownerId: providerId(owner.id), username: raw.username, text: raw.text,
+    id: mediaId(raw.id), ownerId: providerId(owner.id), username: raw.username, text: raw.text,
     permalink: normalizedPermalink.canonicalUrl, timestamp: isoTimestamp(raw.timestamp),
     mediaType: /** @type {ThreadsMedia["mediaType"]} */ (raw.media_type),
     mediaUrl: safeHttpsUrl(raw.media_url), thumbnailUrl: safeHttpsUrl(raw.thumbnail_url),
     children: childIds(raw.children), quotedPostId, linkAttachmentUrl: safeHttpsUrl(raw.link_attachment_url),
-    altText: providerString(raw.alt_text, true), rootPostId: relatedId(raw.root_post, "id"),
-    repliedToId: relatedId(raw.replied_to, "id"),
+    altText: providerString(raw.alt_text, true), rootPostId: relatedMediaId(raw.root_post),
+    repliedToId: relatedMediaId(raw.replied_to),
   };
 }
 
@@ -203,7 +220,7 @@ function mapPage(value, path) {
       if (typeof paging.next !== "string") protocolError();
       let next;
       try { next = new URL(paging.next); } catch { protocolError(); }
-      if (next.origin !== "https://graph.threads.net" || next.pathname !== `/v1.0/${path}` ||
+      if (next.origin !== "https://graph.threads.net" || next.username || next.password || next.hash || next.pathname !== `/v1.0/${path}` ||
         [...next.searchParams.keys()].length !== 1 || next.searchParams.getAll("after").length !== 1)
         protocolError();
       nextCursor = providerId(next.searchParams.get("after"));
@@ -217,7 +234,7 @@ export async function exchangeThreadsCode(fetcher, input) {
   try {
     const form = new URLSearchParams({ client_id: providerId(input?.clientId), client_secret: providerId(input?.clientSecret), grant_type: "authorization_code", redirect_uri: providerId(input?.redirectUri), code: providerId(input?.code) });
     const response = await request(fetcher, new URL(`${GRAPH}/oauth/access_token`), { method: "POST", body: form, signal: input?.signal });
-    if (!response.ok) { cancelUnused(response.body); throw threadsProviderError(response); }
+    if (!response.ok) throw await threadsProviderError(response);
     const raw = exactKnownKeys(await readJsonAtMost(response, JSON_MAXIMUM_BYTES), ["access_token", "user_id"]);
     return { accessToken: providerId(raw.access_token), userId: providerId(raw.user_id) };
   } catch (error) { throw threadsError(error); }
@@ -238,7 +255,7 @@ async function tokenExchange(fetcher, path, query, signal) {
   try {
     const url = new URL(`${GRAPH}/${path}`); url.search = query.toString();
     const response = await request(fetcher, url, { signal });
-    if (!response.ok) { cancelUnused(response.body); throw threadsProviderError(response); }
+    if (!response.ok) throw await threadsProviderError(response);
     const raw = exactKnownKeys(await readJsonAtMost(response, JSON_MAXIMUM_BYTES), ["access_token", "token_type", "expires_in"]);
     const expiresIn = raw.expires_in;
     if (typeof raw.token_type !== "string" || !raw.token_type || typeof expiresIn !== "number" || !Number.isSafeInteger(expiresIn) || expiresIn <= 0)
@@ -268,14 +285,14 @@ export async function fetchThreadsProfilePostsPage(fetcher, input) {
 /** @param {Fetcher} fetcher @param {{ accessToken: string, mediaId: string, signal?: AbortSignal }} input @returns {Promise<ThreadsMedia>} */
 export async function fetchThreadsMedia(fetcher, input) {
   try {
-    return mapMedia(await graphGet(fetcher, providerId(input?.mediaId), new URLSearchParams({ fields: MEDIA_FIELDS }), providerId(input?.accessToken), input?.signal));
+    return mapMedia(await graphGet(fetcher, mediaId(input?.mediaId), new URLSearchParams({ fields: MEDIA_FIELDS }), providerId(input?.accessToken), input?.signal));
   } catch (error) { throw threadsError(error); }
 }
 
 /** @param {Fetcher} fetcher @param {{ accessToken: string, mediaId: string, after?: string | null, signal?: AbortSignal }} input @returns {Promise<ThreadsPage>} */
 export async function fetchThreadsConversationPage(fetcher, input) {
   try {
-    const id = providerId(input?.mediaId);
+    const id = mediaId(input?.mediaId);
     const query = new URLSearchParams({ fields: MEDIA_FIELDS });
     if (input?.after !== undefined && input.after !== null) query.set("after", providerId(input.after));
     return mapPage(await graphGet(fetcher, `${id}/conversation`, query, providerId(input?.accessToken), input?.signal), `${id}/conversation`);

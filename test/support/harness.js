@@ -90,7 +90,11 @@ function fixturePage(pages, after, path) {
   /** @type {any} */ let page;
   if (Array.isArray(pages)) {
     let index = first;
-    if (after !== null) index = pages.findIndex((item) => item?.nextCursor === after) + 1;
+    if (after !== null) {
+      const previous = pages.findIndex((item) => item?.nextCursor === after);
+      if (previous < 0) return null;
+      index = previous + 1;
+    }
     page = pages[index];
   } else if (pages && typeof pages === "object") page = /** @type {Record<string, any>} */ (pages)[after ?? ""];
   if (!page || typeof page !== "object" || Array.isArray(page) || !Array.isArray(page.data)) return null;

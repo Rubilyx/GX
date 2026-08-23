@@ -7,6 +7,7 @@ import {
 } from "../../src/threads-api.js";
 import { AppError } from "../../src/domain.js";
 import { normalizeThreadsUrl } from "../../src/threads-domain.js";
+import { providerFixture } from "../support/harness.js";
 
 const fields = [
   "id", "media_product_type", "media_type", "media_url", "permalink", "owner",
@@ -128,4 +129,78 @@ test("resolves only bounded Threads short redirects and returns canonical inputs
   }, short, AbortSignal.timeout(1_000));
   assert.deepEqual(resolved, normalizeThreadsUrl("https://www.threads.com/@meta/post/root1"));
   await assert.rejects(resolveThreadsPostUrl(async () => new Response(null, { status: 302, headers: { Location: "https://evil.test/t/no" } }), short, AbortSignal.timeout(1_000)), isAppError("threads_post_unavailable", 404));
+});
+
+test("contains injected fetch failures behind a fresh fixed unavailable error", async () => {
+  const injected = new AppError("attacker_controlled", 418, { retryAfter: 999 });
+  await assert.rejects(
+    fetchThreadsMedia(async () => { throw injected; }, { accessToken: "secret", mediaId: "root-1", signal: AbortSignal.timeout(1_000) }),
+    (error) => isAppError("threads_provider_unavailable", 503)(error) && error instanceof AppError && error !== injected && Object.keys(error.details).length === 0,
+  );
+});
+
+test("uses conservative media-ID path segments and rejects unsafe values before fetching", async () => {
+  /** @type {string[]} */ const paths = [];
+  /** @type {(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>} */
+  const fetcher = async (input) => {
+    paths.push(new URL(new Request(input).url).pathname);
+    return Response.json({ ...media, media_type: "VIDEO", id: "video_1", children: { data: [] } });
+  };
+  assert.equal((await fetchThreadsMedia(fetcher, { accessToken: "secret", mediaId: "video_1", signal: AbortSignal.timeout(1_000) })).mediaType, "VIDEO");
+  assert.equal(paths[0], "/v1.0/video_1");
+  for (const mediaId of [".", "..", "root/1", "root\\1", "root%2f1", "root?x=1", "root#x", " space "]) await assert.rejects(
+    fetchThreadsConversationPage(async () => { assert.fail("unsafe media ID must not fetch"); }, { accessToken: "secret", mediaId, signal: AbortSignal.timeout(1_000) }),
+    isAppError("threads_provider_protocol_error", 502),
+  );
+});
+
+test("classifies Graph error envelopes without exposing their body and preserves an integer retry-after", async () => {
+  /** @type {Array<[number, number, string, number]>} */
+  const cases = [
+    [400, 190, "threads_reconnect_required", 401], [403, 10, "threads_reconnect_required", 401],
+    [400, 100, "threads_post_unavailable", 404], [403, 803, "threads_post_unavailable", 404],
+    [403, 4, "threads_post_unavailable", 404],
+  ];
+  for (const [status, code, expectedCode, expectedStatus] of cases) await assert.rejects(
+    fetchThreadsMedia(async () => Response.json({ error: { code, error_subcode: 7, message: "secret provider text", type: "OAuthException" } }, { status }), { accessToken: "secret", mediaId: "root-1", signal: AbortSignal.timeout(1_000) }),
+    (error) => isAppError(expectedCode, expectedStatus)(error) && error instanceof Error && !error.message.includes("secret provider text"),
+  );
+  await assert.rejects(
+    fetchThreadsMedia(async () => new Response(null, { status: 429, headers: { "Retry-After": "42" } }), { accessToken: "secret", mediaId: "root-1", signal: AbortSignal.timeout(1_000) }),
+    (error) => isAppError("threads_rate_limited", 429)(error) && error instanceof AppError && error.details.retryAfter === 42,
+  );
+});
+
+test("rejects malformed token, profile, page, and paging-next response shapes", async () => {
+  await assert.rejects(exchangeThreadsCode(async () => Response.json({ access_token: "token", user_id: "user", extra: true }), { clientId: "client", clientSecret: "secret", redirectUri: "https://app.test/callback", code: "code", signal: AbortSignal.timeout(1_000) }), isAppError("threads_provider_protocol_error", 502));
+  await assert.rejects(fetchThreadsProfile(async () => Response.json({ id: "author", username: "meta", name: 1, threads_profile_picture_url: null }), { accessToken: "secret", username: "meta", signal: AbortSignal.timeout(1_000) }), isAppError("threads_provider_protocol_error", 502));
+  for (const next of [
+    "https://user:pass@graph.threads.net/v1.0/profile_posts?after=cursor",
+    "https://graph.threads.net/v1.0/profile_posts?after=cursor#secret",
+  ]) await assert.rejects(
+    fetchThreadsProfilePostsPage(async () => Response.json({ data: [], paging: { next } }), { accessToken: "secret", username: "meta", signal: AbortSignal.timeout(1_000) }),
+    isAppError("threads_provider_protocol_error", 502),
+  );
+  await assert.rejects(fetchThreadsProfilePostsPage(async () => Response.json({ data: {}, paging: null }), { accessToken: "secret", username: "meta", signal: AbortSignal.timeout(1_000) }), isAppError("threads_provider_protocol_error", 502));
+});
+
+test("accepts three short redirects, cancels their bodies, and rejects a fourth", async () => {
+  const short = normalizeThreadsUrl("https://www.threads.com/t/RootShort");
+  let cancelled = 0;
+  const locations = ["https://www.threads.com/t/one", "https://www.threads.com/t/two", "https://www.threads.com/@meta/post/root1"];
+  const resolved = await resolveThreadsPostUrl(async () => new Response(new ReadableStream({
+    cancel() { cancelled += 1; },
+  }), { status: 302, headers: { Location: locations.shift() ?? "" } }), short, AbortSignal.timeout(1_000));
+  assert.equal(resolved.kind, "canonical");
+  assert.equal(cancelled, 3);
+  await assert.rejects(resolveThreadsPostUrl(async () => new Response(null, { status: 302, headers: { Location: "https://www.threads.com/t/again" } }), short, AbortSignal.timeout(1_000)), isAppError("threads_post_unavailable", 404));
+});
+
+test("harness fixture rejects unknown cursors instead of replaying its first page", async () => {
+  const fixture = providerFixture({
+    threadsProfilePages: [{ data: [media], nextCursor: "cursor-1" }, { data: [] }],
+  });
+  const base = `https://graph.threads.net/v1.0/profile_posts?fields=${encodeURIComponent(fields)}&username=meta`;
+  assert.equal((await fixture(`${base}&after=cursor-1`, { headers: { Authorization: "Bearer secret" } })).status, 200);
+  await assert.rejects(fixture(`${base}&after=unknown`, { headers: { Authorization: "Bearer secret" } }), /Unexpected provider request/);
 });

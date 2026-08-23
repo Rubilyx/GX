@@ -250,6 +250,28 @@ export async function refreshThreadsAccessToken(fetcher, input) {
   return tokenExchange(fetcher, "refresh_access_token", new URLSearchParams({ grant_type: "th_refresh_token", access_token: providerId(input?.accessToken) }), input?.signal);
 }
 
+/** @param {Fetcher} fetcher @param {{ accessToken: string, signal?: AbortSignal }} input */
+export async function debugThreadsAccessToken(fetcher, input) {
+  try {
+    const accessToken = providerId(input?.accessToken);
+    const url = new URL(`${GRAPH}/debug_token`);
+    url.search = new URLSearchParams({ input_token: accessToken }).toString();
+    const response = await request(fetcher, url, {
+      headers: { Authorization: `Bearer ${accessToken}` }, signal: input?.signal,
+    });
+    if (!response.ok) throw await threadsProviderError(response);
+    const root = exactKnownKeys(await readJsonAtMost(response, JSON_MAXIMUM_BYTES), ["data"]);
+    const raw = exactKnownKeys(root.data, ["app_id", "user_id", "is_valid", "expires_at", "scopes"]);
+    if (typeof raw.is_valid !== "boolean" || !Number.isSafeInteger(raw.expires_at) ||
+      /** @type {number} */ (raw.expires_at) <= 0 || !Array.isArray(raw.scopes) || raw.scopes.length > 64)
+      protocolError();
+    return {
+      appId: providerId(raw.app_id), userId: providerId(raw.user_id), isValid: raw.is_valid,
+      expiresAt: /** @type {number} */ (raw.expires_at), scopes: raw.scopes.map(providerId),
+    };
+  } catch (error) { throw threadsError(error); }
+}
+
 /** @param {Fetcher} fetcher @param {string} path @param {URLSearchParams} query @param {AbortSignal | undefined} signal */
 async function tokenExchange(fetcher, path, query, signal) {
   try {

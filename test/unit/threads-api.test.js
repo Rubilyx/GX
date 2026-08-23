@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  THREADS_SCOPES, exchangeLongLivedThreadsToken, exchangeThreadsCode,
+  THREADS_SCOPES, debugThreadsAccessToken, exchangeLongLivedThreadsToken, exchangeThreadsCode,
   fetchThreadsConversationPage, fetchThreadsMedia, fetchThreadsProfile,
   fetchThreadsProfilePostsPage, refreshThreadsAccessToken, resolveThreadsPostUrl,
 } from "../../src/threads-api.js";
@@ -39,6 +39,7 @@ test("uses the fixed scopes, Graph requests, bearer header, field projections, a
     if (url.pathname.endsWith("/oauth/access_token")) return Response.json({ access_token: "short", user_id: "user-1" });
     if (url.pathname.endsWith("/access_token")) return Response.json({ access_token: "long", token_type: "bearer", expires_in: 5_184_000 });
     if (url.pathname.endsWith("/refresh_access_token")) return Response.json({ access_token: "refreshed", token_type: "bearer", expires_in: 5_184_000 });
+    if (url.pathname.endsWith("/debug_token")) return Response.json({ data: { app_id: "client", user_id: "user-1", is_valid: true, expires_at: 5_184_100, scopes: THREADS_SCOPES } });
     if (url.pathname.endsWith("/profile_lookup")) return Response.json({ id: "author-1", username: "meta", name: "Meta", threads_profile_picture_url: "https://scontent.cdninstagram.com/avatar" });
     if (url.pathname.endsWith("/profile_posts")) return Response.json({ data: [media], paging: { next: "https://graph.threads.net/v1.0/profile_posts?after=next-1" } });
     if (url.pathname.endsWith("/conversation")) return Response.json({ data: [{ ...media, id: "reply-1", media_type: "TEXT_POST", children: undefined, is_quote_post: false, quoted_post: undefined, root_post: { id: "root-1" }, replied_to: { id: "root-1" }, text: "reply" }] });
@@ -49,6 +50,7 @@ test("uses the fixed scopes, Graph requests, bearer header, field projections, a
   assert.deepEqual(await exchangeThreadsCode(fetcher, { clientId: "client", clientSecret: "secret", redirectUri: "https://app.test/callback", code: "code", signal: AbortSignal.timeout(1_000) }), { accessToken: "short", userId: "user-1" });
   assert.deepEqual(await exchangeLongLivedThreadsToken(fetcher, { clientSecret: "secret", accessToken: "short", signal: AbortSignal.timeout(1_000) }), { accessToken: "long", tokenType: "bearer", expiresIn: 5_184_000 });
   assert.deepEqual(await refreshThreadsAccessToken(fetcher, { accessToken: "long", signal: AbortSignal.timeout(1_000) }), { accessToken: "refreshed", tokenType: "bearer", expiresIn: 5_184_000 });
+  assert.deepEqual(await debugThreadsAccessToken(fetcher, { accessToken: "long", signal: AbortSignal.timeout(1_000) }), { appId: "client", userId: "user-1", isValid: true, expiresAt: 5_184_100, scopes: THREADS_SCOPES });
   assert.deepEqual(await fetchThreadsProfile(fetcher, { accessToken: "secret", username: "meta", signal: AbortSignal.timeout(1_000) }), { id: "author-1", username: "meta", name: "Meta", profilePictureUrl: "https://scontent.cdninstagram.com/avatar" });
   assert.deepEqual(await fetchThreadsProfilePostsPage(fetcher, { accessToken: "secret", username: "meta", after: "before-1", signal: AbortSignal.timeout(1_000) }), {
     data: [{ id: "root-1", ownerId: "author-1", username: "meta", text: "", permalink: "https://www.threads.com/@meta/post/root1", timestamp: "2026-08-24T00:00:00+0000", mediaType: "CAROUSEL_ALBUM", mediaUrl: null, thumbnailUrl: null, children: ["child-image", "child-video"], quotedPostId: "quote-1", linkAttachmentUrl: "https://example.test/read", altText: "Root image", rootPostId: "root-1", repliedToId: "parent-1" }],
@@ -69,11 +71,13 @@ test("uses the fixed scopes, Graph requests, bearer header, field projections, a
   assert.deepEqual(Object.fromEntries(new URLSearchParams(await requests[0].text())), { client_id: "client", client_secret: "secret", grant_type: "authorization_code", redirect_uri: "https://app.test/callback", code: "code" });
   assert.equal(requests[1].url, "https://graph.threads.net/v1.0/access_token?grant_type=th_exchange_token&client_secret=secret&access_token=short");
   assert.equal(requests[2].url, "https://graph.threads.net/v1.0/refresh_access_token?grant_type=th_refresh_token&access_token=long");
-  assert.equal(requests[3].url, "https://graph.threads.net/v1.0/profile_lookup?fields=id%2Cusername%2Cname%2Cthreads_profile_picture_url&username=meta");
-  assert.equal(requests[4].url, `https://graph.threads.net/v1.0/profile_posts?fields=${encodeURIComponent(fields)}&username=meta&after=before-1`);
-  assert.equal(requests[5].url, `https://graph.threads.net/v1.0/root-1?fields=${encodeURIComponent(fields)}`);
-  assert.equal(requests[6].url, `https://graph.threads.net/v1.0/root-1/conversation?fields=${encodeURIComponent(fields)}&after=cursor-1`);
-  for (const request of requests.slice(3)) assert.equal(request.headers.get("authorization"), "Bearer secret");
+  assert.equal(requests[3].url, "https://graph.threads.net/v1.0/debug_token?input_token=long");
+  assert.equal(requests[3].headers.get("authorization"), "Bearer long");
+  assert.equal(requests[4].url, "https://graph.threads.net/v1.0/profile_lookup?fields=id%2Cusername%2Cname%2Cthreads_profile_picture_url&username=meta");
+  assert.equal(requests[5].url, `https://graph.threads.net/v1.0/profile_posts?fields=${encodeURIComponent(fields)}&username=meta&after=before-1`);
+  assert.equal(requests[6].url, `https://graph.threads.net/v1.0/root-1?fields=${encodeURIComponent(fields)}`);
+  assert.equal(requests[7].url, `https://graph.threads.net/v1.0/root-1/conversation?fields=${encodeURIComponent(fields)}&after=cursor-1`);
+  for (const request of requests.slice(4)) assert.equal(request.headers.get("authorization"), "Bearer secret");
   for (const request of requests) assert.equal(request.redirect, "manual");
 });
 
@@ -182,6 +186,22 @@ test("rejects malformed token, profile, page, and paging-next response shapes", 
     isAppError("threads_provider_protocol_error", 502),
   );
   await assert.rejects(fetchThreadsProfilePostsPage(async () => Response.json({ data: {}, paging: null }), { accessToken: "secret", username: "meta", signal: AbortSignal.timeout(1_000) }), isAppError("threads_provider_protocol_error", 502));
+});
+
+test("rejects malformed access-token debugger shapes without exposing token data", async () => {
+  const valid = { app_id: "app-1", user_id: "user-1", is_valid: true, expires_at: 5_184_100, scopes: THREADS_SCOPES };
+  for (const data of [
+    { ...valid, extra: true }, { ...valid, app_id: "" }, { ...valid, user_id: 1 },
+    { ...valid, is_valid: "true" }, { ...valid, expires_at: 1.5 },
+    { ...valid, scopes: "threads_basic" }, { ...valid, scopes: ["threads_basic", 1] },
+  ]) await assert.rejects(
+    debugThreadsAccessToken(async () => Response.json({ data }), { accessToken: "secret-debug-token", signal: AbortSignal.timeout(1_000) }),
+    (error) => isAppError("threads_provider_protocol_error", 502)(error) && error instanceof Error && !error.message.includes("secret-debug-token"),
+  );
+  await assert.rejects(
+    debugThreadsAccessToken(async () => Response.json({ data: valid, extra: true }), { accessToken: "secret-debug-token", signal: AbortSignal.timeout(1_000) }),
+    isAppError("threads_provider_protocol_error", 502),
+  );
 });
 
 test("accepts three short redirects, cancels their bodies, and rejects a fourth", async () => {

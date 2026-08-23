@@ -7,6 +7,8 @@ const secrets = Object.freeze({
   PROD_IP_HMAC_KEY: "cmVwby1hdGxhcy10ZXN0LWlwLWtleQ==",
   PROD_SESSION_KEY: "cmVwby1hdGxhcy10ZXN0LXNlc3Npb24ta2V5",
   OPENAI_API_KEY: "test-openai-key",
+  THREADS_APP_SECRET: "test-threads-secret",
+  THREADS_TOKEN_KEY: "cmVwby1hdGxhcy10aHJlYWRzLXRlc3Qta2V5LTAwMDE=",
 });
 
 const vars = Object.freeze({
@@ -15,6 +17,7 @@ const vars = Object.freeze({
   OPENAI_MODEL: "test-snapshot",
   RELEASE_ID: "test-release",
   TRUSTED_TYPES_MODE: "report-only",
+  THREADS_APP_ID: "test-threads-app",
 });
 
 /** @param {unknown} error */
@@ -193,7 +196,7 @@ export async function seedNamedRepositories(db, count, options = {}) {
   }
 }
 
-/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number>, threadsRetryAfter?: string, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
+/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number>, threadsRetryAfter?: string, threadsDebug?: Record<string, any>, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
 export function providerFixture(options = {}) {
   const {
   metadata = metadataFixture,
@@ -209,6 +212,7 @@ export function providerFixture(options = {}) {
   threadsMedia = { "root-1": threadsRootMedia },
   threadsStatus = 200,
   threadsRetryAfter,
+  threadsDebug = { app_id: "test-threads-app", user_id: "author-1", is_valid: true, expires_at: 2_000_000_000, scopes: ["threads_basic", "threads_profile_discovery", "threads_read_replies"] },
   mediaBodies = { "fixture-avatar": "avatar", "fixture-image": "image" },
   calls,
   } = options;
@@ -273,6 +277,10 @@ export function providerFixture(options = {}) {
     if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/refresh_access_token" && exactQuery(url, ["grant_type", "access_token"]) && url.searchParams.get("grant_type") === "th_refresh_token" && !request.headers.get("authorization")) {
       calls?.push({ method, path });
       return statusResponse("refresh_access_token") ?? Response.json({ access_token: "refreshed-token", token_type: "bearer", expires_in: 5_184_000 });
+    }
+    if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/debug_token" && exactQuery(url, ["input_token"]) && bearer(request) && request.headers.get("authorization") === `Bearer ${url.searchParams.get("input_token")}`) {
+      calls?.push({ method, path });
+      return statusResponse("debug_token") ?? Response.json({ data: threadsDebug });
     }
     if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/profile_lookup" && exactQuery(url, ["fields", "username"]) && url.searchParams.get("fields") === threadsProfileFields && url.searchParams.get("username") === "meta" && bearer(request)) {
       calls?.push({ method, path });

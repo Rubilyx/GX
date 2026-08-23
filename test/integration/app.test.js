@@ -215,9 +215,12 @@ test("memo route updates only the personal note and returns the saved repository
   assert.equal(response.status, 200);
   const result = await response.json();
   assert.deepEqual(Object.keys(result), ["repository"]);
-  assert.equal(result.repository.personalNote, "새 개인 메모");
+  assert.equal(Object.hasOwn(result.repository, "personalNote"), false);
   assert.equal(result.repository.primaryCategory, "Backend");
   assert.deepEqual(result.repository.tags, ["keep"]);
+  assert.equal(await env.PROD_DB.prepare(
+    "SELECT personal_note FROM repositories WHERE id = ?",
+  ).bind(repositoryId).first("personal_note"), "새 개인 메모");
 });
 
 test("memo route rejects notes over 4000 characters without changing stored data", async () => {

@@ -93,7 +93,7 @@ before(async () => { harness = await startHarness(); });
 beforeEach(async () => { await harness.reset(); });
 after(async () => { await harness.close(); });
 
-test("migration creates five tables and enforces five tags", async () => {
+test("migration creates the complete table inventory and enforces five tags", async () => {
   const env = await harness.worker.getEnv();
   const rows = await env.PROD_DB.prepare(
     `SELECT name FROM sqlite_schema

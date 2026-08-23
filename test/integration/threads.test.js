@@ -31,16 +31,27 @@ test("Threads entries enforce identity, quote parents, cascades, and OAuth singl
   const db = await harness.worker.getEnv().then((env) => env.PROD_DB);
   await db.prepare("INSERT INTO threads_authors (threads_user_id, username, display_name) VALUES ('author', 'author', 'Author'), ('reply', 'reply', 'Reply')").run();
   await db.prepare("INSERT INTO threads_posts (id, shortcode, submitted_url, status, root_author_id) VALUES ('post', 'short', 'https://www.threads.net/t/short', 'ready', 'author')").run();
-  const entry = (id, source, kind, parent = null, author = "author") => db.prepare(
+  const entry = (id, source, kind, parent = null, author = "author", post = "post") => db.prepare(
     `INSERT INTO threads_entries (id, threads_post_id, source_media_id, kind, parent_entry_id, author_id, text, published_at, media_type, first_seen_at, last_seen_at)
-     VALUES (?, 'post', ?, ?, ?, ?, '', '2026-08-24T00:00:00Z', 'TEXT_POST', 1, 1)`,
-  ).bind(id, source, kind, parent, author).run();
+     VALUES (?, ?, ?, ?, ?, ?, '', '2026-08-24T00:00:00Z', 'TEXT_POST', 1, 1)`,
+  ).bind(id, post, source, kind, parent, author).run();
   await entry("root", "root-media", "root");
   await entry("reply-a", "reply-a-media", "author_reply", null, "reply");
   await entry("reply-b", "reply-b-media", "author_reply", null, "reply");
   await entry("quote-a", "quote-media", "quote", "reply-a", "reply");
   await entry("quote-b", "quote-media", "quote", "reply-b", "reply");
   await assert.rejects(entry("quote-duplicate", "quote-media", "quote", "reply-a", "reply"));
+  await db.prepare("INSERT INTO threads_posts (id, shortcode, submitted_url, status, root_author_id) VALUES ('post-2', 'short-2', 'https://www.threads.net/t/short-2', 'ready', 'author')").run();
+  await assert.rejects(entry("cross-post-quote", "quote-media-2", "quote", "reply-a", "reply", "post-2"));
+  await db.prepare("UPDATE threads_entries SET threads_post_id = 'post-2' WHERE id = 'quote-a'").run().then(
+    () => assert.fail("cross-post update unexpectedly succeeded"),
+    () => undefined,
+  );
+  await assert.rejects(entry("nested-quote", "nested-media", "quote", "quote-a", "reply"));
+  await db.prepare("UPDATE threads_entries SET parent_entry_id = 'quote-a' WHERE id = 'quote-b'").run().then(
+    () => assert.fail("nested-quote update unexpectedly succeeded"),
+    () => undefined,
+  );
   await db.prepare("INSERT INTO threads_links (id, entry_id, url, source, ordinal) VALUES ('link', 'root', 'https://example.com', 'body', 0)").run();
   await db.prepare("INSERT INTO threads_media (id, entry_id, source_media_id, kind, ordinal) VALUES ('media', 'root', 'root-media', 'image', 0)").run();
   await db.prepare("INSERT INTO threads_sync_jobs (id, threads_post_id, generation, status, queued_at, updated_at) VALUES ('job', 'post', 1, 'queued', 1, 1)").run();

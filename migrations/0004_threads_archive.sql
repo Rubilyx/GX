@@ -49,6 +49,32 @@ CREATE TABLE threads_entries (
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   CHECK ((kind = 'quote' AND parent_entry_id IS NOT NULL) OR (kind != 'quote' AND parent_entry_id IS NULL))
 );
+CREATE TRIGGER threads_entries_validate_parent_insert
+BEFORE INSERT ON threads_entries
+FOR EACH ROW
+WHEN NEW.kind = 'quote'
+  AND NOT EXISTS (
+    SELECT 1 FROM threads_entries parent
+    WHERE parent.id = NEW.parent_entry_id
+      AND parent.threads_post_id = NEW.threads_post_id
+      AND parent.kind IN ('root', 'author_reply')
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'threads_entry_invalid_parent');
+END;
+CREATE TRIGGER threads_entries_validate_parent_update
+BEFORE UPDATE OF threads_post_id, kind, parent_entry_id ON threads_entries
+FOR EACH ROW
+WHEN NEW.kind = 'quote'
+  AND NOT EXISTS (
+    SELECT 1 FROM threads_entries parent
+    WHERE parent.id = NEW.parent_entry_id
+      AND parent.threads_post_id = NEW.threads_post_id
+      AND parent.kind IN ('root', 'author_reply')
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'threads_entry_invalid_parent');
+END;
 CREATE UNIQUE INDEX threads_entries_primary_source_idx ON threads_entries(threads_post_id, source_media_id) WHERE kind IN ('root','author_reply');
 CREATE UNIQUE INDEX threads_entries_quote_source_idx ON threads_entries(threads_post_id, parent_entry_id, source_media_id) WHERE kind = 'quote';
 CREATE INDEX threads_entries_reply_order_idx ON threads_entries(threads_post_id, published_at, source_media_id) WHERE kind = 'author_reply';

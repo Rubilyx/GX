@@ -59,6 +59,57 @@ const analysisFixture = Object.freeze({
   tags: ["example"],
 });
 
+const threadsFields = [
+  "id", "media_product_type", "media_type", "media_url", "permalink", "owner",
+  "username", "text", "timestamp", "shortcode", "thumbnail_url", "children",
+  "is_quote_post", "quoted_post", "link_attachment_url", "alt_text", "root_post", "replied_to",
+].join(",");
+const threadsProfileFields = "id,username,name,threads_profile_picture_url";
+const threadsProfile = Object.freeze({
+  id: "author-1", username: "meta", name: "Meta", threads_profile_picture_url: "https://scontent.cdninstagram.com/fixture-avatar",
+});
+const threadsRootMedia = Object.freeze({
+  id: "root-1", media_product_type: "THREADS", media_type: "TEXT_POST",
+  permalink: "https://www.threads.com/@meta/post/RootShort", owner: { id: "author-1" },
+  username: "meta", text: "Root", timestamp: "2026-08-24T00:00:00+0000", shortcode: "RootShort",
+});
+
+/** @param {URL} url @param {readonly string[]} keys */
+function exactQuery(url, keys) {
+  const actual = [...url.searchParams.keys()];
+  return actual.length === keys.length && keys.every((key) =>
+    url.searchParams.getAll(key).length === 1);
+}
+
+/** @param {Request} request */
+function bearer(request) { return /^Bearer\s+[^\s]+$/.test(request.headers.get("authorization") ?? ""); }
+
+/** @param {unknown} pages @param {string | null} after @param {string} path */
+function fixturePage(pages, after, path) {
+  const first = after === null ? 0 : -1;
+  /** @type {any} */ let page;
+  if (Array.isArray(pages)) {
+    let index = first;
+    if (after !== null) index = pages.findIndex((item) => item?.nextCursor === after) + 1;
+    page = pages[index];
+  } else if (pages && typeof pages === "object") page = /** @type {Record<string, any>} */ (pages)[after ?? ""];
+  if (!page || typeof page !== "object" || Array.isArray(page) || !Array.isArray(page.data)) return null;
+  /** @type {{ data: any, paging?: { next: string } }} */
+  const body = { data: page.data };
+  if (page.nextCursor !== undefined && page.nextCursor !== null) {
+    if (typeof page.nextCursor !== "string" || !page.nextCursor) return null;
+    body.paging = { next: `https://graph.threads.net/v1.0/${path}?after=${encodeURIComponent(page.nextCursor)}` };
+  }
+  return body;
+}
+
+/** @param {unknown} status @param {string} route */
+function fixtureStatus(status, route) {
+  if (typeof status === "number") return status;
+  const routes = status && typeof status === "object" ? /** @type {Record<string, number>} */ (status) : null;
+  return routes && Number.isInteger(routes[route]) ? routes[route] : 200;
+}
+
 /** @typedef {{ id: string, githubId: string, owner: string, name: string, htmlUrl: string, description: string | null, homepageUrl: string | null, defaultBranch: string, primaryLanguage: string | null, stars: number, forks: number, licenseSpdx: string | null, topics: string[], githubUpdatedAt: string, githubPushedAt: string | null, activityRefreshedAt: number | null, activityRefreshGeneration: number, readmeSha: string | null, readmeStatus: string, summary: string | null, problem: string | null, values: string[], audience: string | null, cautions: string | null, primaryCategory: string | null, analysisStatus: string, analysisErrorCode: string | null, analysisModel: string | null, promptVersion: string | null, analysisStartedAt: number | null, personalNote: string, analysisGeneration: number, tags: string[], createdAt: number | null }} SeedRepository */
 /** @type {Readonly<SeedRepository>} */
 const seedDefaults = Object.freeze({
@@ -138,7 +189,7 @@ export async function seedNamedRepositories(db, count, options = {}) {
   }
 }
 
-/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, calls?: Array<{ method: string, path: string }> }} [options] */
+/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number>, threadsRetryAfter?: string, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
 export function providerFixture(options = {}) {
   const {
   metadata = metadataFixture,
@@ -149,6 +200,12 @@ export function providerFixture(options = {}) {
   readmeStatus = 200,
   beforeOpenAi = () => {},
   openAiGate = Promise.resolve(),
+  threadsProfilePages = [{ data: [threadsRootMedia] }],
+  threadsConversationPages = [{ data: [] }],
+  threadsMedia = { "root-1": threadsRootMedia },
+  threadsStatus = 200,
+  threadsRetryAfter,
+  mediaBodies = { "fixture-avatar": "avatar", "fixture-image": "image" },
   calls,
   } = options;
   /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
@@ -190,7 +247,64 @@ export function providerFixture(options = {}) {
         })
         : new Response(null, { status: openAiStatus });
     }
-    throw new Error(`Unexpected provider request: ${method} ${url}`);
+    const unexpected = () => { throw new Error(`Unexpected provider request: ${method} ${url}`); };
+    const statusResponse = (/** @type {string} */ route) => {
+      const status = fixtureStatus(threadsStatus, route);
+      return status === 200 ? null : new Response(null, { status, headers: threadsRetryAfter ? { "Retry-After": threadsRetryAfter } : {} });
+    };
+    if (url.origin === "https://www.threads.com" && method === "GET" && url.pathname === "/t/RootShort" && !url.search && !request.headers.get("authorization")) {
+      calls?.push({ method, path });
+      return new Response(null, { status: 302, headers: { Location: "https://www.threads.com/@meta/post/RootShort" } });
+    }
+    if (url.origin === "https://graph.threads.net" && url.pathname === "/v1.0/oauth/access_token" && method === "POST" && !url.search && !request.headers.get("authorization")) {
+      const form = new URLSearchParams(await request.text());
+      if ([...form.keys()].length !== 5 || !["client_id", "client_secret", "grant_type", "redirect_uri", "code"].every((key) => form.getAll(key).length === 1) || form.get("grant_type") !== "authorization_code") return unexpected();
+      calls?.push({ method, path });
+      return statusResponse("oauth/access_token") ?? Response.json({ access_token: "short-token", user_id: "author-1" });
+    }
+    if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/access_token" && exactQuery(url, ["grant_type", "client_secret", "access_token"]) && url.searchParams.get("grant_type") === "th_exchange_token" && !request.headers.get("authorization")) {
+      calls?.push({ method, path });
+      return statusResponse("access_token") ?? Response.json({ access_token: "long-token", token_type: "bearer", expires_in: 5_184_000 });
+    }
+    if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/refresh_access_token" && exactQuery(url, ["grant_type", "access_token"]) && url.searchParams.get("grant_type") === "th_refresh_token" && !request.headers.get("authorization")) {
+      calls?.push({ method, path });
+      return statusResponse("refresh_access_token") ?? Response.json({ access_token: "refreshed-token", token_type: "bearer", expires_in: 5_184_000 });
+    }
+    if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/profile_lookup" && exactQuery(url, ["fields", "username"]) && url.searchParams.get("fields") === threadsProfileFields && url.searchParams.get("username") === "meta" && bearer(request)) {
+      calls?.push({ method, path });
+      return statusResponse("profile_lookup") ?? Response.json(threadsProfile);
+    }
+    if (url.origin === "https://graph.threads.net" && method === "GET" && url.pathname === "/v1.0/profile_posts" && exactQuery(url, [...(url.searchParams.has("after") ? ["fields", "username", "after"] : ["fields", "username"])]) && url.searchParams.get("fields") === threadsFields && url.searchParams.get("username") === "meta" && bearer(request)) {
+      const after = url.searchParams.get("after");
+      const page = fixturePage(threadsProfilePages, after, "profile_posts");
+      if (!page) return unexpected();
+      calls?.push({ method, path });
+      return statusResponse("profile_posts") ?? Response.json(page);
+    }
+    const mediaMatch = /^\/v1\.0\/([^/]+)$/.exec(url.pathname);
+    if (url.origin === "https://graph.threads.net" && method === "GET" && mediaMatch && exactQuery(url, ["fields"]) && url.searchParams.get("fields") === threadsFields && bearer(request)) {
+      const body = threadsMedia[decodeURIComponent(mediaMatch[1])];
+      if (!body) return unexpected();
+      calls?.push({ method, path });
+      return statusResponse("media") ?? Response.json(body);
+    }
+    const conversationMatch = /^\/v1\.0\/([^/]+)\/conversation$/.exec(url.pathname);
+    if (url.origin === "https://graph.threads.net" && method === "GET" && conversationMatch && exactQuery(url, url.searchParams.has("after") ? ["fields", "after"] : ["fields"]) && url.searchParams.get("fields") === threadsFields && bearer(request)) {
+      const id = decodeURIComponent(conversationMatch[1]);
+      const conversationSets = threadsConversationPages && typeof threadsConversationPages === "object" && !Array.isArray(threadsConversationPages) ? /** @type {Record<string, unknown>} */ (threadsConversationPages) : null;
+      const pages = conversationSets && id in conversationSets ? conversationSets[id] : threadsConversationPages;
+      const page = fixturePage(pages, url.searchParams.get("after"), `${id}/conversation`);
+      if (!page) return unexpected();
+      calls?.push({ method, path });
+      return statusResponse("conversation") ?? Response.json(page);
+    }
+    if (url.origin === "https://scontent.cdninstagram.com" && method === "GET" && !url.search && /^\/[^/]+$/.test(url.pathname) && !request.headers.get("authorization")) {
+      const object = decodeURIComponent(url.pathname.slice(1));
+      if (!(object in mediaBodies)) return unexpected();
+      calls?.push({ method, path });
+      return new Response(mediaBodies[object]);
+    }
+    return unexpected();
   };
 }
 

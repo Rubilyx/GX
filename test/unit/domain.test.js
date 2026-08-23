@@ -36,21 +36,24 @@ test("accepts only one q/category/tag/page value", () => {
 test("normalizes tag and editable fields", () => {
   assert.deepEqual(normalizeTags([" Node JS ", "node-js", "AI"]), ["node-js", "ai"]);
   assert.deepEqual(validateRepositoryEdit({
-    personalNote: "  메모  ", primaryCategory: "Backend", tags: ["node-js"],
-  }), { personalNote: "메모", primaryCategory: "Backend", tags: ["node-js"] });
+    primaryCategory: "Backend", tags: [" Node JS ", "node-js"],
+  }), { primaryCategory: "Backend", tags: ["node-js"] });
   assert.throws(() => normalizeTags(["a", "b", "c", "d", "e", "f"]), /invalid_tags/);
-  assert.throws(() => validateRepositoryEdit({ personalNote: "x".repeat(4001), primaryCategory: "Backend", tags: [] }), /invalid_repository_edit/);
 });
 
 test("rejects extra edit fields", () => {
   assert.throws(
-    () => validateRepositoryEdit({ personalNote: "", primaryCategory: "Other", tags: [], stars: 99 }),
+    () => validateRepositoryEdit({ personalNote: "", primaryCategory: "Other", tags: [] }),
+    /invalid_repository_edit/,
+  );
+  assert.throws(
+    () => validateRepositoryEdit({ primaryCategory: "Other", tags: [], stars: 99 }),
     /invalid_repository_edit/,
   );
 });
 
 test("rejects malformed repository edit shapes with safe errors", () => {
-  for (const input of [{}, null, { personalNote: "", primaryCategory: "Other", tags: "x" }]) {
+  for (const input of [{}, null, { primaryCategory: "Other", tags: "x" }]) {
     assert.throws(
       () => validateRepositoryEdit(/** @type {any} */ (input)),
       (error) => error instanceof AppError && error.code === "invalid_repository_edit" && error.status === 400,

@@ -37,6 +37,21 @@ function invalidStorage() {
   throw new AppError("storage_unavailable", 503);
 }
 
+const REPOSITORY_WITH_NOTE_SUMMARY = `
+  r.*,
+  (
+    SELECT COUNT(*)
+    FROM repository_notes AS note_count_rows
+    WHERE note_count_rows.repository_id = r.id
+  ) AS note_count,
+  (
+    SELECT newest.body
+    FROM repository_notes AS newest
+    WHERE newest.repository_id = r.id
+    ORDER BY newest.created_at DESC, newest.id DESC
+    LIMIT 1
+  ) AS latest_note`;
+
 /** @param {any} value */
 function mutationChanges(value) {
   const changes = value?.meta?.changes;
@@ -272,6 +287,9 @@ function jsonArray(value) {
 
 /** @param {any} row @param {string[]} [tags] */
 function mapRepository(row, tags = []) {
+  const noteCount = Number(row.note_count);
+  if (!Number.isInteger(noteCount) || noteCount < 0 ||
+    !(typeof row.latest_note === "string" || row.latest_note === null)) invalidStorage();
   return {
     id: row.id, githubId: row.github_id, owner: row.owner, name: row.name,
     htmlUrl: row.html_url, description: row.description, homepageUrl: row.homepage_url,
@@ -286,7 +304,7 @@ function mapRepository(row, tags = []) {
     analysisStatus: row.analysis_status, analysisErrorCode: row.analysis_error_code,
     analysisModel: row.analysis_model, promptVersion: row.prompt_version,
     analysisStartedAt: row.analysis_started_at, analyzedAt: row.analyzed_at,
-    personalNote: row.personal_note, analysisGeneration: row.analysis_generation,
+    noteCount, latestNote: row.latest_note, analysisGeneration: row.analysis_generation,
     createdAt: row.created_at, updatedAt: row.updated_at, tags,
   };
 }
@@ -294,7 +312,9 @@ function mapRepository(row, tags = []) {
 /** @param {any} db @param {string} id */
 export async function getRepository(db, id) {
   try {
-    const row = await db.prepare("SELECT * FROM repositories WHERE id = ?").bind(id).first();
+    const row = await db.prepare(
+      `SELECT ${REPOSITORY_WITH_NOTE_SUMMARY} FROM repositories AS r WHERE r.id = ?`,
+    ).bind(id).first();
     if (!row) return null;
     const tags = await db.prepare(
       "SELECT normalized_tag FROM repository_tags WHERE repository_id = ? ORDER BY normalized_tag",
@@ -316,7 +336,12 @@ export async function listRepositories(db, filters) {
       OR r.name LIKE ? ESCAPE '\\' COLLATE NOCASE
       OR r.description LIKE ? ESCAPE '\\' COLLATE NOCASE
       OR r.summary LIKE ? ESCAPE '\\' COLLATE NOCASE
-      OR r.personal_note LIKE ? ESCAPE '\\' COLLATE NOCASE
+      OR EXISTS (
+        SELECT 1
+        FROM repository_notes AS note_search
+        WHERE note_search.repository_id = r.id
+          AND note_search.body LIKE ? ESCAPE '\\' COLLATE NOCASE
+      )
     )`);
     bindings.push(pattern, pattern, pattern, pattern, pattern);
   }
@@ -341,7 +366,7 @@ export async function listRepositories(db, filters) {
       Number.isInteger(filters.page) && filters.page > 0 ? filters.page : 1;
     const page = Math.min(requestedPage, totalPages);
     const rows = await db.prepare(
-      `SELECT r.* FROM repositories AS r ${whereSql}
+      `SELECT ${REPOSITORY_WITH_NOTE_SUMMARY} FROM repositories AS r ${whereSql}
        ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?`,
     ).bind(...bindings, pageSize, (page - 1) * pageSize).all();
     // ponytail: the 1,000-repository cap bounds this to 5,000 rows; scope by page if that cap grows.
@@ -379,9 +404,9 @@ export async function listRepositories(db, filters) {
 export async function updateRepository(db, id, patch) {
   const edit = validateRepositoryEdit(patch);
   const statements = [db.prepare(
-    `UPDATE repositories SET personal_note = ?, primary_category = ?, updated_at = unixepoch()
+    `UPDATE repositories SET primary_category = ?, updated_at = unixepoch()
      WHERE id = ?`,
-  ).bind(edit.personalNote, edit.primaryCategory, id), db.prepare(
+  ).bind(edit.primaryCategory, id), db.prepare(
     `DELETE FROM repository_tags WHERE repository_id = ?
      AND EXISTS (SELECT 1 FROM repositories WHERE id = ?)`,
   ).bind(id, id)];

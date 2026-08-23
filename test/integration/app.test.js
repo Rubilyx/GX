@@ -236,7 +236,9 @@ test("memo route rejects notes over 4000 characters without changing stored data
 
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { errorCode: "invalid_personal_note" });
-  assert.equal((await getRepository(env.PROD_DB, repositoryId))?.personalNote, "보존할 메모");
+  assert.equal(await env.PROD_DB.prepare(
+    "SELECT personal_note FROM repositories WHERE id = ?",
+  ).bind(repositoryId).first("personal_note"), "보존할 메모");
 });
 
 test("activity refresh synchronizes pushed activity with one GitHub metadata request", async () => {
@@ -293,7 +295,7 @@ test("activity refresh synchronizes pushed activity with one GitHub metadata req
   assert.equal(typeof stored.activityRefreshedAt, "number");
   assert.equal(stored.stars, 10);
   assert.equal(stored.primaryLanguage, "JavaScript");
-  assert.equal(stored.personalNote, "보존할 메모");
+  assert.equal(Object.hasOwn(stored, "personalNote"), false);
   assert.deepEqual(stored.tags, ["keep"]);
 
   const native = await postForm(

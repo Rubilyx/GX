@@ -15,7 +15,7 @@ export const CATEGORIES = Object.freeze([
 ]);
 
 const TAG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const EDIT_KEYS = new Set(["personalNote", "primaryCategory", "tags"]);
+const EDIT_KEYS = new Set(["primaryCategory", "tags"]);
 
 /** @param {unknown} raw @param {string} errorCode */
 function normalizedPersonalNote(raw, errorCode) {
@@ -94,14 +94,13 @@ export function parseNotePage(url) {
   return { page: Number(raw) };
 }
 
-/** @param {{ personalNote: string, primaryCategory: string, tags: string[] } & Record<string, unknown>} input */
+/** @param {{ primaryCategory: string, tags: string[] } & Record<string, unknown>} input */
 export function validateRepositoryEdit(input) {
   if (!input || typeof input !== "object" || Array.isArray(input) ||
     Object.keys(input).some((key) => !EDIT_KEYS.has(key)) ||
-    typeof input.personalNote !== "string" || typeof input.primaryCategory !== "string" || !Array.isArray(input.tags))
+    typeof input.primaryCategory !== "string" || !Array.isArray(input.tags))
     throw new AppError("invalid_repository_edit", 400);
-  const personalNote = normalizedPersonalNote(input.personalNote, "invalid_repository_edit");
   if (!CATEGORIES.includes(input.primaryCategory))
     throw new AppError("invalid_repository_edit", 400);
-  return { personalNote, primaryCategory: input.primaryCategory, tags: normalizeTags(input.tags) };
+  return { primaryCategory: input.primaryCategory, tags: normalizeTags(input.tags) };
 }

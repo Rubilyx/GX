@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { after, before, beforeEach, test } from "node:test";
 import {
-  providerFixture, seedNamedRepositories, seedRepository, startHarness,
+  providerFixture, seedNamedRepositories, seedRepository, seedRepositoryNote, startHarness,
 } from "../support/harness.js";
 import {
   collectRepository, deleteRepository, getRepository, listRepositories,
@@ -444,6 +444,60 @@ test("search treats percent and underscore literally and caps rows at 10", async
   )).repositories.map((/** @type {any} */ repository) => repository.id), ["slash"]);
 });
 
+test("Note summary joins use newest timestamp then id and omit legacy personal notes", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, { id: "repo-first", githubId: "first", createdAt: 2 });
+  await seedRepository(env.PROD_DB, { id: "repo-second", githubId: "second", createdAt: 1 });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-a", repositoryId: "repo-first", body: "Oldest Note", createdAt: 10, updatedAt: 10,
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-b", repositoryId: "repo-first", body: "Second Note", createdAt: 20, updatedAt: 20,
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-c", repositoryId: "repo-first", body: "Latest Note", createdAt: 20, updatedAt: 20,
+  });
+
+  const first = await getRepository(env.PROD_DB, "repo-first");
+  assert.ok(first);
+  assert.deepEqual({ noteCount: first.noteCount, latestNote: first.latestNote }, {
+    noteCount: 3, latestNote: "Latest Note",
+  });
+  assert.equal(Object.hasOwn(first, "personalNote"), false);
+
+  const listed = await listRepositories(env.PROD_DB, { q: "", category: "", tag: "", page: 1 });
+  const byId = new Map(listed.repositories.map((/** @type {any} */ repository) => [repository.id, repository]));
+  assert.deepEqual(
+    { noteCount: byId.get("repo-first")?.noteCount, latestNote: byId.get("repo-first")?.latestNote },
+    { noteCount: 3, latestNote: "Latest Note" },
+  );
+  assert.deepEqual(
+    { noteCount: byId.get("repo-second")?.noteCount, latestNote: byId.get("repo-second")?.latestNote },
+    { noteCount: 0, latestNote: null },
+  );
+  assert.equal(Object.hasOwn(byId.get("repo-second"), "personalNote"), false);
+});
+
+test("Note body search finds older Notes and escapes literal wildcards", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, { id: "repo-notes", githubId: "notes" });
+  await seedRepository(env.PROD_DB, { id: "repo-empty", githubId: "empty" });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-search-old", repositoryId: "repo-notes", body: "older unique phrase", createdAt: 10, updatedAt: 10,
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-search-percent", repositoryId: "repo-notes", body: "literal_100%", createdAt: 20, updatedAt: 20,
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-search-slash", repositoryId: "repo-notes", body: "back\\slash", createdAt: 30, updatedAt: 30,
+  });
+
+  for (const query of ["older unique phrase", "_100%", "%", "\\"]) {
+    const result = await listRepositories(env.PROD_DB, { q: query, category: "", tag: "", page: 1 });
+    assert.deepEqual(result.repositories.map((/** @type {any} */ repository) => repository.id), ["repo-notes"]);
+  }
+});
+
 test("list combines q category and tag with AND and clamps to last page", async () => {
   const env = await harness.worker.getEnv();
   await seedNamedRepositories(env.PROD_DB, 31);
@@ -475,16 +529,26 @@ test("list combines q category and tag with AND and clamps to last page", async 
   assert.equal(clamped.repositories.length, 5);
 });
 
-test("edit revalidates and replaces note category tags; delete cascades", async () => {
+test("repository edit excludes Notes and legacy field while replacing category tags", async () => {
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB, { tags: ["old"] });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-kept", body: "Keep this Note", createdAt: 10, updatedAt: 10,
+  });
+  const notesBefore = await env.PROD_DB.prepare(
+    "SELECT id, repository_id, body, created_at, updated_at FROM repository_notes WHERE repository_id = ?",
+  ).bind("repo-1").all();
   const updated = await updateRepository(env.PROD_DB, "repo-1", {
-    personalNote: "  cafe\u0301  ", primaryCategory: "Data", tags: ["New Tag", "new-tag"],
+    primaryCategory: "Data", tags: ["New Tag", "new-tag"],
   });
   assert.ok(updated);
-  assert.equal(updated.personalNote, "café");
+  assert.equal(Object.hasOwn(updated, "personalNote"), false);
   assert.equal(updated.primaryCategory, "Data");
   assert.deepEqual(updated.tags, ["new-tag"]);
+  const notesAfter = await env.PROD_DB.prepare(
+    "SELECT id, repository_id, body, created_at, updated_at FROM repository_notes WHERE repository_id = ?",
+  ).bind("repo-1").all();
+  assert.deepEqual(notesAfter.results, notesBefore.results);
   await deleteRepository(env.PROD_DB, "repo-1");
   assert.equal(await env.PROD_DB.prepare("SELECT COUNT(*) AS count FROM repositories").first("count"), 0);
   assert.equal(await env.PROD_DB.prepare("SELECT COUNT(*) AS count FROM repository_tags").first("count"), 0);
@@ -542,16 +606,21 @@ test("refresh GitHub failure leaves stored row byte-for-byte unchanged", async (
   assert.deepEqual(afterRow, before);
 });
 
-test("successful refresh preserves note and replaces at most five tags", async () => {
+test("successful refresh preserves Notes and replaces at most five tags", async () => {
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB, {
-    githubId: String(metadataFixture.id), personalNote: "keep", tags: ["old"],
+    githubId: String(metadataFixture.id), tags: ["old"],
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-refresh", body: "Keep this Note", createdAt: 10, updatedAt: 10,
   });
   const analysis = { ...analysisFixture, tags: ["one", "two", "three", "four", "five"] };
   await refreshRepository(env.PROD_DB, "repo-1", dependencies(providerFixture({ analysis })));
   const row = await getRepository(env.PROD_DB, "repo-1");
   assert.ok(row);
-  assert.equal(row.personalNote, "keep");
+  assert.deepEqual({ noteCount: row.noteCount, latestNote: row.latestNote }, {
+    noteCount: 1, latestNote: "Keep this Note",
+  });
   assert.equal(row.githubPushedAt, "2026-08-08T00:00:00Z");
   assert.deepEqual(row.tags, ["five", "four", "one", "three", "two"]);
 });
@@ -747,7 +816,15 @@ test("fails closed on malformed D1 mutation results", async (context) => {
         first: [{ id: "repo-1", topics_json: "[]", values_json: "[]" }],
         all: [{ results: [] }],
       }), "repo-1",
-      { personalNote: "note", primaryCategory: "Backend", tags: ["tag"] },
+      { primaryCategory: "Backend", tags: ["tag"] },
+    ));
+  });
+  await context.test("repository Note summary fields are malformed", async () => {
+    await rejectsStorage(getRepository(
+      d1Stub({ first: [{ note_count: -1, latest_note: null }], all: [{ results: [] }] }), "repo-1",
+    ));
+    await rejectsStorage(getRepository(
+      d1Stub({ first: [{ note_count: 1, latest_note: 42 }], all: [{ results: [] }] }), "repo-1",
     ));
   });
   await context.test("delete result reports unsuccessful", async () => {

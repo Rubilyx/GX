@@ -4,8 +4,8 @@ import {
 } from "./threads-domain.js";
 import {
   ACTIVE_JOBS, d1NonnegativeInteger, exactRow, inputPositiveInteger,
-  inputTimestamp, invalidStorage, JOB_STATUSES, MEDIA_KINDS, mutationBatch,
-  mutationChanges, POST_STATUSES, requiredString, selectRows, storageError,
+  inputTimestamp, invalidStorage, JOB_STATUSES, mutationBatch,
+  mutationChanges, nullableString, POST_STATUSES, requiredString, selectRows, storageError,
 } from "./threads-storage.js";
 
 const SYNC_ROW_KEYS = [
@@ -151,7 +151,7 @@ const JOB_ROW_KEYS = [
   "post_id", "generation", "status", "profile_cursor", "conversation_cursor",
   "pending_quote_count", "expected_entry_count", "expected_media_count",
   "ready_media_count", "failed_media_count", "error_code", "root_author_id",
-  "threads_media_id", "canonical_url",
+  "threads_media_id", "canonical_url", "submitted_url", "shortcode",
 ];
 /** @param {any} row */
 function mapJobRow(row) {
@@ -165,7 +165,9 @@ function mapJobRow(row) {
     !(row.error_code === null || typeof row.error_code === "string") ||
     !(row.root_author_id === null || typeof row.root_author_id === "string") ||
     !(row.threads_media_id === null || typeof row.threads_media_id === "string") ||
-    !(row.canonical_url === null || typeof row.canonical_url === "string")) invalidStorage();
+    !(row.canonical_url === null || typeof row.canonical_url === "string") ||
+    typeof row.submitted_url !== "string" || !row.submitted_url ||
+    typeof row.shortcode !== "string" || !row.shortcode) invalidStorage();
   for (const key of ["pending_quote_count", "expected_entry_count", "expected_media_count",
     "ready_media_count", "failed_media_count"]) d1NonnegativeInteger(row[key]);
   return {
@@ -175,7 +177,8 @@ function mapJobRow(row) {
     expectedMediaCount: row.expected_media_count, readyMediaCount: row.ready_media_count,
     failedMediaCount: row.failed_media_count, errorCode: row.error_code,
     rootAuthorId: row.root_author_id, threadsMediaId: row.threads_media_id,
-    canonicalUrl: row.canonical_url,
+    canonicalUrl: row.canonical_url, submittedUrl: row.submitted_url,
+    shortcode: row.shortcode,
   };
 }
 
@@ -201,9 +204,35 @@ export async function claimThreadsJob(db, postId, generation, status) {
          expected_media_count, ready_media_count, failed_media_count, error_code,
          (SELECT root_author_id FROM threads_posts WHERE id = threads_post_id) AS root_author_id,
          (SELECT threads_media_id FROM threads_posts WHERE id = threads_post_id) AS threads_media_id,
-         (SELECT canonical_url FROM threads_posts WHERE id = threads_post_id) AS canonical_url`,
+         (SELECT canonical_url FROM threads_posts WHERE id = threads_post_id) AS canonical_url,
+         (SELECT submitted_url FROM threads_posts WHERE id = threads_post_id) AS submitted_url,
+         (SELECT shortcode FROM threads_posts WHERE id = threads_post_id) AS shortcode`,
     ).bind(status, postId, generation).first();
     return mapJobRow(row);
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number, expectedCursor?: string | null, nextCursor?: string | null, nowSeconds: number }} input */
+export async function advanceThreadsProfileCursor(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const expectedCursor = nullableString(input?.expectedCursor);
+  const nextCursor = nullableString(input?.nextCursor);
+  const now = inputTimestamp(input?.nowSeconds);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_sync_jobs AS j SET
+         profile_cursor = ?, status = 'resolving', updated_at = ?
+       WHERE threads_post_id = ? AND generation = ? AND status = 'resolving'
+         AND profile_cursor IS ?
+         AND EXISTS (
+           SELECT 1 FROM threads_posts p
+           WHERE p.id = j.threads_post_id AND p.sync_generation = j.generation
+             AND p.status <> 'deleting'
+         )`,
+    ).bind(nextCursor, now, postId, generation, expectedCursor).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
   } catch (error) { throw storageError(error); }
 }
 
@@ -370,30 +399,6 @@ export async function recalculateThreadsStatus(db, input) {
   } catch (error) { throw storageError(error); }
 }
 
-/** @param {unknown} value */
-function mediaDescriptor(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new AppError("invalid_threads_state", 400);
-  const item = /** @type {Record<string, any>} */ (value);
-  if (typeof item.entryId !== "string" || !item.entryId ||
-    typeof item.sourceMediaId !== "string" || !item.sourceMediaId ||
-    !MEDIA_KINDS.has(item.kind) || !Number.isSafeInteger(item.ordinal) || item.ordinal < 0 ||
-    !(item.altText === null || typeof item.altText === "string") ||
-    typeof item.sourceUrl !== "string" || !item.sourceUrl)
-    throw new AppError("invalid_threads_state", 400);
-  return item;
-}
-/** @param {unknown} value */
-function profileDescriptor(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new AppError("invalid_threads_state", 400);
-  const item = /** @type {Record<string, any>} */ (value);
-  if (typeof item.authorId !== "string" || !item.authorId ||
-    typeof item.sourceUrl !== "string" || !item.sourceUrl)
-    throw new AppError("invalid_threads_state", 400);
-  return item;
-}
-
 function finalizationGate() {
   return `EXISTS (
     SELECT 1 FROM threads_sync_jobs gate
@@ -408,19 +413,46 @@ function finalizationGate() {
   )`;
 }
 
-/** @param {any} db @param {any} mediaQueue @param {{ postId: string, generation: number, media?: unknown[], profiles?: unknown[], nowSeconds: number }} input */
+/** @param {any} db @param {string} postId @param {number} generation */
+async function pendingFinalizationRows(db, postId, generation) {
+  const gate = `EXISTS (
+    SELECT 1 FROM threads_sync_jobs job JOIN threads_posts post
+      ON post.id = job.threads_post_id
+    WHERE job.threads_post_id = ? AND job.generation = ?
+      AND job.status = 'media_pending' AND job.content_completed_at IS NOT NULL
+      AND job.profile_cursor IS NULL AND job.conversation_cursor IS NULL
+      AND job.pending_quote_count = 0 AND post.sync_generation = job.generation
+      AND post.status <> 'deleting'
+  )`;
+  const media = selectRows(await db.prepare(
+    `SELECT media.id AS media_id, media.entry_id
+     FROM threads_media media JOIN threads_entries entry ON entry.id = media.entry_id
+     WHERE entry.threads_post_id = ? AND media.status = 'pending' AND ${gate}
+     ORDER BY entry.id, media.ordinal, media.id`,
+  ).bind(postId, postId, generation).all(), ["media_id", "entry_id"]);
+  for (const row of media) if (typeof row.media_id !== "string" || !row.media_id ||
+    typeof row.entry_id !== "string" || !row.entry_id) invalidStorage();
+  const profiles = selectRows(await db.prepare(
+    `SELECT DISTINCT entry.author_id
+     FROM threads_entries entry JOIN threads_authors author
+       ON author.threads_user_id = entry.author_id
+     WHERE entry.threads_post_id = ? AND author.profile_media_status = 'pending' AND ${gate}
+     ORDER BY entry.author_id`,
+  ).bind(postId, postId, generation).all(), ["author_id"]);
+  for (const row of profiles) if (typeof row.author_id !== "string" || !row.author_id)
+    invalidStorage();
+  return { media, profiles };
+}
+
+/** @param {any} db @param {any} mediaQueue @param {{ postId: string, generation: number, nowSeconds: number }} input */
 export async function finalizeThreadsContent(db, mediaQueue, input) {
   const postId = requiredString(input?.postId);
   const generation = inputPositiveInteger(input?.generation);
   const now = inputTimestamp(input?.nowSeconds);
-  if (!Array.isArray(input?.media ?? []) || !Array.isArray(input?.profiles ?? []))
-    throw new AppError("invalid_threads_state", 400);
-  const media = (input.media ?? []).map(mediaDescriptor);
-  const profiles = (input.profiles ?? []).map(profileDescriptor);
   try {
     const state = await currentState(db, postId, generation);
     if (!state) return { status: "stale", ready: 0, failed: 0, expected: 0 };
-    if (["media_pending", "ready", "partial", "error"].includes(state.status)) {
+    if (["ready", "partial", "error"].includes(state.status)) {
       return { status: state.status, ready: state.ready_media_count,
         failed: state.failed_media_count, expected: state.expected_media_count };
     }
@@ -428,88 +460,53 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
       state.pending_quote_count !== 0) {
       return { status: "collecting", ready: 0, failed: 0, expected: 0 };
     }
-    const uniqueProfiles = [...new Map(profiles.map((item) => [item.authorId, item])).values()];
-    const authorRows = selectRows(await db.prepare(
-      `SELECT DISTINCT e.author_id, a.profile_media_status
-       FROM threads_entries e JOIN threads_authors a ON a.threads_user_id = e.author_id
-       WHERE e.threads_post_id = ? ORDER BY e.author_id`,
-    ).bind(postId).all(), ["author_id", "profile_media_status"]);
-    for (const author of authorRows) {
-      if (typeof author.author_id !== "string" ||
-        !["pending", "ready", "error"].includes(author.profile_media_status)) invalidStorage();
+    if (state.status !== "media_pending") {
+      const leaseToken = `finalizing:${crypto.randomUUID()}`;
+      const gate = finalizationGate();
+      const statements = [
+        db.prepare(
+          `UPDATE threads_sync_jobs AS job SET status = 'media_pending',
+             content_completed_at = ?, error_code = ?, updated_at = ?
+           WHERE threads_post_id = ? AND generation = ?
+             AND status IN ('queued','resolving','collecting')
+             AND profile_cursor IS NULL AND conversation_cursor IS NULL
+             AND pending_quote_count = 0
+             AND EXISTS (
+               SELECT 1 FROM threads_posts post WHERE post.id = job.threads_post_id
+                 AND post.sync_generation = job.generation AND post.status <> 'deleting'
+             )`,
+        ).bind(now, leaseToken, now, postId, generation),
+        db.prepare(
+          `UPDATE threads_posts SET status = 'collecting', error_code = NULL, updated_at = ?
+           WHERE id = ? AND sync_generation = ? AND status <> 'deleting' AND ${gate}`,
+        ).bind(now, postId, generation, leaseToken, postId, generation),
+        db.prepare(
+          `UPDATE threads_sync_jobs SET
+             expected_entry_count = (
+               SELECT COUNT(*) FROM threads_entries WHERE threads_post_id = ?
+             ),
+             expected_media_count = (
+               SELECT COUNT(*) FROM threads_media media
+               JOIN threads_entries entry ON entry.id = media.entry_id
+               WHERE entry.threads_post_id = ?
+             ) + (
+               SELECT COUNT(DISTINCT author_id) FROM threads_entries
+               WHERE threads_post_id = ?
+             ), error_code = ?, updated_at = ?
+           WHERE threads_post_id = ? AND generation = ? AND ${gate}`,
+        ).bind(postId, postId, postId, state.error_code, now, postId, generation,
+          leaseToken, postId, generation),
+      ];
+      const changes = mutationBatch(await db.batch(statements), statements.length);
+      if (changes.some((count) => count > 1)) invalidStorage();
+      if (changes.some((count) => count !== 1))
+        return { status: "stale", ready: 0, failed: 0, expected: 0 };
     }
-    const profileIds = new Set(uniqueProfiles.map((item) => item.authorId));
-    const leaseToken = `finalizing:${crypto.randomUUID()}`;
-    const gate = finalizationGate();
-    const statements = [db.prepare(
-      `UPDATE threads_sync_jobs AS j SET status = 'media_pending', content_completed_at = ?,
-         error_code = ?, updated_at = ?
-       WHERE threads_post_id = ? AND generation = ?
-         AND status IN ('queued','resolving','collecting')
-         AND profile_cursor IS NULL AND conversation_cursor IS NULL
-         AND pending_quote_count = 0
-         AND EXISTS (
-           SELECT 1 FROM threads_posts p WHERE p.id = j.threads_post_id
-             AND p.sync_generation = j.generation AND p.status <> 'deleting'
-         )`,
-    ).bind(now, leaseToken, now, postId, generation)];
-    for (const item of media) {
-      statements.push(db.prepare(
-        `INSERT INTO threads_media
-           (id, entry_id, source_media_id, kind, ordinal, alt_text, status,
-            created_at, updated_at)
-         SELECT ?, e.id, ?, ?, ?, ?, 'pending', ?, ?
-         FROM threads_entries e
-         WHERE e.id = ? AND e.threads_post_id = ? AND ${gate}
-         ON CONFLICT(entry_id, source_media_id, kind, ordinal) DO NOTHING`,
-      ).bind(crypto.randomUUID(), item.sourceMediaId, item.kind, item.ordinal,
-        item.altText ?? null, now, now, item.entryId, postId,
-        leaseToken, postId, generation));
-    }
-    for (const author of authorRows) {
-      if (!profileIds.has(author.author_id) && author.profile_media_status === "pending") {
-        statements.push(db.prepare(
-          `UPDATE threads_authors SET profile_media_status = 'error',
-             profile_error_code = 'threads_profile_unavailable', updated_at = ?
-           WHERE threads_user_id = ? AND profile_media_status = 'pending'
-             AND ${gate}`,
-        ).bind(now, author.author_id, leaseToken, postId, generation));
-      }
-    }
-    statements.push(db.prepare(
-      `UPDATE threads_posts SET status = 'collecting', error_code = NULL, updated_at = ?
-       WHERE id = ? AND sync_generation = ? AND status <> 'deleting' AND ${gate}`,
-    ).bind(now, postId, generation, leaseToken, postId, generation));
-    statements.push(db.prepare(
-      `UPDATE threads_sync_jobs SET
-         expected_entry_count = (
-           SELECT COUNT(*) FROM threads_entries WHERE threads_post_id = ?
-         ),
-         expected_media_count = (
-           SELECT COUNT(*) FROM threads_media m JOIN threads_entries e ON e.id = m.entry_id
-           WHERE e.threads_post_id = ?
-         ) + (
-           SELECT COUNT(DISTINCT author_id) FROM threads_entries WHERE threads_post_id = ?
-         ), error_code = ?, updated_at = ?
-       WHERE threads_post_id = ? AND generation = ? AND ${gate}`,
-    ).bind(postId, postId, postId, state.error_code, now, postId, generation,
-      leaseToken, postId, generation));
-    const changes = mutationBatch(await db.batch(statements), statements.length);
-    if (changes.some((count) => count > 1)) invalidStorage();
-    if (changes[0] !== 1 || changes.at(-2) !== 1 || changes.at(-1) !== 1)
-      return { status: "stale", ready: 0, failed: 0, expected: 0 };
-    const mediaStart = 1;
-    for (let index = 0; index < media.length; index += 1) {
-      if (changes[mediaStart + index] !== 1) continue;
-      const item = media[index];
-      const row = exactRow(await db.prepare(
-        `SELECT id FROM threads_media
-         WHERE entry_id = ? AND source_media_id = ? AND kind = ? AND ordinal = ?`,
-      ).bind(item.entryId, item.sourceMediaId, item.kind, item.ordinal).first(), ["id"]);
-      if (typeof row.id !== "string" || !row.id) invalidStorage();
+    const pending = await pendingFinalizationRows(db, postId, generation);
+    for (const row of pending.media) {
       if (!await sendMedia(mediaQueue, {
         version: 1, type: "archive-entry-media", postId, generation,
-        entryId: item.entryId, mediaId: row.id, sourceUrl: item.sourceUrl,
+        entryId: row.entry_id, mediaId: row.media_id,
       })) {
         const changed = mutationChanges(await db.prepare(
           `UPDATE threads_media SET status = 'error', error_code = 'queue_unavailable',
@@ -523,16 +520,14 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
                  AND j.pending_quote_count = 0 AND p.sync_generation = j.generation
                  AND p.status <> 'deleting'
              )`,
-        ).bind(now, row.id, postId, generation).run());
+        ).bind(now, row.media_id, postId, generation).run());
         if (changed > 1) invalidStorage();
       }
     }
-    for (const item of uniqueProfiles) {
-      const author = authorRows.find((row) => row.author_id === item.authorId);
-      if (!author || author.profile_media_status !== "pending") continue;
+    for (const row of pending.profiles) {
       if (!await sendMedia(mediaQueue, {
         version: 1, type: "archive-profile", postId, generation,
-        authorId: item.authorId, sourceUrl: item.sourceUrl,
+        authorId: row.author_id,
       })) {
         const changed = mutationChanges(await db.prepare(
           `UPDATE threads_authors SET profile_media_status = 'error',
@@ -547,7 +542,7 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
                  AND j.pending_quote_count = 0 AND p.sync_generation = j.generation
                  AND p.status <> 'deleting'
              )`,
-        ).bind(now, item.authorId, postId, generation).run());
+        ).bind(now, row.author_id, postId, generation).run());
         if (changed > 1) invalidStorage();
       }
     }

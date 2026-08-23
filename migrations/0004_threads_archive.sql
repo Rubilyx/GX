@@ -45,9 +45,27 @@ CREATE TABLE threads_entries (
   text TEXT NOT NULL DEFAULT '', permalink TEXT, published_at TEXT NOT NULL,
   media_type TEXT NOT NULL CHECK (media_type IN ('TEXT_POST','IMAGE','VIDEO','CAROUSEL_ALBUM','REPOST_FACADE')),
   alt_text TEXT, nested_quote_permalink TEXT,
+  quoted_post_id TEXT,
+  quote_status TEXT NOT NULL DEFAULT 'none'
+    CHECK (quote_status IN ('none','pending','ready','error')),
+  quote_error_code TEXT,
   first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  CHECK ((kind = 'quote' AND parent_entry_id IS NOT NULL) OR (kind != 'quote' AND parent_entry_id IS NULL))
+  CHECK ((kind = 'quote' AND parent_entry_id IS NOT NULL) OR (kind != 'quote' AND parent_entry_id IS NULL)),
+  CHECK (
+    (kind = 'quote' AND quoted_post_id IS NULL
+      AND quote_status = 'none' AND quote_error_code IS NULL)
+    OR
+    (kind IN ('root','author_reply') AND (
+      (quoted_post_id IS NULL AND quote_status = 'none' AND quote_error_code IS NULL)
+      OR
+      (quoted_post_id IS NOT NULL AND quote_status IN ('pending','ready')
+        AND quote_error_code IS NULL)
+      OR
+      (quoted_post_id IS NOT NULL AND quote_status = 'error'
+        AND quote_error_code IS NOT NULL AND length(quote_error_code) > 0)
+    ))
+  )
 );
 CREATE TRIGGER threads_entries_validate_parent_insert
 BEFORE INSERT ON threads_entries

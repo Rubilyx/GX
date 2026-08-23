@@ -37,7 +37,16 @@ test("validates closed capture and media queue messages", () => {
   assert.deepEqual(validateCaptureMessage(capture), capture);
   invalid(() => validateCaptureMessage({...capture, extra:true}), "invalid_threads_queue_message");
   invalid(() => validateCaptureMessage({...capture, generation:0}), "invalid_threads_queue_message");
-  const media = {version:1,type:"delete-object",objectKey:"k"};
-  assert.deepEqual(validateMediaMessage(media), media);
-  invalid(() => validateMediaMessage({...media, extra:true}), "invalid_threads_queue_message");
+  const entry = {version:1,type:"archive-entry-media",postId:"p",generation:2,
+    entryId:"e",mediaId:"m"};
+  const profile = {version:1,type:"archive-profile",postId:"p",generation:2,authorId:"a"};
+  const retry = {version:1,type:"retry-media",postId:"p",generation:2,mediaId:"m"};
+  const deletion = {version:1,type:"delete-object",objectKey:"k"};
+  for (const media of [entry, profile, retry, deletion])
+    assert.deepEqual(validateMediaMessage(media), media);
+  for (const media of [entry, profile, retry]) invalid(
+    () => validateMediaMessage({...media, sourceUrl:"https://cdn.invalid/item"}),
+    "invalid_threads_queue_message",
+  );
+  invalid(() => validateMediaMessage({...deletion, extra:true}), "invalid_threads_queue_message");
 });

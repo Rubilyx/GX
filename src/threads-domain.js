@@ -80,7 +80,7 @@ const CAPTURE = {
   "resolve-post": ["version","type","postId","generation","cursor"], "collect-conversation": ["version","type","postId","generation","cursor"],
   "collect-quote": ["version","type","postId","generation","entryId","quoteId"], "finalize-content": ["version","type","postId","generation"], "delete-archive": ["version","type","postId"],
 };
-const MEDIA = { "archive-entry-media":["version","type","postId","generation","entryId","mediaId","sourceUrl"], "archive-profile":["version","type","postId","generation","authorId","sourceUrl"], "retry-media":["version","type","postId","generation","mediaId","sourceUrl"], "delete-object":["version","type","objectKey"] };
+const MEDIA = { "archive-entry-media":["version","type","postId","generation","entryId","mediaId"], "archive-profile":["version","type","postId","generation","authorId"], "retry-media":["version","type","postId","generation","mediaId"], "delete-object":["version","type","objectKey"] };
 /** @param {unknown} raw @param {MessageSets} sets @returns {Record<string, unknown>} */
 function validate(raw, sets) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new AppError("invalid_threads_queue_message", 400);

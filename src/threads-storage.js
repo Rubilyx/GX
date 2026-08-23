@@ -89,7 +89,9 @@ export function providerMedia(value) {
   if (typeof media.id !== "string" || !media.id || typeof media.ownerId !== "string" ||
     !media.ownerId || typeof media.username !== "string" || typeof media.text !== "string" ||
     typeof media.permalink !== "string" || !MEDIA_TYPES.has(media.mediaType) ||
-    !Array.isArray(media.children)) throw new AppError("threads_provider_protocol_error", 502);
+    !Array.isArray(media.children) || !(media.quotedPostId === null ||
+      typeof media.quotedPostId === "string" && media.quotedPostId))
+    throw new AppError("threads_provider_protocol_error", 502);
   return /** @type {Record<string, any>} */ ({
     ...media, timestamp: canonicalProviderTimestamp(media.timestamp),
   });
@@ -106,8 +108,44 @@ export function providerProfile(value) {
   return profile;
 }
 
-/** @param {any} db @param {Record<string, any>} profile @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] */
-function authorStatement(db, profile, postId, generation, now, requiredMediaId = null) {
+const MEDIA_DESCRIPTOR_KEYS = [
+  "entrySourceMediaId", "sourceMediaId", "kind", "ordinal", "altText",
+];
+/** @param {unknown} value */
+function mediaDescriptor(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).length !== MEDIA_DESCRIPTOR_KEYS.length ||
+    Object.keys(value).some((key) => !MEDIA_DESCRIPTOR_KEYS.includes(key)))
+    throw new AppError("invalid_threads_state", 400);
+  const item = /** @type {Record<string, any>} */ (value);
+  if (typeof item.entrySourceMediaId !== "string" || !item.entrySourceMediaId ||
+    typeof item.sourceMediaId !== "string" || !item.sourceMediaId ||
+    !MEDIA_KINDS.has(item.kind) || !Number.isSafeInteger(item.ordinal) || item.ordinal < 0 ||
+    !(item.altText === null || typeof item.altText === "string"))
+    throw new AppError("invalid_threads_state", 400);
+  return {
+    entrySourceMediaId: item.entrySourceMediaId.normalize("NFC"),
+    sourceMediaId: item.sourceMediaId.normalize("NFC"), kind: item.kind,
+    ordinal: item.ordinal, altText: item.altText === null ? null : item.altText.normalize("NFC"),
+  };
+}
+/** @param {unknown} value */
+function mediaDescriptors(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new AppError("invalid_threads_state", 400);
+  return value.map(mediaDescriptor);
+}
+/** @param {unknown} value */
+function boundedOptionalPermalink(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !value || value.length > 4_096)
+    throw new AppError("invalid_threads_state", 400);
+  return value.normalize("NFC");
+}
+
+/** @param {any} db @param {Record<string, any>} profile @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] @param {string | null} [workParentId] @param {string | null} [workClaim] */
+function authorStatement(db, profile, postId, generation, now, requiredMediaId = null,
+  workParentId = null, workClaim = null) {
   return db.prepare(
     `INSERT INTO threads_authors
        (threads_user_id, username, display_name, created_at, updated_at)
@@ -116,21 +154,31 @@ function authorStatement(db, profile, postId, generation, now, requiredMediaId =
        SELECT 1 FROM threads_posts
        WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
          AND (? IS NULL OR threads_media_id = ?)
+         AND (? IS NULL OR EXISTS (
+           SELECT 1 FROM threads_entries work
+           WHERE work.id = ? AND work.threads_post_id = threads_posts.id
+             AND work.quote_status = 'error' AND work.quote_error_code = ?
+         ))
      )
      ON CONFLICT(threads_user_id) DO UPDATE SET
        username = excluded.username, display_name = excluded.display_name,
        updated_at = excluded.updated_at`,
   ).bind(profile.id, profile.username, profile.name ?? profile.username, now, now,
-    postId, generation, requiredMediaId, requiredMediaId);
+    postId, generation, requiredMediaId, requiredMediaId,
+    workClaim, workParentId, workClaim);
 }
-/** @param {any} db @param {Record<string, any>} entry @param {"root"|"author_reply"} kind @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] */
-function primaryEntryStatement(db, entry, kind, postId, generation, now, requiredMediaId = null) {
+/** @param {any} db @param {Record<string, any>} entry @param {"root"|"author_reply"} kind @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] @param {string} [entryId] */
+function primaryEntryStatement(db, entry, kind, postId, generation, now,
+  requiredMediaId = null, entryId = crypto.randomUUID()) {
+  const quotedPostId = entry.quotedPostId ?? null;
   return db.prepare(
     `INSERT INTO threads_entries
        (id, threads_post_id, source_media_id, kind, author_id, text, permalink,
         published_at, media_type, alt_text, nested_quote_permalink,
+        quoted_post_id, quote_status, quote_error_code,
         first_seen_at, last_seen_at, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
+       CASE WHEN ? IS NULL THEN 'none' ELSE 'pending' END, NULL, ?, ?, ?
      WHERE EXISTS (
        SELECT 1 FROM threads_posts
        WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
@@ -140,14 +188,15 @@ function primaryEntryStatement(db, entry, kind, postId, generation, now, require
        WHERE kind IN ('root','author_reply')
      DO UPDATE SET last_seen_at = excluded.last_seen_at`,
   ).bind(
-    crypto.randomUUID(), postId, entry.id, kind, entry.ownerId, entry.text,
+    entryId, postId, entry.id, kind, entry.ownerId, entry.text,
     entry.permalink, entry.timestamp, entry.mediaType, entry.altText ?? null,
-    now, now, now, postId, generation, requiredMediaId, requiredMediaId,
+    quotedPostId, quotedPostId, now, now, now,
+    postId, generation, requiredMediaId, requiredMediaId,
   );
 }
-/** @param {any} db @param {Record<string, any>} entry @param {string} kind @param {string} postId @param {number} generation @param {string | null} parentId @param {string | null} [requiredMediaId] */
+/** @param {any} db @param {Record<string, any>} entry @param {string} kind @param {string} postId @param {number} generation @param {string | null} parentId @param {string | null} [requiredMediaId] @param {string | null} [workParentId] @param {string | null} [workClaim] */
 function linkStatements(db, entry, kind, postId, generation, parentId = null,
-  requiredMediaId = null) {
+  requiredMediaId = null, workParentId = null, workClaim = null) {
   return extractThreadsLinks(entry.text, entry.linkAttachmentUrl).map((link) => db.prepare(
     `INSERT INTO threads_links (id, entry_id, url, source, ordinal)
      SELECT ?, e.id, ?, ?, ? FROM threads_entries e
@@ -157,11 +206,70 @@ function linkStatements(db, entry, kind, postId, generation, parentId = null,
          SELECT 1 FROM threads_posts
          WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
            AND (? IS NULL OR threads_media_id = ?)
+           AND (? IS NULL OR EXISTS (
+             SELECT 1 FROM threads_entries work
+             WHERE work.id = ? AND work.threads_post_id = threads_posts.id
+               AND work.quote_status = 'error' AND work.quote_error_code = ?
+           ))
        )
      ON CONFLICT(entry_id, url) DO NOTHING`,
   ).bind(crypto.randomUUID(), link.url, link.source, link.ordinal,
     postId, entry.id, kind, parentId, parentId, postId, generation,
-    requiredMediaId, requiredMediaId));
+    requiredMediaId, requiredMediaId, workClaim, workParentId, workClaim));
+}
+
+/** @param {any} db @param {Record<string, any>} item @param {"root"|"author_reply"|"quote"} entryKind @param {string} postId @param {number} generation @param {number} now @param {string | null} [parentId] @param {string | null} [requiredMediaId] @param {string | null} [workParentId] @param {string | null} [workClaim] */
+function pendingMediaStatement(db, item, entryKind, postId, generation, now,
+  parentId = null, requiredMediaId = null, workParentId = null, workClaim = null) {
+  return db.prepare(
+    `INSERT INTO threads_media
+       (id, entry_id, source_media_id, kind, ordinal, alt_text, status,
+        created_at, updated_at)
+     SELECT ?, entry.id, ?, ?, ?, ?, 'pending', ?, ?
+     FROM threads_entries entry
+     WHERE entry.threads_post_id = ? AND entry.source_media_id = ? AND entry.kind = ?
+       AND (? IS NULL OR entry.parent_entry_id = ?)
+       AND EXISTS (
+         SELECT 1 FROM threads_posts post
+         WHERE post.id = ? AND post.sync_generation = ? AND post.status <> 'deleting'
+           AND (? IS NULL OR post.threads_media_id = ?)
+           AND (? IS NULL OR EXISTS (
+             SELECT 1 FROM threads_entries work
+             WHERE work.id = ? AND work.threads_post_id = post.id
+               AND work.quote_status = 'error' AND work.quote_error_code = ?
+           ))
+       )
+     ON CONFLICT(entry_id, source_media_id, kind, ordinal) DO NOTHING`,
+  ).bind(
+    crypto.randomUUID(), item.sourceMediaId, item.kind, item.ordinal, item.altText,
+    now, now, postId, item.entrySourceMediaId, entryKind, parentId, parentId,
+    postId, generation, requiredMediaId, requiredMediaId,
+    workClaim, workParentId, workClaim,
+  );
+}
+
+/** @param {any} db @param {string} postId @param {"root"|"author_reply"} kind @param {Record<string, any>[]} entries */
+async function pendingQuoteWork(db, postId, kind, entries) {
+  const sourceIds = [...new Set(entries.map((entry) => entry.id))];
+  if (sourceIds.length === 0) return [];
+  const rows = selectRows(await db.prepare(
+    `SELECT id AS parent_entry_id, source_media_id, quoted_post_id
+     FROM threads_entries
+     WHERE threads_post_id = ? AND kind = ? AND quote_status = 'pending'
+       AND source_media_id IN (${sourceIds.map(() => "?").join(",")})`,
+  ).bind(postId, kind, ...sourceIds).all(), [
+    "parent_entry_id", "source_media_id", "quoted_post_id",
+  ]);
+  const bySource = new Map();
+  for (const row of rows) {
+    if (typeof row.parent_entry_id !== "string" || !row.parent_entry_id ||
+      typeof row.source_media_id !== "string" || !row.source_media_id ||
+      typeof row.quoted_post_id !== "string" || !row.quoted_post_id) invalidStorage();
+    bySource.set(row.source_media_id, {
+      parentEntryId: row.parent_entry_id, quoteId: row.quoted_post_id,
+    });
+  }
+  return sourceIds.flatMap((sourceId) => bySource.has(sourceId) ? [bySource.get(sourceId)] : []);
 }
 
 const CANDIDATE_KEYS = [
@@ -277,7 +385,7 @@ export async function markDuplicateArchive(db, postId, generation, now) {
   return changes[0] === 1;
 }
 
-/** @param {any} db @param {{ postId: string, generation: number, profile: unknown, root: unknown, profileCursor?: string | null, conversationCursor?: string | null, nowSeconds: number }} input */
+/** @param {any} db @param {{ postId: string, generation: number, profile: unknown, root: unknown, profileCursor?: string | null, conversationCursor?: string | null, media?: unknown[], nowSeconds: number }} input */
 export async function saveResolvedThreadsRoot(db, input) {
   const postId = requiredString(input?.postId);
   const generation = inputPositiveInteger(input?.generation);
@@ -287,6 +395,9 @@ export async function saveResolvedThreadsRoot(db, input) {
   if (profile.id !== root.ownerId) throw new AppError("threads_provider_protocol_error", 502);
   const profileCursor = nullableString(input?.profileCursor);
   const conversationCursor = nullableString(input?.conversationCursor);
+  const media = mediaDescriptors(input?.media);
+  if (media.some((item) => item.entrySourceMediaId !== root.id))
+    throw new AppError("invalid_threads_state", 400);
   try {
     const candidates = selectRows(await db.prepare(
       `SELECT p.id, p.threads_media_id, p.sync_generation, p.status, p.created_at,
@@ -297,11 +408,12 @@ export async function saveResolvedThreadsRoot(db, input) {
        WHERE p.id = ? OR p.threads_media_id = ? ORDER BY p.created_at, p.id`,
     ).bind(postId, root.id).all(), CANDIDATE_KEYS).map(candidateRow);
     const current = candidates.find((row) => row.id === postId);
-    if (!current || current.sync_generation !== generation || current.status === "deleting") return false;
+    if (!current || current.sync_generation !== generation || current.status === "deleting")
+      return { saved: false, quoteWork: [] };
     const owner = candidates.find((row) => row.id !== postId && row.threads_media_id === root.id);
     if (owner && precedes(owner, current)) {
       await markDuplicateArchive(db, postId, generation, now);
-      return false;
+      return { saved: false, quoteWork: [] };
     }
     const claim = owner ? `claim:${root.id}` : null;
     const correction = owner
@@ -332,6 +444,7 @@ export async function saveResolvedThreadsRoot(db, input) {
     ).bind(root.id, root.permalink, profile.id, now, postId, generation,
       root.id, root.id, postId);
     const requiredIdentity = owner ? claim : root.id;
+    const rootEntryId = crypto.randomUUID();
     const statements = [
       ...correction,
       authorStatement(db, profile, postId, generation, now, claim),
@@ -339,10 +452,6 @@ export async function saveResolvedThreadsRoot(db, input) {
       db.prepare(
         `UPDATE threads_sync_jobs SET
            status = 'collecting', profile_cursor = ?, conversation_cursor = ?,
-           pending_quote_count = pending_quote_count + CASE WHEN ? IS NOT NULL AND NOT EXISTS (
-             SELECT 1 FROM threads_entries
-             WHERE threads_post_id = ? AND source_media_id = ? AND kind = 'root'
-           ) THEN 1 ELSE 0 END,
            updated_at = ?
          WHERE threads_post_id = ? AND generation = ?
            AND EXISTS (
@@ -350,10 +459,29 @@ export async function saveResolvedThreadsRoot(db, input) {
              WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
                AND threads_media_id = ?
            )`,
-      ).bind(profileCursor, conversationCursor, root.quotedPostId ?? null, postId, root.id,
-        now, postId, generation, postId, generation, requiredIdentity),
-      primaryEntryStatement(db, root, "root", postId, generation, now, claim),
+      ).bind(profileCursor, conversationCursor, now, postId, generation,
+        postId, generation, requiredIdentity),
+      primaryEntryStatement(db, root, "root", postId, generation, now, claim, rootEntryId),
+      ...(root.quotedPostId ? [db.prepare(
+        `UPDATE threads_sync_jobs SET pending_quote_count = pending_quote_count + 1,
+           updated_at = ?
+         WHERE threads_post_id = ? AND generation = ?
+           AND EXISTS (
+             SELECT 1 FROM threads_entries
+             WHERE id = ? AND threads_post_id = ? AND kind = 'root'
+               AND quoted_post_id = ? AND quote_status = 'pending'
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_posts
+             WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+               AND threads_media_id = ?
+           )`,
+      ).bind(now, postId, generation, rootEntryId, postId, root.quotedPostId,
+        postId, generation, requiredIdentity)] : []),
       ...linkStatements(db, root, "root", postId, generation, null, claim),
+      ...media.map((item) => pendingMediaStatement(
+        db, item, "root", postId, generation, now, null, claim,
+      )),
       ...(owner ? [db.prepare(
         `UPDATE threads_posts AS winner SET threads_media_id = ?
          WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
@@ -376,55 +504,69 @@ export async function saveResolvedThreadsRoot(db, input) {
     if (owner) {
       if (changes[0] === 0) {
         if (changes.some((count) => count !== 0)) invalidStorage();
-        return false;
+        return { saved: false, quoteWork: [] };
       }
       for (const index of [0, 1, 2, 3, base, base + 1, base + 2, base + 3,
         changes.length - 1]) {
         if (changes[index] !== 1) invalidStorage();
       }
-      return true;
+      return { saved: true, quoteWork: await pendingQuoteWork(db, postId, "root", [root]) };
     }
-    return changes[base + 1] === 1 && changes[base + 2] === 1 && changes[base + 3] === 1;
+    const saved = changes[base + 1] === 1 && changes[base + 2] === 1 &&
+      changes[base + 3] === 1;
+    return { saved, quoteWork: saved ? await pendingQuoteWork(db, postId, "root", [root]) : [] };
   } catch (error) { throw storageError(error); }
 }
 
-/** @param {any} db @param {{ postId: string, generation: number, entries: unknown[], nextCursor?: string | null, nowSeconds: number }} input */
+/** @param {any} db @param {{ postId: string, generation: number, entries: unknown[], nextCursor?: string | null, media?: unknown[], nowSeconds: number }} input */
 export async function saveThreadsConversationPage(db, input) {
   const postId = requiredString(input?.postId);
   const generation = inputPositiveInteger(input?.generation);
   const now = inputTimestamp(input?.nowSeconds);
   if (!Array.isArray(input?.entries)) throw new AppError("invalid_threads_state", 400);
   const entries = input.entries.map(providerMedia);
+  const media = mediaDescriptors(input?.media);
+  const inputSources = new Set(entries.map((entry) => entry.id));
+  if (media.some((item) => !inputSources.has(item.entrySourceMediaId)))
+    throw new AppError("invalid_threads_state", 400);
   const nextCursor = nullableString(input?.nextCursor);
   try {
     const post = await db.prepare(
       "SELECT root_author_id FROM threads_posts WHERE id = ? AND sync_generation = ? AND status <> 'deleting'",
     ).bind(postId, generation).first();
-    if (post === null) return { accepted: 0, nextCursor };
+    if (post === null) return { accepted: 0, nextCursor, quoteWork: [] };
     const root = exactRow(post, ["root_author_id"]);
     if (typeof root.root_author_id !== "string" || !root.root_author_id) invalidStorage();
     const accepted = entries.filter((entry) => entry.ownerId === root.root_author_id);
+    const acceptedSources = new Set(accepted.map((entry) => entry.id));
+    if (media.some((item) => !acceptedSources.has(item.entrySourceMediaId)))
+      throw new AppError("invalid_threads_state", 400);
     const statements = [];
     for (const entry of accepted) {
-      if (entry.quotedPostId) {
-        statements.push(db.prepare(
-          `UPDATE threads_sync_jobs SET pending_quote_count = pending_quote_count + 1,
-             updated_at = ?
-           WHERE threads_post_id = ? AND generation = ?
-             AND NOT EXISTS (
-               SELECT 1 FROM threads_entries
-               WHERE threads_post_id = ? AND source_media_id = ?
-                 AND kind IN ('root','author_reply')
-             )
-             AND EXISTS (
-               SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
-                 AND status <> 'deleting'
-             )`,
-        ).bind(now, postId, generation, postId, entry.id, postId, generation));
-      }
-      statements.push(primaryEntryStatement(db, entry, "author_reply", postId, generation, now));
+      const entryId = crypto.randomUUID();
+      statements.push(primaryEntryStatement(
+        db, entry, "author_reply", postId, generation, now, null, entryId,
+      ));
+      if (entry.quotedPostId) statements.push(db.prepare(
+        `UPDATE threads_sync_jobs SET pending_quote_count = pending_quote_count + 1,
+           updated_at = ?
+         WHERE threads_post_id = ? AND generation = ?
+           AND EXISTS (
+             SELECT 1 FROM threads_entries
+             WHERE id = ? AND threads_post_id = ? AND kind = 'author_reply'
+               AND quoted_post_id = ? AND quote_status = 'pending'
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
+               AND status <> 'deleting'
+           )`,
+      ).bind(now, postId, generation, entryId, postId, entry.quotedPostId,
+        postId, generation));
       statements.push(...linkStatements(db, entry, "author_reply", postId, generation));
     }
+    for (const item of media) statements.push(pendingMediaStatement(
+      db, item, "author_reply", postId, generation, now,
+    ));
     statements.push(db.prepare(
       `UPDATE threads_sync_jobs SET status = 'collecting', conversation_cursor = ?, updated_at = ?
        WHERE threads_post_id = ? AND generation = ?
@@ -435,11 +577,13 @@ export async function saveThreadsConversationPage(db, input) {
     ).bind(nextCursor, now, postId, generation, postId, generation));
     const changes = mutationBatch(await db.batch(statements), statements.length);
     if (changes.some((count) => count > 1)) invalidStorage();
-    return { accepted: changes.at(-1) === 1 ? accepted.length : 0, nextCursor };
+    const saved = changes.at(-1) === 1;
+    return { accepted: saved ? accepted.length : 0, nextCursor,
+      quoteWork: saved ? await pendingQuoteWork(db, postId, "author_reply", accepted) : [] };
   } catch (error) { throw storageError(error); }
 }
 
-/** @param {any} db @param {{ postId: string, generation: number, parentEntryId: string, profile: unknown, quote: unknown, nowSeconds: number }} input */
+/** @param {any} db @param {{ postId: string, generation: number, parentEntryId: string, profile: unknown, quote: unknown, nestedQuotePermalink?: string | null, media?: unknown[], nowSeconds: number }} input */
 export async function saveThreadsQuote(db, input) {
   const postId = requiredString(input?.postId);
   const parentId = requiredString(input?.parentEntryId);
@@ -448,29 +592,27 @@ export async function saveThreadsQuote(db, input) {
   const profile = providerProfile(input?.profile);
   const quote = providerMedia(input?.quote);
   if (profile.id !== quote.ownerId) throw new AppError("threads_provider_protocol_error", 502);
+  const nestedQuotePermalink = boundedOptionalPermalink(input?.nestedQuotePermalink);
+  const media = mediaDescriptors(input?.media);
+  if (media.some((item) => item.entrySourceMediaId !== quote.id))
+    throw new AppError("invalid_threads_state", 400);
   try {
+    const claim = `claim:${crypto.randomUUID()}`;
     const statements = [
       db.prepare(
-        `UPDATE threads_sync_jobs SET
-           pending_quote_count = CASE WHEN pending_quote_count > 0
-             THEN pending_quote_count - 1 ELSE 0 END, updated_at = ?
-         WHERE threads_post_id = ? AND generation = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM threads_entries
-             WHERE threads_post_id = ? AND parent_entry_id = ?
-               AND source_media_id = ? AND kind = 'quote'
-           )
+        `UPDATE threads_entries AS parent SET
+           quote_status = 'error', quote_error_code = ?
+         WHERE id = ? AND threads_post_id = ? AND kind IN ('root','author_reply')
+           AND quoted_post_id = ? AND quote_status = 'pending' AND quote_error_code IS NULL
            AND EXISTS (
-             SELECT 1 FROM threads_entries
-             WHERE id = ? AND threads_post_id = ? AND kind IN ('root','author_reply')
-           )
-           AND EXISTS (
-             SELECT 1 FROM threads_posts
-             WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+             SELECT 1 FROM threads_sync_jobs job
+             JOIN threads_posts post ON post.id = job.threads_post_id
+             WHERE job.threads_post_id = ? AND job.generation = ?
+               AND job.pending_quote_count > 0
+               AND post.sync_generation = job.generation AND post.status <> 'deleting'
            )`,
-      ).bind(now, postId, generation, postId, parentId, quote.id,
-        parentId, postId, postId, generation),
-      authorStatement(db, profile, postId, generation, now),
+      ).bind(claim, parentId, postId, quote.id, postId, generation),
+      authorStatement(db, profile, postId, generation, now, null, parentId, claim),
       db.prepare(
         `INSERT INTO threads_entries
            (id, threads_post_id, source_media_id, kind, parent_entry_id,
@@ -481,6 +623,8 @@ export async function saveThreadsQuote(db, input) {
          FROM threads_entries parent
          WHERE parent.id = ? AND parent.threads_post_id = ?
            AND parent.kind IN ('root','author_reply')
+           AND parent.quoted_post_id = ? AND parent.quote_status = 'error'
+           AND parent.quote_error_code = ?
            AND EXISTS (
              SELECT 1 FROM threads_posts
              WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
@@ -491,13 +635,119 @@ export async function saveThreadsQuote(db, input) {
       ).bind(
         crypto.randomUUID(), postId, quote.id, parentId, quote.ownerId, quote.text,
         quote.permalink, quote.timestamp, quote.mediaType, quote.altText ?? null,
-        quote.nestedQuotePermalink ?? null, now, now, now,
-        parentId, postId, postId, generation,
+        nestedQuotePermalink, now, now, now,
+        parentId, postId, quote.id, claim, postId, generation,
       ),
-      ...linkStatements(db, quote, "quote", postId, generation, parentId),
+      ...linkStatements(db, quote, "quote", postId, generation, parentId,
+        null, parentId, claim),
+      ...media.map((item) => pendingMediaStatement(
+        db, item, "quote", postId, generation, now, parentId, null, parentId, claim,
+      )),
+      db.prepare(
+        `UPDATE threads_sync_jobs SET pending_quote_count = pending_quote_count - 1,
+           updated_at = ?
+         WHERE threads_post_id = ? AND generation = ? AND pending_quote_count > 0
+           AND EXISTS (
+             SELECT 1 FROM threads_entries parent
+             WHERE parent.id = ? AND parent.threads_post_id = ?
+               AND parent.quoted_post_id = ? AND parent.quote_status = 'error'
+               AND parent.quote_error_code = ?
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_posts
+             WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+           )`,
+      ).bind(now, postId, generation, parentId, postId, quote.id, claim,
+        postId, generation),
+      db.prepare(
+        `UPDATE threads_entries AS parent SET quote_status = 'ready', quote_error_code = NULL
+         WHERE id = ? AND threads_post_id = ? AND kind IN ('root','author_reply')
+           AND quoted_post_id = ? AND quote_status = 'error' AND quote_error_code = ?
+           AND EXISTS (
+             SELECT 1 FROM threads_entries quote
+             WHERE quote.threads_post_id = parent.threads_post_id
+               AND quote.parent_entry_id = parent.id AND quote.source_media_id = ?
+               AND quote.kind = 'quote'
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_sync_jobs job
+             JOIN threads_posts post ON post.id = job.threads_post_id
+             WHERE job.threads_post_id = ? AND job.generation = ?
+               AND post.sync_generation = job.generation AND post.status <> 'deleting'
+           )`,
+      ).bind(parentId, postId, quote.id, claim, quote.id, postId, generation),
     ];
     const changes = mutationBatch(await db.batch(statements), statements.length);
     if (changes.some((count) => count > 1)) invalidStorage();
-    return changes[2] === 1;
+    if (changes[0] === 0) {
+      if (changes.some((count) => count !== 0)) invalidStorage();
+      return false;
+    }
+    const decrement = changes.length - 2;
+    for (const index of [0, 1, 2, decrement, changes.length - 1])
+      if (changes[index] !== 1) invalidStorage();
+    return true;
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number, parentEntryId: string, quoteId: string, errorCode: string, nowSeconds: number }} input */
+export async function failThreadsQuote(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const parentId = requiredString(input?.parentEntryId);
+  const quoteId = requiredString(input?.quoteId);
+  const errorCode = requiredString(input?.errorCode);
+  const now = inputTimestamp(input?.nowSeconds);
+  try {
+    const claim = `claim:${crypto.randomUUID()}`;
+    const statements = [
+      db.prepare(
+        `UPDATE threads_entries AS parent SET quote_status = 'error', quote_error_code = ?
+         WHERE id = ? AND threads_post_id = ? AND kind IN ('root','author_reply')
+           AND quoted_post_id = ? AND quote_status = 'pending' AND quote_error_code IS NULL
+           AND EXISTS (
+             SELECT 1 FROM threads_sync_jobs job
+             JOIN threads_posts post ON post.id = job.threads_post_id
+             WHERE job.threads_post_id = ? AND job.generation = ?
+               AND job.pending_quote_count > 0
+               AND post.sync_generation = job.generation AND post.status <> 'deleting'
+           )`,
+      ).bind(claim, parentId, postId, quoteId, postId, generation),
+      db.prepare(
+        `UPDATE threads_sync_jobs SET pending_quote_count = pending_quote_count - 1,
+           updated_at = ?
+         WHERE threads_post_id = ? AND generation = ? AND pending_quote_count > 0
+           AND EXISTS (
+             SELECT 1 FROM threads_entries parent
+             WHERE parent.id = ? AND parent.threads_post_id = ?
+               AND parent.quoted_post_id = ? AND parent.quote_status = 'error'
+               AND parent.quote_error_code = ?
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_posts
+             WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+           )`,
+      ).bind(now, postId, generation, parentId, postId, quoteId, claim,
+        postId, generation),
+      db.prepare(
+        `UPDATE threads_entries AS parent SET quote_error_code = ?
+         WHERE id = ? AND threads_post_id = ? AND quoted_post_id = ?
+           AND quote_status = 'error' AND quote_error_code = ?
+           AND EXISTS (
+             SELECT 1 FROM threads_sync_jobs job
+             JOIN threads_posts post ON post.id = job.threads_post_id
+             WHERE job.threads_post_id = ? AND job.generation = ?
+               AND post.sync_generation = job.generation AND post.status <> 'deleting'
+           )`,
+      ).bind(errorCode, parentId, postId, quoteId, claim, postId, generation),
+    ];
+    const changes = mutationBatch(await db.batch(statements), statements.length);
+    if (changes.some((count) => count > 1)) invalidStorage();
+    if (changes[0] === 0) {
+      if (changes.some((count) => count !== 0)) invalidStorage();
+      return false;
+    }
+    if (changes.some((count) => count !== 1)) invalidStorage();
+    return true;
   } catch (error) { throw storageError(error); }
 }

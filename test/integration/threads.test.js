@@ -11,6 +11,7 @@ import {
   saveResolvedThreadsRoot, saveThreadsConversationPage, saveThreadsQuote,
   startThreadsDeletion,
 } from "../../src/threads.js";
+import { d1NonnegativeInteger, mutationChanges } from "../../src/threads-storage.js";
 import {
   providerFixture, seedThreadsArchive, startHarness,
 } from "../support/harness.js";
@@ -617,4 +618,231 @@ test("Threads finalization is idempotent, stale generations cannot advance statu
     createThreadsSync(db, harness.captureQueue, "https://threads.net/t/RootShort", 3_009),
     (error) => error instanceof AppError && error.code === "threads_archive_deleting",
   );
+});
+
+/** @param {D1Database} db @param {string} id @param {number} createdAt */
+async function seedCollisionCandidate(db, id, createdAt) {
+  return seedThreadsArchive(db, {
+    id, shortcode: `${id}Short`, threadsMediaId: null,
+    submittedUrl: `https://threads.net/t/${id}Short`, canonicalUrl: null,
+    status: "collecting", authorId: `${id}-seed-author`, username: id,
+    displayName: id, rootEntryId: `${id}-unused-root`, withRoot: false,
+    jobStatus: "resolving", createdAt, updatedAt: createdAt,
+  });
+}
+
+const collisionRoot = () => media("provider-shared-root", "provider-owner", {
+  username: "provider", rootPostId: null, repliedToId: null,
+  permalink: "https://www.threads.com/@provider/post/SharedRoot",
+});
+
+test("Threads review deterministically reassigns a provider ID when the newer row resolves first", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedCollisionCandidate(db, "older-local", 10);
+  await seedCollisionCandidate(db, "newer-local", 20);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "newer-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 21,
+  }), true);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "older-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 22,
+  }), true);
+  assert.deepEqual(await db.prepare(
+    `SELECT id, threads_media_id, status, error_code FROM threads_posts
+     WHERE id IN ('older-local','newer-local') ORDER BY id`,
+  ).all().then((result) => result.results), [
+    { id: "newer-local", threads_media_id: null, status: "error",
+      error_code: "threads_archive_duplicate" },
+    { id: "older-local", threads_media_id: "provider-shared-root", status: "collecting",
+      error_code: null },
+  ]);
+  assert.deepEqual(await db.prepare(
+    `SELECT p.id, j.status, j.error_code FROM threads_posts p JOIN threads_sync_jobs j
+     ON j.threads_post_id = p.id AND j.generation = p.sync_generation
+     WHERE p.id IN ('older-local','newer-local') ORDER BY p.id`,
+  ).all().then((result) => result.results), [
+    { id: "newer-local", status: "error", error_code: "threads_archive_duplicate" },
+    { id: "older-local", status: "collecting", error_code: null },
+  ]);
+});
+
+test("Threads review keeps the older provider owner when it resolves first", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedCollisionCandidate(db, "older-local", 10);
+  await seedCollisionCandidate(db, "newer-local", 20);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "older-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 21,
+  }), true);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "newer-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 22,
+  }), false);
+  assert.deepEqual(await db.prepare(
+    `SELECT id, threads_media_id, status, error_code FROM threads_posts
+     WHERE id IN ('older-local','newer-local') ORDER BY id`,
+  ).all().then((result) => result.results), [
+    { id: "newer-local", threads_media_id: null, status: "error",
+      error_code: "threads_archive_duplicate" },
+    { id: "older-local", threads_media_id: "provider-shared-root", status: "collecting",
+      error_code: null },
+  ]);
+});
+
+/** @param {D1Database} db @param {string} id */
+async function seedFinalizable(db, id) {
+  const row = await seedThreadsArchive(db, {
+    id, shortcode: `${id}Short`, threadsMediaId: `${id}-source`,
+    submittedUrl: `https://threads.net/t/${id}Short`,
+    canonicalUrl: `https://www.threads.com/@${id}/post/${id}Short`,
+    status: "collecting", authorId: `${id}-author`, username: id,
+    displayName: id, rootEntryId: `${id}-root-entry`, rootText: id,
+    rootPermalink: `https://www.threads.com/@${id}/post/${id}Short`,
+    jobStatus: "collecting", createdAt: 10, updatedAt: 10,
+  });
+  return {
+    postId: id, generation: 1, nowSeconds: 20,
+    media: [{ entryId: row.rootEntryId, sourceMediaId: row.threadsMediaId,
+      kind: "image", ordinal: 0, altText: `${id} alt`,
+      sourceUrl: `https://scontent.cdninstagram.com/${id}-image` }],
+    profiles: [{ authorId: row.authorId,
+      sourceUrl: `https://scontent.cdninstagram.com/${id}-profile` }],
+  };
+}
+
+/** @param {D1Database} db @param {() => Promise<unknown>} beforeBatch */
+function interceptFirstBatch(db, beforeBatch) {
+  let intercepted = false;
+  return {
+    prepare: db.prepare.bind(db),
+    /** @param {D1PreparedStatement[]} statements */
+    async batch(statements) {
+      if (!intercepted) { intercepted = true; await beforeBatch(); }
+      return db.batch(statements);
+    },
+  };
+}
+
+test("Threads review finalization commits no media after its generation becomes stale", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const input = await seedFinalizable(db, "stale-finalize");
+  const raced = interceptFirstBatch(db, () => db.prepare(
+    "UPDATE threads_posts SET sync_generation = 2 WHERE id = 'stale-finalize'",
+  ).run());
+  assert.equal((await finalizeThreadsContent(raced, harness.mediaQueue, input)).status, "stale");
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_media WHERE entry_id = 'stale-finalize-root-entry'",
+  ).first("count"), 0);
+  assert.equal(harness.mediaMessages.length, 0);
+});
+
+test("Threads review finalization commits no media when deletion wins before its batch", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const input = await seedFinalizable(db, "delete-finalize");
+  const raced = interceptFirstBatch(db, () => db.prepare(
+    "UPDATE threads_posts SET status = 'deleting' WHERE id = 'delete-finalize'",
+  ).run());
+  assert.equal((await finalizeThreadsContent(raced, harness.mediaQueue, input)).status, "stale");
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_media WHERE entry_id = 'delete-finalize-root-entry'",
+  ).first("count"), 0);
+  assert.equal(harness.mediaMessages.length, 0);
+});
+
+test("Threads review missing media Queue terminalizes every unsent item as partial", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const input = await seedFinalizable(db, "missing-media-queue");
+  const result = await finalizeThreadsContent(db, null, input);
+  assert.equal(result.status, "partial");
+  assert.deepEqual(await db.prepare(
+    "SELECT status, error_code FROM threads_media WHERE entry_id = 'missing-media-queue-root-entry'",
+  ).first(), { status: "error", error_code: "queue_unavailable" });
+  assert.deepEqual(await db.prepare(
+    "SELECT profile_media_status, profile_error_code FROM threads_authors WHERE threads_user_id = 'missing-media-queue-author'",
+  ).first(), { profile_media_status: "error", profile_error_code: "queue_unavailable" });
+});
+
+test("Threads review partial media Queue rejection cannot strand media_pending", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const input = await seedFinalizable(db, "partial-media-queue");
+  input.media.push({ ...input.media[0], kind: "video_thumbnail", ordinal: 1 });
+  let sends = 0;
+  const queue = { async send() {
+    sends += 1;
+    if (sends === 2) throw new Error("reject-second-message");
+  } };
+  const result = await finalizeThreadsContent(db, queue, input);
+  assert.equal(result.status, "partial");
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_media WHERE status = 'error'",
+  ).first("count"), 1);
+  assert.equal(await db.prepare(
+    "SELECT status FROM threads_posts WHERE id = 'partial-media-queue'",
+  ).first("status"), "partial");
+});
+
+test("Threads review premature aggregation leaves collecting content unchanged", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedFinalizable(db, "premature-aggregate");
+  assert.deepEqual(await recalculateThreadsStatus(db, {
+    postId: "premature-aggregate", generation: 1, nowSeconds: 21,
+  }), { status: "collecting", ready: 0, failed: 0, expected: 0 });
+  assert.deepEqual(await db.prepare(
+    `SELECT p.status AS post_status, j.status AS job_status, j.content_completed_at
+     FROM threads_posts p JOIN threads_sync_jobs j ON j.threads_post_id = p.id
+     WHERE p.id = 'premature-aggregate'`,
+  ).first(), { post_status: "collecting", job_status: "collecting",
+    content_completed_at: null });
+});
+
+test("Threads review canonicalizes offset timestamps before chronological reply ordering", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const row = await seedThreadsArchive(db, {
+    id: "timestamp-order", shortcode: "TimestampOrder", threadsMediaId: "timestamp-root",
+    submittedUrl: "https://threads.net/t/TimestampOrder",
+    canonicalUrl: "https://www.threads.com/@time/post/TimestampOrder",
+    status: "collecting", authorId: "time-author", username: "time",
+    displayName: "Time", rootEntryId: "timestamp-root-entry",
+    rootPermalink: "https://www.threads.com/@time/post/TimestampOrder",
+    jobStatus: "collecting", createdAt: 10, updatedAt: 10,
+  });
+  await saveThreadsConversationPage(db, {
+    postId: row.id, generation: 1, nextCursor: null, nowSeconds: 20,
+    entries: [
+      media("minus-offset", row.authorId, { username: "time",
+        timestamp: "2026-08-24T00:30:00-0900" }),
+      media("utc-middle", row.authorId, { username: "time",
+        timestamp: "2026-08-24T00:00:00Z" }),
+      media("plus-offset", row.authorId, { username: "time",
+        timestamp: "2026-08-24T00:30:00+0900" }),
+    ],
+  });
+  const detail = await getThreadsArchive(db, row.id, { repliesPage: 1 });
+  assert.deepEqual(detail?.replies.map((reply) => [reply.sourceMediaId, reply.publishedAt]), [
+    ["plus-offset", "2026-08-23T15:30:00.000Z"],
+    ["utc-middle", "2026-08-24T00:00:00.000Z"],
+    ["minus-offset", "2026-08-24T09:30:00.000Z"],
+  ]);
+});
+
+test("Threads review rejects unsafe D1 counts before issuing a page query", async () => {
+  let prepares = 0;
+  const malformedDb = { prepare() {
+    prepares += 1;
+    return { first: async () => ({ count: Number.MAX_SAFE_INTEGER + 1 }) };
+  } };
+  await assert.rejects(listThreadsArchives(malformedDb, { page: 1 }),
+    (error) => error instanceof AppError && error.code === "storage_unavailable");
+  assert.equal(prepares, 1);
+});
+
+test("Threads review rejects unsafe D1 generations counts bytes timestamps and mutation changes", () => {
+  for (const field of ["generation", "count", "bytes", "timestamp"]) {
+    assert.throws(() => d1NonnegativeInteger(Number.MAX_SAFE_INTEGER + 1),
+      (error) => error instanceof AppError && error.code === "storage_unavailable", field);
+  }
+  assert.throws(() => mutationChanges({
+    success: true, meta: { changes: Number.MAX_SAFE_INTEGER + 1 },
+  }), (error) => error instanceof AppError && error.code === "storage_unavailable");
 });

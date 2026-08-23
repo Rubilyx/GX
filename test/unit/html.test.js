@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  assetHref, htmlAttr, htmlText, renderIndexPage, renderLoginPage, renderRepositoryPage,
-  repositoryActivity,
+  assetHref, htmlAttr, htmlText, renderIndexPage, renderLoginPage, renderRepositoryNotesPage,
+  renderRepositoryPage, repositoryActivity,
 } from "../../src/html.js";
 
 const repository = {
@@ -17,7 +17,7 @@ const repository = {
   values: [`<em>value</em>`], audience: `<u>audience</u>`, cautions: `<strong>cautions</strong>`,
   primaryCategory: `Backend"><script>`, analysisStatus: "error", analysisErrorCode: `native secret <x>`,
   analysisModel: `model<script>`, promptVersion: `v1<&`, analysisStartedAt: null,
-  analyzedAt: 2, personalNote: `</textarea><script>alert("note")</script>`,
+  analyzedAt: 2, noteCount: 3, latestNote: `</textarea><script>alert("note")</script>`,
   analysisGeneration: 1, createdAt: 1, updatedAt: 2, tags: [`tag"><script>`],
 };
 
@@ -119,7 +119,9 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   const card = html.match(/<article[^>]*>[\s\S]*?<\/article>/)?.[0] ?? "";
   assert.match(card, /^<article data-analysis-card-status="error">/);
   assert.match(card,
-    /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">Note 1<\/a><\/div>/);
+    /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes">Note 3<\/a><\/div>/);
+  assert.match(card,
+    /<div class="repository-memo"><h3>Note<\/h3><p data-repository-memo>&lt;\/textarea&gt;&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/p><\/div>/);
   assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.doesNotMatch(card, /<dt>Analysis status<\/dt>/);
   assert.match(card,
@@ -130,17 +132,21 @@ test("index exposes complete native forms and safe enhancement controls", () => 
     /<dialog data-repository-dialog[\s\S]*?<\/dialog>/,
   )?.[0] ?? "";
   assert.match(repositoryDialog, /aria-labelledby="repository-dialog-heading"/);
-  assert.match(repositoryDialog, /<h2 id="repository-dialog-heading">저장소 상세<\/h2>/);
-  assert.match(repositoryDialog, /<textarea id="dialog-summary" data-repository-summary readonly><\/textarea>/);
+  assert.match(repositoryDialog, /<h2 id="repository-dialog-heading" data-repository-notes-heading>Note<\/h2>/);
+  assert.match(repositoryDialog, /<p data-repository-notes-summary><\/p>/);
   assert.match(repositoryDialog,
-    /<form method="post" data-repository-note-form>[\s\S]*name="csrf" value="csrf&quot;x"/);
+    /<form method="post" data-repository-note-create-form>[\s\S]*name="csrf" value="csrf&quot;x"/);
   assert.match(repositoryDialog,
-    /<textarea id="dialog-note" name="personalNote" data-repository-note maxlength="4000"><\/textarea>/);
+    /<textarea id="dialog-note" name="body" data-repository-note-create maxlength="4000" required><\/textarea>/);
   assert.match(repositoryDialog,
     /<p data-repository-note-status role="status" aria-live="polite"><\/p>/);
-  assert.match(repositoryDialog, /<button type="submit" data-repository-note-save>저장<\/button>/);
+  assert.match(repositoryDialog, /<section data-repository-note-list><\/section>/);
+  assert.match(repositoryDialog, /<nav data-repository-note-pagination aria-label="Note 페이지"><\/nav>/);
+  assert.match(repositoryDialog, /<button type="submit" data-repository-note-create-save>저장<\/button>/);
   assert.match(repositoryDialog, /<button type="button" data-repository-dialog-close>닫기<\/button>/);
-  assert.doesNotMatch(repositoryDialog, /data-repository-note[^>]*readonly/);
+  assert.doesNotMatch(repositoryDialog, /personalNote|data-repository-summary|data-repository-note-form/);
+  assert.match(html,
+    /<dialog data-repository-note-delete-dialog[\s\S]*data-repository-note-delete-date[\s\S]*data-repository-note-delete-excerpt[\s\S]*data-repository-note-delete-form/);
   const deleteDialog = html.match(
     /<dialog data-repository-delete-dialog[\s\S]*?<\/dialog>/,
   )?.[0] ?? "";
@@ -151,7 +157,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(deleteDialog,
     /<p class="repository-delete-target"><span>삭제 대상<\/span><strong data-repository-delete-name><\/strong><\/p>/);
   assert.match(deleteDialog,
-    /<p id="repository-delete-dialog-warning" class="repository-delete-warning">저장소와 개인 메모가 영구 삭제되며 복구할 수 없습니다\.<\/p>/);
+    /<p id="repository-delete-dialog-warning" class="repository-delete-warning">저장소와 모든 Note가 영구 삭제되며 복구할 수 없습니다\.<\/p>/);
   assert.match(deleteDialog, /<form method="post" data-repository-delete-form>/);
   assert.match(deleteDialog, /name="csrf" value="csrf&quot;x"/);
   assert.match(deleteDialog, /<input type="hidden" name="confirm" value="yes">/);
@@ -255,19 +261,19 @@ test("index compacts card metadata without replacing AI failure content", () => 
   assert.match(cards[1], /<span class="repository-badge">tag&lt;script&gt;<\/span>/);
   assert.doesNotMatch(cards[1], /tag<script>/);
   assert.match(cards[0],
-    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Note 1<\/a><\/div>/);
+    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+\/notes">Note 3<\/a><\/div>/);
   assert.match(cards[1],
-    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+">Note 1<\/a><\/div>/);
+    /<div class="repository-actions"><a href="\/repositories\/[^"]+">자세히 보기<\/a><a data-repository-link href="\/repositories\/[^"]+\/notes">Note 3<\/a><\/div>/);
 });
 
-test("index cards show only a saved memo directly after the description", () => {
+test("index cards show only the newest Note directly after the description", () => {
   const html = renderIndexPage({
     releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
     repositories: [
-      { ...repository, personalNote: "첫 줄\n둘째 줄" },
+      { ...repository, noteCount: 2, latestNote: "첫 줄\n둘째 줄" },
       {
         ...repository, id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-        githubId: "43", owner: "Empty", name: "note", personalNote: "",
+        githubId: "43", owner: "Empty", name: "note", noteCount: 0, latestNote: null,
       },
     ],
     filters: { q: "", category: "", tag: "", page: 1 }, categories: [],
@@ -278,9 +284,9 @@ test("index cards show only a saved memo directly after the description", () => 
 
   assert.match(savedCard,
     /<p data-analysis-summary-status="error">[\s\S]*?<\/p><div class="repository-memo"><h3>Note<\/h3><p data-repository-memo>첫 줄\n둘째 줄<\/p><\/div>/);
-  assert.match(savedCard, /<a data-repository-link href="[^"]+">Note 1<\/a>/);
+  assert.match(savedCard, /<a data-repository-link href="[^"]+\/notes">Note 2<\/a>/);
   assert.doesNotMatch(emptyCard, /repository-memo|data-repository-memo|>None</);
-  assert.match(emptyCard, /<a data-repository-link href="[^"]+">Note<\/a>/);
+  assert.match(emptyCard, /<a data-repository-link href="[^"]+\/notes">Note<\/a>/);
 });
 
 test("index cards show pushed activity with an accessible metadata-only refresh form", () => {
@@ -344,6 +350,10 @@ test("repository document renders canonical GitHub URL and all native mutation f
   });
   assert.match(html, /href="https:\/\/github\.com\/a%2Fb%3Cscript%3E\/x%3Fy%22%3E%3Cimg%20src%3Dx%3E"/);
   assert.match(html, /action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/);
+  assert.match(html, /<h2 id="edit-heading">분류 편집<\/h2>/);
+  assert.match(html,
+    /<a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes">Note 관리<\/a>/);
+  assert.doesNotMatch(html, /personalNote|personal-note|개인 메모/);
   assert.match(html, /<dt>GitHub ID<\/dt><dd>42&lt;script&gt;<\/dd>/);
   assert.match(html, /<dt>README SHA<\/dt><dd>sha&lt;script&gt;<\/dd>/);
   assert.match(html, /<dt>분석 상태<\/dt><dd><span class="analysis-badge" data-analysis-status="error"><span class="status-marker" aria-hidden="true"><\/span>분석 오류<\/span><\/dd>/);
@@ -362,6 +372,65 @@ test("repository document renders canonical GitHub URL and all native mutation f
   assert.doesNotMatch(remove, /새 분석 결과/);
   assert.doesNotMatch(html, /<[^>]+\son(?:click|submit|change)=/);
   assert.doesNotMatch(html, /<script>alert|<img src|<b>summary|<\/textarea><script/);
+  assert.match(remove, /이 저장소와 모든 Note를 영구 삭제/);
+});
+
+test("repository Note page renders escaped CRUD forms, Seoul dates, and numbered pagination", () => {
+  const notes = Array.from({ length: 5 }, (_, index) => ({
+    id: `${index + 1}`.repeat(8) + "-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    repositoryId: repository.id,
+    body: index === 0 ? `<script>alert("note")</script>` : `Note ${index + 1}`,
+    createdAt: 1_787_410_800 - index,
+    updatedAt: index === 0 ? 1_787_410_801 : 1_787_410_800 - index,
+  }));
+  const html = renderRepositoryNotesPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: `csrf"x`,
+    repository, notes, page: 2, totalPages: 3, total: 12,
+    flash: "repository_note_updated",
+  });
+
+  assert.match(html,
+    /<h1 data-repository-notes-heading>a\/b&lt;script&gt;\/x\?y&quot;&gt;&lt;img src=x&gt; Note<\/h1>/);
+  assert.match(html, /<p data-repository-notes-summary>&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
+  assert.match(html,
+    /<form method="post" action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes" data-repository-note-create-form>/);
+  assert.match(html,
+    /<textarea id="new-note" name="body" data-repository-note-create maxlength="4000" required><\/textarea>/);
+  assert.match(html, /name="csrf" value="csrf&quot;x"/);
+  assert.match(html, /<p data-repository-note-status role="status" aria-live="polite">/);
+  assert.equal((html.match(/<li data-repository-note-item/g) ?? []).length, 5);
+  assert.match(html, /<p class="repository-note-body">&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/p>/);
+  assert.match(html, /<time datetime="2026-08-23">2026\.08\.23<\/time>/);
+  assert.match(html, /수정 <time datetime="2026-08-23">2026\.08\.23<\/time>/);
+  assert.match(html,
+    /action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes\/11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/);
+  assert.match(html,
+    /<textarea id="note-body-11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa" name="body" maxlength="4000" required>&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/textarea>/);
+  assert.match(html,
+    /action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes\/11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/delete"/);
+  assert.match(html, /<input type="hidden" name="confirm" value="yes">/);
+  assert.match(html,
+    /data-repository-note-delete data-note-date="2026\.08\.23" data-note-excerpt="&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;"/);
+  const pagination = html.match(/<nav data-repository-note-pagination[\s\S]*?<\/nav>/)?.[0] ?? "";
+  assert.match(pagination, /<a rel="prev" href="[^\"]+\?page=1">이전<\/a>/);
+  assert.match(pagination, /href="[^\"]+\?page=1">1<\/a>/);
+  assert.match(pagination, /href="[^\"]+\?page=2" aria-current="page">2<\/a>/);
+  assert.match(pagination, /href="[^\"]+\?page=3">3<\/a>/);
+  assert.match(pagination, /<a rel="next" href="[^\"]+\?page=3">다음<\/a>/);
+  assert.match(html, /Note를 수정했습니다/);
+  assert.doesNotMatch(html, /<script>alert|onclick=/);
+});
+
+test("repository Note page renders an actionable empty state", () => {
+  const html = renderRepositoryNotesPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf",
+    repository: { ...repository, summary: null }, notes: [], page: 1, totalPages: 1, total: 0,
+    flash: "",
+  });
+  assert.match(html,
+    /<section data-repository-note-list><h2 id="repository-note-list-heading" data-repository-note-list-heading>저장한 Note가 없습니다<\/h2>/);
+  assert.match(html, /첫 Note를 작성하세요/);
+  assert.doesNotMatch(html, /<li data-repository-note-item|data-repository-note-pagination/);
 });
 
 test("analysis status hooks admit only fixed own values", () => {

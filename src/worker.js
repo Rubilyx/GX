@@ -3,22 +3,31 @@ import {
   authenticatePin, createCsrfToken, createSession, hashClientIp,
   requireAuthenticatedMutation, verifySession,
 } from "./auth.js";
-import { AppError, CATEGORIES, parseListQuery } from "./domain.js";
-import { renderIndexPage, renderLoginPage, renderRepositoryPage } from "./html.js";
+import { AppError, CATEGORIES, parseListQuery, parseNotePage } from "./domain.js";
+import {
+  renderIndexPage, renderLoginPage, renderRepositoryNotesPage, renderRepositoryPage,
+} from "./html.js";
+import {
+  createRepositoryNote, deleteRepositoryNote, getRepositoryNoteSummary,
+  listRepositoryNotes, updateRepositoryNote,
+} from "./notes.js";
 import {
   collectRepository, deleteRepository, getRepository, listRepositories, refreshRepository,
-  refreshRepositoryActivity, updatePersonalNote, updateRepository,
+  refreshRepositoryActivity, updateRepository,
 } from "./repositories.js";
 import { parseCspReport, parseTelemetry, recordTelemetry } from "./telemetry.js";
 
-const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(note|activity|refresh|delete))?$/;
+const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(activity|refresh|delete))?$/;
+const REPOSITORY_NOTES_PATH =
+  /^\/repositories\/([0-9a-f-]+)\/notes(?:\/([0-9a-f-]+)(?:\/(delete))?)?$/;
 const ASSET_PATH = /^\/assets\/([^/]+)\/([^/]+)$/;
 const ASSETS = new Set([
   "layers.css", "tokens.css", "core.css", "login.css", "repositories.css",
   "app.js", "dom.js", "repo-capture.js", "repo-filter.js", "repo-panel.js", "favicon.svg",
 ]);
 const FLASH = new Set([
-  "repository_created", "repository_already_saved", "repository_updated", "repository_note_updated",
+  "repository_created", "repository_already_saved", "repository_updated",
+  "repository_note_created", "repository_note_updated", "repository_note_deleted",
   "repository_activity_refreshed", "repository_refreshed", "repository_analysis_error",
   "repository_deleted",
 ]);
@@ -267,6 +276,7 @@ function pageRoute(raw, allowedOrigin, errorCode) {
     if (url.origin !== allowedOrigin || url.username || url.password) appError(errorCode, 400);
     if (url.pathname === "/" || url.pathname === "/login" || url.pathname === "/health")
       return url.pathname;
+    if (REPOSITORY_NOTES_PATH.test(url.pathname)) return "/repositories/:id/notes";
     if (/^\/repositories\/[^/]+$/.test(url.pathname)) return "/repositories/:id";
   } catch (error) {
     if (error instanceof AppError) throw error;
@@ -354,14 +364,14 @@ async function sessionFor(request, runtime) {
   );
 }
 
-/** @param {URL} url @param {Set<string>} allowedKeys */
-function flashFrom(url, allowedKeys) {
+/** @param {URL} url @param {Set<string>} allowedKeys @param {string} [errorCode] */
+function flashFrom(url, allowedKeys, errorCode = "invalid_list_query") {
   for (const key of url.searchParams.keys()) {
     if (!allowedKeys.has(key) || url.searchParams.getAll(key).length !== 1)
-      appError("invalid_list_query", 400);
+      appError(errorCode, 400);
   }
   const flash = url.searchParams.get("flash") ?? "";
-  if (flash && !FLASH.has(flash)) appError("invalid_list_query", 400);
+  if (flash && !FLASH.has(flash)) appError(errorCode, 400);
   return flash;
 }
 
@@ -373,19 +383,29 @@ function indexQuery(url) {
   return { filters: parseListQuery(clean), flash };
 }
 
+/** @param {URL} url */
+function noteQuery(url) {
+  const flash = flashFrom(url, new Set(["page", "flash"]), "invalid_note_query");
+  const clean = new URL(url);
+  clean.searchParams.delete("flash");
+  return { ...parseNotePage(clean), flash };
+}
+
 /** @param {Runtime} runtime @param {typeof fetch} fetcher */
 function dependencies(runtime, fetcher) {
   return { fetcher, openAiApiKey: runtime.openAiApiKey, openAiModel: runtime.openAiModel };
 }
 
-/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} match */
-function knownRoute(method, pathname, match) {
+/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} repositoryMatch @param {RegExpExecArray | null} notesMatch */
+function knownRoute(method, pathname, repositoryMatch, notesMatch) {
   const fixed = new Map([
     ["/health", ["GET"]], ["/login", ["GET"]], ["/session", ["POST"]],
     ["/session/logout", ["POST"]], ["/", ["GET"]], ["/repositories", ["POST"]],
     ["/telemetry", ["POST"]], ["/csp-report", ["POST"]],
   ]);
-  const allowed = fixed.get(pathname) ?? (match ? (match[2] ? ["POST"] : ["GET", "POST"]) : null);
+  const allowed = fixed.get(pathname) ?? (notesMatch
+    ? (notesMatch[2] ? ["POST"] : ["GET", "POST"])
+    : repositoryMatch ? (repositoryMatch[2] ? ["POST"] : ["GET", "POST"]) : null);
   if (!allowed) return null;
   if (!allowed.includes(method)) return empty(405, { Allow: allowed.join(", ") });
   return false;
@@ -463,6 +483,61 @@ async function renderRepository(url, runtime, session, id, wantsJson) {
   }), 200, {}, "app", runtime.trustedTypesMode);
 }
 
+/** @param {any} repository */
+function noteRepository(repository) {
+  return {
+    id: repository.id, owner: repository.owner, name: repository.name, summary: repository.summary,
+  };
+}
+
+/** @param {URL} url @param {Runtime} runtime @param {any} session @param {string} id @param {boolean} wantsJson */
+async function renderRepositoryNotes(url, runtime, session, id, wantsJson) {
+  const { page, flash } = noteQuery(url);
+  const repository = await getRepository(runtime.db, id);
+  if (!repository) appError("repository_not_found", 404);
+  const result = await listRepositoryNotes(runtime.db, id, page);
+  if (!result) appError("repository_not_found", 404);
+  const projected = noteRepository(repository);
+  if (wantsJson) return json({ repository: projected, ...result });
+  return html(renderRepositoryNotesPage({
+    releaseId: runtime.releaseId, modulePreloads,
+    csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
+    repository: projected, ...result, flash,
+  }), 200, {}, "app", runtime.trustedTypesMode);
+}
+
+/** @param {Request} request @param {Runtime} runtime @param {string} repositoryId @param {string | undefined} noteId @param {string | undefined} action @param {boolean} wantsJson */
+async function mutateRepositoryNote(request, runtime, repositoryId, noteId, action, wantsJson) {
+  const deleting = action === "delete";
+  const form = await parseForm(request, 16_384,
+    deleting ? new Set(["csrf", "confirm"]) : new Set(["csrf", "body"]));
+  await requireAuthenticatedMutation(request, runtime, form);
+  if (deleting && requiredString(form, "confirm") !== "yes")
+    appError("confirmation_required", 400);
+  if (!await getRepository(runtime.db, repositoryId)) appError("repository_not_found", 404);
+  if (!noteId) {
+    const note = await createRepositoryNote(runtime.db, repositoryId, requiredString(form, "body"));
+    if (!note) appError("repository_not_found", 404);
+    const noteSummary = await getRepositoryNoteSummary(runtime.db, repositoryId);
+    return wantsJson ? json({ note, noteSummary })
+      : redirect(`/repositories/${repositoryId}/notes?flash=repository_note_created`);
+  }
+  if (deleting) {
+    if (!await deleteRepositoryNote(runtime.db, repositoryId, noteId))
+      appError("repository_note_not_found", 404);
+    const noteSummary = await getRepositoryNoteSummary(runtime.db, repositoryId);
+    return wantsJson ? json({ repositoryId, noteId, noteSummary })
+      : redirect(`/repositories/${repositoryId}/notes?flash=repository_note_deleted`);
+  }
+  const note = await updateRepositoryNote(
+    runtime.db, repositoryId, noteId, requiredString(form, "body"),
+  );
+  if (!note) appError("repository_note_not_found", 404);
+  const noteSummary = await getRepositoryNoteSummary(runtime.db, repositoryId);
+  return wantsJson ? json({ note, noteSummary })
+    : redirect(`/repositories/${repositoryId}/notes?flash=repository_note_updated`);
+}
+
 /** @param {{ repositoryId: string, analysisStatus: string, errorCode: string | null }} result */
 function captureJson(result) {
   return {
@@ -474,9 +549,8 @@ function captureJson(result) {
 
 /** @param {Request} request @param {Runtime} runtime @param {typeof fetch} fetcher @param {string} id @param {string} action @param {boolean} wantsJson */
 async function mutate(request, runtime, fetcher, id, action, wantsJson) {
-  const schema = action === "edit" ? new Set(["csrf", "personalNote", "primaryCategory", "tags"])
-    : action === "note" ? new Set(["csrf", "personalNote"])
-      : action === "activity" ? new Set(["csrf"])
+  const schema = action === "edit" ? new Set(["csrf", "primaryCategory", "tags"])
+    : action === "activity" ? new Set(["csrf"])
       : new Set(["csrf", "confirm"]);
   const form = await parseForm(request, 16_384, schema);
   await requireAuthenticatedMutation(request, runtime, form);
@@ -486,18 +560,11 @@ async function mutate(request, runtime, fetcher, id, action, wantsJson) {
   if (action === "edit") {
     const rawTags = requiredString(form, "tags");
     const repository = await updateRepository(runtime.db, id, {
-      personalNote: requiredString(form, "personalNote"),
       primaryCategory: requiredString(form, "primaryCategory"),
       tags: rawTags.trim() ? rawTags.split(",").map((tag) => tag.trim()) : [],
     });
     if (!repository) appError("repository_not_found", 404);
     return wantsJson ? json({ repository }) : redirect(`/repositories/${id}?flash=repository_updated`);
-  }
-  if (action === "note") {
-    const repository = await updatePersonalNote(runtime.db, id, requiredString(form, "personalNote"));
-    if (!repository) appError("repository_not_found", 404);
-    return wantsJson ? json({ repository })
-      : redirect(`/repositories/${id}?flash=repository_note_updated`);
   }
   if (action === "activity") {
     const repository = await refreshRepositoryActivity(runtime.db, id, fetcher);
@@ -537,13 +604,15 @@ async function dispatchRequest(request, env, context, fetcher) {
     } catch (error) { return safeErrorResponse(error, wantsJson, runtime, url.pathname); }
   }
   const repositoryMatch = REPOSITORY_PATH.exec(url.pathname);
-  const methodResult = knownRoute(request.method, url.pathname, repositoryMatch);
+  const notesMatch = REPOSITORY_NOTES_PATH.exec(url.pathname);
+  const methodResult = knownRoute(request.method, url.pathname, repositoryMatch, notesMatch);
   if (methodResult) return methodResult;
   if (methodResult === null) return plain(404, "Not Found");
 
   try {
     const queryRoute = request.method === "GET" &&
-      (url.pathname === "/" || (repositoryMatch && !repositoryMatch[2]));
+      (url.pathname === "/" || (repositoryMatch && !repositoryMatch[2]) ||
+        (notesMatch && !notesMatch[2]));
     if (url.search && !queryRoute) appError("invalid_query", 400);
     if (request.method === "GET" && url.pathname === "/health")
       return json({ status: "ok", releaseId: runtime.releaseId });
@@ -581,6 +650,14 @@ async function dispatchRequest(request, env, context, fetcher) {
         : result.analysisStatus === "error" ? "repository_analysis_error" : "repository_created";
       return redirect(`/repositories/${result.repositoryId}?flash=${flash}`);
     }
+    if (notesMatch) {
+      const [, repositoryId, noteId, action] = notesMatch;
+      if (request.method === "GET")
+        return await renderRepositoryNotes(url, runtime, session, repositoryId, wantsJson);
+      return await mutateRepositoryNote(
+        request, runtime, repositoryId, noteId, action, wantsJson,
+      );
+    }
     if (!repositoryMatch) return plain(404, "Not Found");
     const [, id, action] = repositoryMatch;
     if (request.method === "GET") return await renderRepository(url, runtime, session, id, wantsJson);
@@ -593,6 +670,7 @@ async function dispatchRequest(request, env, context, fetcher) {
 /** @param {string} pathname */
 function safeRouteTemplate(pathname) {
   if (ASSET_PATH.test(pathname)) return "/assets/:release/:file";
+  if (REPOSITORY_NOTES_PATH.test(pathname)) return "/repositories/:id/notes";
   const repository = REPOSITORY_PATH.exec(pathname);
   if (repository) return repository[2] ? `/repositories/:id/${repository[2]}` : "/repositories/:id";
   if (new Set([

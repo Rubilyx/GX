@@ -1,6 +1,8 @@
 import { AppError } from "./domain.js";
 
-const ROUTES = new Set(["/login", "/", "/repositories/:id", "/health"]);
+const ROUTES = new Set([
+  "/login", "/", "/repositories/:id", "/repositories/:id/notes", "/health",
+]);
 const CLIENT_CODES = new Set(["network_error", "invalid_response", "dialog_error", "other"]);
 const DIRECTIVES = new Set([
   "script-src", "script-src-elem", "style-src", "img-src", "connect-src",

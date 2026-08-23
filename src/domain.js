@@ -17,19 +17,6 @@ export const CATEGORIES = Object.freeze([
 const TAG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EDIT_KEYS = new Set(["primaryCategory", "tags"]);
 
-/** @param {unknown} raw @param {string} errorCode */
-function normalizedPersonalNote(raw, errorCode) {
-  if (typeof raw !== "string") throw new AppError(errorCode, 400);
-  const personalNote = raw.trim().normalize("NFC");
-  if (personalNote.length > 4_000) throw new AppError(errorCode, 400);
-  return personalNote;
-}
-
-/** @param {unknown} raw */
-export function validatePersonalNote(raw) {
-  return normalizedPersonalNote(raw, "invalid_personal_note");
-}
-
 /** @param {unknown} raw */
 export function validateRepositoryNote(raw) {
   if (typeof raw !== "string") throw new AppError("invalid_repository_note", 400);

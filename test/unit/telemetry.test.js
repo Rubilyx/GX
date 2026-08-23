@@ -12,6 +12,13 @@ test("accepts only exact bucketed RUM payloads", () => {
   assert.deepEqual(parseTelemetry({
     eventType: "web_vital", metricName: "LCP", value: 2_501,
   }, "/repositories/:id", "release-1").valueBucket, "needs-improvement");
+  assert.deepEqual(parseTelemetry({
+    eventType: "navigation", metricName: "navigation_duration", value: 321,
+  }, "/repositories/:id/notes", "release-1"), {
+    releaseId: "release-1", routeTemplate: "/repositories/:id/notes",
+    eventType: "navigation", metricName: "navigation_duration",
+    valueBucket: "300-999", dimension: "none",
+  });
   assert.equal(parseTelemetry({
     eventType: "web_vital", metricName: "LCP", value: 4_001,
   }, "/", "release-1").valueBucket, "poor");

@@ -6,7 +6,7 @@ import { getRepository } from "../../src/repositories.js";
 import { recordTelemetry } from "../../src/telemetry.js";
 import { handleRequest } from "../../src/worker.js";
 import {
-  login, postForm, providerFixture, seedRepository, startHarness,
+  login, postForm, providerFixture, seedRepository, seedRepositoryNote, startHarness,
 } from "../support/harness.js";
 
 /** @param {unknown} error */
@@ -114,8 +114,18 @@ test("native forms cover login through create, detail, edit, refresh, filter, de
   assert.match(await detail.text(), /예제 저장소의 핵심 사용법/);
 
   assert.equal((await postForm(harness.worker, path, session, {
-    personalNote: "보관할 메모", primaryCategory: "Backend", tags: "example, node-js",
+    primaryCategory: "Backend", tags: "example, node-js",
   })).status, 303);
+  assert.equal((await postForm(harness.worker, `${path}/notes`, session, {
+    body: "보관할 Note",
+  })).status, 303);
+  const notesPage = await harness.worker.fetch(`${session.origin}${path}/notes`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(notesPage.status, 200);
+  const notesHtml = await notesPage.text();
+  assert.match(notesHtml, /<textarea id="new-note" name="body"/);
+  assert.match(notesHtml, /<p class="repository-note-body">보관할 Note<\/p>/);
   assert.equal((await postForm(harness.worker, `${path}/refresh`, session, { confirm: "yes" })).status, 303);
 
   const filtered = await harness.worker.fetch(`${session.origin}/?q=example&category=Backend&tag=example&page=1`, {
@@ -184,7 +194,7 @@ test("enhanced detail and mutation routes return exact JSON shapes", async () =>
   assert.deepEqual(Object.keys(await detail.clone().json()), ["repository"]);
 
   const edited = await postForm(harness.worker, path, session, {
-    personalNote: "메모", primaryCategory: "Backend", tags: "example",
+    primaryCategory: "Backend", tags: "example",
   }, { Accept: "application/json" });
   assert.equal(edited.status, 200);
   assert.deepEqual(Object.keys(await edited.json()), ["repository"]);
@@ -196,52 +206,194 @@ test("enhanced detail and mutation routes return exact JSON shapes", async () =>
   })).status, 200);
 });
 
-test("memo route updates only the personal note and returns the saved repository", async () => {
+test("Note collection and item routes expose exact JSON CRUD contracts", async () => {
   const env = await harness.worker.getEnv();
   const repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
   await seedRepository(env.PROD_DB, {
-    id: repositoryId, personalNote: "이전 메모", primaryCategory: "Backend", tags: ["keep"],
+    id: repositoryId, owner: "Owner", name: "Repository", summary: "Safe summary",
+  });
+  for (let index = 1; index <= 6; index += 1) await seedRepositoryNote(env.PROD_DB, {
+    id: `${index}`.repeat(8) + "-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    repositoryId, body: `Existing ${index}`, createdAt: index, updatedAt: index,
   });
   const session = await login(harness.worker);
+  const notesPath = `/repositories/${repositoryId}/notes`;
 
-  const response = await postForm(
-    harness.worker,
-    `/repositories/${repositoryId}/note`,
-    session,
-    { personalNote: "  새 개인 메모  " },
-    { Accept: "application/json" },
-  );
+  const listed = await harness.worker.fetch(`${session.origin}${notesPath}?page=2`, {
+    headers: { Cookie: session.cookie, Accept: "application/json" },
+  });
+  assert.equal(listed.status, 200);
+  const listJson = await listed.json();
+  assert.deepEqual(Object.keys(listJson).sort(),
+    ["notes", "page", "repository", "total", "totalPages"]);
+  assert.deepEqual(Object.keys(listJson.repository).sort(),
+    ["id", "name", "owner", "summary"]);
+  assert.deepEqual(listJson.repository, {
+    id: repositoryId, owner: "Owner", name: "Repository", summary: "Safe summary",
+  });
+  assert.equal(listJson.page, 2);
+  assert.equal(listJson.totalPages, 2);
+  assert.equal(listJson.total, 6);
+  assert.deepEqual(listJson.notes.map((/** @type {any} */ note) => note.body), ["Existing 1"]);
 
-  assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.deepEqual(Object.keys(result), ["repository"]);
-  assert.equal(Object.hasOwn(result.repository, "personalNote"), false);
-  assert.equal(result.repository.primaryCategory, "Backend");
-  assert.deepEqual(result.repository.tags, ["keep"]);
-  assert.equal(await env.PROD_DB.prepare(
-    "SELECT personal_note FROM repositories WHERE id = ?",
-  ).bind(repositoryId).first("personal_note"), "새 개인 메모");
+  const created = await postForm(harness.worker, notesPath, session,
+    { body: "  새 Note  " }, { Accept: "application/json" });
+  assert.equal(created.status, 200);
+  const createJson = await created.json();
+  assert.deepEqual(Object.keys(createJson).sort(), ["note", "noteSummary"]);
+  assert.equal(createJson.note.body, "새 Note");
+  assert.deepEqual(createJson.noteSummary, { noteCount: 7, latestNote: "새 Note" });
+
+  const itemPath = `${notesPath}/${createJson.note.id}`;
+  const updated = await postForm(harness.worker, itemPath, session,
+    { body: "  수정 Note  " }, { Accept: "application/json" });
+  assert.equal(updated.status, 200);
+  const updateJson = await updated.json();
+  assert.deepEqual(Object.keys(updateJson).sort(), ["note", "noteSummary"]);
+  assert.equal(updateJson.note.body, "수정 Note");
+  assert.deepEqual(updateJson.noteSummary, { noteCount: 7, latestNote: "수정 Note" });
+
+  const deleted = await postForm(harness.worker, `${itemPath}/delete`, session,
+    { confirm: "yes" }, { Accept: "application/json" });
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(await deleted.json(), {
+    repositoryId, noteId: createJson.note.id,
+    noteSummary: { noteCount: 6, latestNote: "Existing 6" },
+  });
 });
 
-test("memo route rejects notes over 4000 characters without changing stored data", async () => {
+test("Note routes enforce authentication, CSRF, validation, scoping, queries, and methods", async () => {
+  const origin = "https://production.repo-atlas.test";
+  const repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const otherRepositoryId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const noteId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
   const env = await harness.worker.getEnv();
-  const repositoryId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-  await seedRepository(env.PROD_DB, { id: repositoryId, personalNote: "보존할 메모" });
+  await seedRepository(env.PROD_DB, { id: repositoryId });
+  await seedRepository(env.PROD_DB, { id: otherRepositoryId, githubId: "other" });
+  await seedRepositoryNote(env.PROD_DB, { id: noteId, repositoryId, body: "Keep me" });
+  const notesPath = `/repositories/${repositoryId}/notes`;
+
+  const expiredHtml = await harness.worker.fetch(`${origin}${notesPath}`);
+  assert.equal(expiredHtml.status, 303);
+  assert.equal(expiredHtml.headers.get("location"), "/login");
+  const expiredJson = await harness.worker.fetch(`${origin}${notesPath}`, {
+    headers: { Accept: "application/json" },
+  });
+  assert.equal(expiredJson.status, 401);
+  assert.deepEqual(await expiredJson.json(), { errorCode: "session_expired" });
+
   const session = await login(harness.worker);
+  /** @param {string} path @param {Array<[string, string]>} entries */
+  const rawPost = (path, entries) => {
+    const body = new FormData();
+    for (const [key, value] of entries) body.append(key, value);
+    return harness.worker.fetch(`${origin}${path}`, {
+      method: "POST",
+      headers: { Origin: origin, Cookie: session.cookie, Accept: "application/json" },
+      body,
+    });
+  };
+  /** @type {Array<[string, Array<[string, string]>]>} */
+  const mutations = [
+    [notesPath, [["body", "new"]]],
+    [`${notesPath}/${noteId}`, [["body", "updated"]]],
+    [`${notesPath}/${noteId}/delete`, [["confirm", "yes"]]],
+  ];
+  for (const [path, fields] of mutations) {
+    assert.equal((await rawPost(path, fields)).status, 401, `${path} absent CSRF`);
+    assert.equal((await rawPost(path, [["csrf", "invalid"], ...fields])).status, 401,
+      `${path} invalid CSRF`);
+  }
 
-  const response = await postForm(
-    harness.worker,
-    `/repositories/${repositoryId}/note`,
-    session,
-    { personalNote: "x".repeat(4001) },
-    { Accept: "application/json" },
-  );
+  for (const body of ["", "x".repeat(4_001)]) {
+    for (const path of [notesPath, `${notesPath}/${noteId}`]) {
+      const response = await postForm(harness.worker, path, session, { body }, {
+        Accept: "application/json",
+      });
+      assert.equal(response.status, 400, `${path} body length ${body.length}`);
+      assert.deepEqual(await response.json(), { errorCode: "invalid_repository_note" });
+    }
+  }
 
-  assert.equal(response.status, 400);
-  assert.deepEqual(await response.json(), { errorCode: "invalid_personal_note" });
-  assert.equal(await env.PROD_DB.prepare(
-    "SELECT personal_note FROM repositories WHERE id = ?",
-  ).bind(repositoryId).first("personal_note"), "보존할 메모");
+  const duplicate = await rawPost(notesPath, [
+    ["csrf", session.csrf], ["body", "one"], ["body", "two"],
+  ]);
+  assert.equal(duplicate.status, 400);
+  assert.deepEqual(await duplicate.json(), { errorCode: "invalid_form" });
+  const extra = await postForm(harness.worker, `${notesPath}/${noteId}`, session,
+    { body: "update", unexpected: "private" }, { Accept: "application/json" });
+  assert.equal(extra.status, 400);
+  assert.deepEqual(await extra.json(), { errorCode: "invalid_form" });
+
+  const unconfirmed = await postForm(harness.worker, `${notesPath}/${noteId}/delete`, session,
+    { confirm: "no" }, { Accept: "application/json" });
+  assert.equal(unconfirmed.status, 400);
+  assert.deepEqual(await unconfirmed.json(), { errorCode: "confirmation_required" });
+
+  const mismatched = await postForm(harness.worker,
+    `/repositories/${otherRepositoryId}/notes/${noteId}`, session,
+    { body: "wrong repository" }, { Accept: "application/json" });
+  assert.equal(mismatched.status, 404);
+  assert.deepEqual(await mismatched.json(), { errorCode: "repository_note_not_found" });
+  const missingParent = await postForm(harness.worker,
+    "/repositories/dddddddd-dddd-dddd-dddd-dddddddddddd/notes", session,
+    { body: "missing" }, { Accept: "application/json" });
+  assert.equal(missingParent.status, 404);
+  assert.deepEqual(await missingParent.json(), { errorCode: "repository_not_found" });
+
+  for (const query of ["", "?page=0", "?page=not-a-number"]) {
+    const response = await harness.worker.fetch(`${origin}${notesPath}${query}`, {
+      headers: { Cookie: session.cookie, Accept: "application/json" },
+    });
+    assert.equal(response.status, 200, query || "missing page");
+    assert.equal((await response.json()).page, 1);
+  }
+  for (const query of ["?page=1&page=2", "?debug=yes"]) {
+    const response = await harness.worker.fetch(`${origin}${notesPath}${query}`, {
+      headers: { Cookie: session.cookie, Accept: "application/json" },
+    });
+    assert.equal(response.status, 400, query);
+    assert.deepEqual(await response.json(), { errorCode: "invalid_note_query" });
+  }
+  assert.equal((await postForm(harness.worker, `${notesPath}?page=1`, session,
+    { body: "query" }, { Accept: "application/json" })).status, 400);
+
+  for (const [method, path, status] of [
+    ["GET", `${notesPath}/${noteId}`, 405],
+    ["DELETE", `${notesPath}/${noteId}`, 405],
+    ["PATCH", `${notesPath}/${noteId}`, 405],
+    ["GET", `${notesPath}/${noteId}/delete`, 405],
+    ["POST", `${notesPath}/${noteId}/unknown`, 404],
+  ]) {
+    const response = await harness.worker.fetch(`${origin}${path}`, {
+      method, headers: { Cookie: session.cookie },
+    });
+    assert.equal(response.status, status, `${method} ${path}`);
+  }
+});
+
+test("native Note mutations redirect to the manager with fixed flash codes", async () => {
+  const repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, { id: repositoryId });
+  const session = await login(harness.worker);
+  const notesPath = `/repositories/${repositoryId}/notes`;
+
+  const created = await postForm(harness.worker, notesPath, session, { body: "새 Note" });
+  assert.equal(created.status, 303);
+  assert.equal(created.headers.get("location"), `${notesPath}?flash=repository_note_created`);
+  const note = await env.PROD_DB.prepare(
+    "SELECT id FROM repository_notes WHERE repository_id = ?",
+  ).bind(repositoryId).first();
+  assert.ok(note);
+  const updated = await postForm(harness.worker, `${notesPath}/${note.id}`, session,
+    { body: "수정 Note" });
+  assert.equal(updated.status, 303);
+  assert.equal(updated.headers.get("location"), `${notesPath}?flash=repository_note_updated`);
+  const deleted = await postForm(harness.worker, `${notesPath}/${note.id}/delete`, session,
+    { confirm: "yes" });
+  assert.equal(deleted.status, 303);
+  assert.equal(deleted.headers.get("location"), `${notesPath}?flash=repository_note_deleted`);
 });
 
 test("activity refresh synchronizes pushed activity with one GitHub metadata request", async () => {
@@ -317,16 +469,16 @@ test("blank tags clear in JSON and native edits while internal empty entries sta
   const path = `/repositories/${repositoryId}`;
 
   const clearedJson = await postForm(harness.worker, path, session, {
-    personalNote: "메모", primaryCategory: "Backend", tags: "   ",
+    primaryCategory: "Backend", tags: "   ",
   }, { Accept: "application/json" });
   assert.equal(clearedJson.status, 200);
   assert.deepEqual((await clearedJson.json()).repository.tags, []);
 
   assert.equal((await postForm(harness.worker, path, session, {
-    personalNote: "메모", primaryCategory: "Backend", tags: "one, two",
+    primaryCategory: "Backend", tags: "one, two",
   }, { Accept: "application/json" })).status, 200);
   const clearedNative = await postForm(harness.worker, path, session, {
-    personalNote: "메모", primaryCategory: "Backend", tags: " \t ",
+    primaryCategory: "Backend", tags: " \t ",
   });
   assert.equal(clearedNative.status, 303);
   const afterNative = await getRepository((await harness.worker.getEnv()).PROD_DB, repositoryId);
@@ -334,7 +486,7 @@ test("blank tags clear in JSON and native edits while internal empty entries sta
   assert.deepEqual(afterNative.tags, []);
 
   const malformed = await postForm(harness.worker, path, session, {
-    personalNote: "메모", primaryCategory: "Backend", tags: "one,,two",
+    primaryCategory: "Backend", tags: "one,,two",
   }, { Accept: "application/json" });
   assert.equal(malformed.status, 400);
   assert.deepEqual(await malformed.json(), { errorCode: "invalid_tags" });
@@ -675,16 +827,35 @@ test("authenticated telemetry is referer-derived, bucketed, retained, and native
     assert.equal(response.status, 204);
     assert.equal(await response.text(), "");
   }
+  const repositoryId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const noteId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const noteResponse = await harness.worker.fetch(`${origin}/telemetry`, {
+    method: "POST",
+    headers: {
+      ...headers, Referer: `${origin}/repositories/${repositoryId}/notes/${noteId}?private=secret`,
+    },
+    body: JSON.stringify({
+      eventType: "navigation", metricName: "navigation_duration", value: 321,
+    }),
+  });
+  assert.equal(noteResponse.status, 204);
   const rows = await env.PROD_DB.prepare(
     "SELECT * FROM telemetry_daily ORDER BY release_id, event_type",
   ).all();
-  assert.equal(rows.results.length, 1);
-  assert.deepEqual(rows.results[0], {
-    day: new Date().toISOString().slice(0, 10), release_id: "test-release",
-    route_template: "/repositories/:id", event_type: "web_vital", metric_name: "LCP",
-    value_bucket: "good", dimension: "none", count: 2,
-  });
-  assert.doesNotMatch(JSON.stringify(rows.results), /private|token|secret/);
+  assert.deepEqual(rows.results, [
+    {
+      day: new Date().toISOString().slice(0, 10), release_id: "test-release",
+      route_template: "/repositories/:id/notes", event_type: "navigation",
+      metric_name: "navigation_duration", value_bucket: "300-999", dimension: "none", count: 1,
+    },
+    {
+      day: new Date().toISOString().slice(0, 10), release_id: "test-release",
+      route_template: "/repositories/:id", event_type: "web_vital", metric_name: "LCP",
+      value_bucket: "good", dimension: "none", count: 2,
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(rows.results),
+    new RegExp(`private|token|secret|${repositoryId}|${noteId}`));
 });
 
 test("telemetry write cleanup deletes the exact thirty-day cutoff and retains day twenty-nine", async () => {
@@ -876,9 +1047,13 @@ test("global authentication locks aggregate once while public response and logs 
       url: "https://github.com/OpenAI/example",
     }, { Accept: "application/json" });
     const repositoryId = (await created.json()).repositoryId;
-    await postForm(harness.worker, `/repositories/${repositoryId}`, session, {
-      personalNote: "private personal note", primaryCategory: "Backend", tags: "example",
-    });
+    const privateNote = await postForm(harness.worker, `/repositories/${repositoryId}/notes`, session, {
+      body: "private Note body",
+    }, { Accept: "application/json" });
+    const noteId = (await privateNote.json()).note.id;
+    await postForm(harness.worker, `/repositories/${repositoryId}/notes/${noteId}`, session, {
+      body: "updated private Note body",
+    }, { Accept: "application/json" });
     const cspUri = "https://evil.example/private-csp?token=secret";
     const cspResponse = await harness.worker.fetch(`${origin}/csp-report`, {
       method: "POST", headers: {
@@ -890,7 +1065,7 @@ test("global authentication locks aggregate once while public response and logs 
     assert.equal(cspResponse.status, 204);
     assert.doesNotMatch(await cspResponse.text(), /private-csp|token|secret/);
 
-    assert.equal(logs.length, 6);
+    assert.equal(logs.length, 7);
     const records = logs.map((call) => {
       assert.equal(call.length, 1);
       const record = call[0];
@@ -902,7 +1077,8 @@ test("global authentication locks aggregate once while public response and logs 
       ]);
       assert.match(record.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
       assert.equal(new Set([
-        "/session", "/", "/repositories", "/repositories/:id", "/csp-report",
+        "/session", "/", "/repositories", "/repositories/:id",
+        "/repositories/:id/notes", "/csp-report",
       ]).has(record.routeTemplate), true);
       assert.equal(Number.isInteger(record.status) && record.status >= 100 && record.status <= 599, true);
       assert.equal(Number.isInteger(record.latencyMs) && record.latencyMs >= 0, true);
@@ -919,10 +1095,13 @@ test("global authentication locks aggregate once while public response and logs 
     const serialized = JSON.stringify(logs);
     for (const secret of [
       pin, session.cookie, "https://github.com/OpenAI/example", "# Example",
-      "예제 저장소의 핵심 사용법을 보여준다.", "private personal note", cspUri,
+      "예제 저장소의 핵심 사용법을 보여준다.", "private Note body",
+      "updated private Note body", repositoryId, noteId, cspUri,
     ]) assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.equal(records.some((record) => record.routeTemplate === "/repositories" &&
       record.githubStatus === "ok" && record.openAiStatus === "ok"), true);
+    assert.equal(records.filter((record) =>
+      record.routeTemplate === "/repositories/:id/notes").length, 2);
   } finally { console.log = originalLog; }
 
   const aggregate = await env.PROD_DB.prepare(`SELECT event_type, route_template, metric_name,

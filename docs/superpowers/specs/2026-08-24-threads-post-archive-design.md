@@ -142,7 +142,7 @@ Stores root posts, included author replies, and one-level quoted posts.
 - `nested_quote_permalink`: only the next quote's URL, nullable.
 - `first_seen_at`, `last_seen_at`, `created_at`.
 
-Enforce uniqueness on `(threads_post_id, source_media_id)`. Root and author replies use `published_at ASC, source_media_id ASC` for deterministic chronology. Quotes render within their parent entry and do not occupy the reply timeline.
+Use a partial unique index on `(threads_post_id, source_media_id)` for `root` and `author_reply` entries. Use a second partial unique index on `(threads_post_id, parent_entry_id, source_media_id)` for `quote` entries so two different author entries may each display the same quoted post while Queue redelivery remains idempotent. Root and author replies use `published_at ASC, source_media_id ASC` for deterministic chronology. Quotes render within their parent entry and do not occupy the reply timeline.
 
 An existing entry is immutable except for `last_seen_at`. A sync inserts only unseen provider media IDs.
 
@@ -185,7 +185,9 @@ A single fixed-key row stores provider user ID, encrypted access token, AES-GCM 
 
 ## OAuth and Token Lifecycle
 
-`GET /threads/connect` creates a cryptographically random, session-bound OAuth state value in a `Secure`, `HttpOnly`, `SameSite=Lax`, `__Host-` cookie with a ten-minute lifetime, then redirects to Meta with the exact scopes above. The callback requires an authenticated PIN session, exact state equality, the configured production origin, a provider authorization code, and no duplicated/unknown query fields.
+`GET /threads/connect` first requires the authenticated PIN session, then creates a cryptographically random OAuth state in a `Secure`, `HttpOnly`, `SameSite=Lax`, `__Host-` cookie with a ten-minute lifetime. The signed cookie binds the state, the initiating PIN-session nonce, and expiry, then the route redirects to Meta with the exact scopes above. The existing PIN cookie remains `SameSite=Strict` and is therefore intentionally absent when Meta performs the cross-site callback.
+
+The callback is authenticated by the short-lived signed OAuth-state cookie instead of weakening or depending on the PIN cookie. It requires a valid signature and expiry, exact state equality, the configured production origin, a provider authorization code, and no duplicated/unknown query fields. This OAuth state is the callback's CSRF and initiation proof; every other Threads route still requires the PIN session.
 
 On success the Worker exchanges the code, validates the granted scopes, obtains a long-lived token, encrypts it, stores it atomically, clears the state cookie, and redirects to `/threads?flash=threads_connected`. Failed or denied authorization stores no credential.
 
@@ -237,7 +239,7 @@ No sync removes an entry, link, or ready media object that is absent at the prov
 
 ## Routes and Response Contracts
 
-Every Threads application route, including the OAuth callback and archived-media route, requires the existing PIN session. Only the pre-existing login, health, telemetry, and CSP-report boundaries retain their current unauthenticated behavior. Every state-changing application request requires existing same-origin and CSRF validation.
+Every Threads application route except the OAuth callback requires the existing PIN session, including the archived-media route. The callback instead requires the valid ten-minute signed OAuth-state cookie because the unchanged `SameSite=Strict` PIN cookie is not sent on Meta's cross-site redirect. Only the pre-existing login, health, telemetry, and CSP-report boundaries retain their current unauthenticated behavior. Every state-changing application request requires existing same-origin and CSRF validation except the callback, whose exact OAuth state contract is its cross-site request-forgery protection.
 
 ### Pages and data
 

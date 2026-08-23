@@ -39,7 +39,7 @@ Repo Atlas is a no-build, zero-runtime-dependency Cloudflare Worker application.
 - `src/worker.js` retains exact-host routing, authentication, security headers, safe error responses, and runtime binding selection.
 - New provider, orchestration, and media responsibilities live in focused modules rather than expanding the GitHub-specific modules.
 - The browser never calls Meta or R2 directly.
-- The existing Repository capture, analysis, notes, filtering, and deletion contracts remain unchanged except for shared navigation and the minimum CSP changes required by same-origin Threads media.
+- The existing Repository capture, analysis, notes, filtering, and deletion contracts remain unchanged except for shared navigation and adding `media-src 'self'` to the authenticated app CSP for same-origin archived video.
 
 The implementation uses `migrations/0004_threads_archive.sql`. It preserves the in-progress `0002_repository_activity.sql` and the already designed `0003_repository_notes.sql`; the Threads migration must not be applied until both earlier migrations are present in the target release.
 
@@ -202,7 +202,7 @@ Supported typed jobs are:
 - `resolve-post`: normalize a resolved URL and traverse public profile pages to locate the shortcode.
 - `collect-conversation`: fetch root details and paginated flattened conversation results.
 - `collect-quote`: fetch one quoted post and record only a nested quote permalink.
-- `finalize-content`: atomically verify content completion, create missing media rows, fan out media messages, and set job counts.
+- `finalize-content`: run only after every conversation page and one-level quote job for the generation has reached a terminal state, atomically verify content completion, create missing media rows, fan out media messages, and set job counts. Repeated finalization is idempotent.
 - `delete-archive`: delete archive-owned objects and rows after all cleanup succeeds.
 
 Each cursor page is one idempotent message cycle, which prevents a post with many replies from exceeding one consumer invocation. Conversation filtering compares the stable `owner.id` with the root author ID; only provider records with that ID become `author_reply` entries. A missing owner ID on a reply is treated as an invalid provider record rather than guessed from display text.
@@ -211,7 +211,7 @@ Each cursor page is one idempotent message cycle, which prevents a post with man
 
 Supported jobs archive entry images, videos, thumbnails, author profile images, or retry/deletion work. Before download the consumer reacquires current provider details by stable source ID when its original URL is unavailable or a retry occurs.
 
-The consumer validates HTTPS, an explicit Meta CDN suffix allowlist, at most three allowlisted redirects, a successful response, allowed image/video MIME, and the provider's length. It pipes the response `ReadableStream` directly to R2 and counts streamed bytes without buffering. A single-part object may not exceed 5 GiB. Missing/incorrect length, truncated data, disallowed redirect, unsupported MIME, or excess size fails only that media row.
+The consumer validates HTTPS, an explicit Meta CDN suffix allowlist, at most three allowlisted redirects, a successful response, allowed image/video MIME, and the provider's length. It pipes the response `ReadableStream` directly to R2 and counts streamed bytes without buffering. A single-part object may not exceed 5 GiB. Missing/incorrect length, truncated data, disallowed redirect, unsupported MIME, or excess size fails only that media row. Profile-image jobs participate in the same generation counters and partial/ready aggregation as entry-media jobs.
 
 R2 keys are deterministic:
 
@@ -237,7 +237,7 @@ No sync removes an entry, link, or ready media object that is absent at the prov
 
 ## Routes and Response Contracts
 
-All application routes require the existing PIN session except login, health, CSP reporting, and the Meta redirect itself. Every state-changing application request requires existing same-origin and CSRF validation.
+Every Threads application route, including the OAuth callback and archived-media route, requires the existing PIN session. Only the pre-existing login, health, telemetry, and CSP-report boundaries retain their current unauthenticated behavior. Every state-changing application request requires existing same-origin and CSRF validation.
 
 ### Pages and data
 
@@ -303,7 +303,7 @@ Deleting an archive is asynchronous because D1 and R2 cannot share one transacti
 
 1. The authenticated mutation atomically marks the archive `deleting`, disables further sync/retry, and queues `delete-archive`.
 2. The deletion job lists the exact R2 keys already referenced by archive media rows. It also identifies author profile objects whose authors will have no references after this archive is removed.
-3. It deletes those objects idempotently, then deletes the `threads_posts` row. Foreign keys cascade to entries, links, media, and jobs.
+3. It deletes those objects idempotently, then deletes the `threads_posts` row. Foreign keys cascade to entries, links, media, and jobs; the same D1 batch deletes author rows that have no remaining entry references.
 4. A failure leaves the tombstoned row and object-key inventory available for retry; the UI reports deletion pending or failed rather than claiming completion.
 
 Disconnecting Meta does not delete archives. Source deletion, edit, or disappearance never deletes or overwrites archived snapshots.
@@ -322,7 +322,7 @@ Use fixed application codes and fixed Korean user messages. Never echo provider 
 - Invalid Meta response shape or cursor loop: `threads_provider_protocol_error`.
 - D1 protocol/exception: `storage_unavailable`.
 - R2 write/read/cleanup exception: media/deletion retry state without data loss.
-- Queue send failure during HTTP submission: keep the D1 job in an explicit enqueue-error state and return a retryable safe response; never claim the job was queued.
+- Queue send failure during HTTP submission: set the D1 job to `error` with `queue_unavailable` and return a retryable safe response; never claim the job was queued.
 - Individual quote/profile/media terminal failure: `partial`; root and successful items remain readable.
 
 ## Security and Privacy
@@ -334,7 +334,7 @@ Use fixed application codes and fixed Korean user messages. Never echo provider 
 - Keep R2 private and require the existing signed session on every media request.
 - Escape all server HTML. Client code uses safe DOM creation and `textContent`; it does not use `innerHTML` for API content.
 - Activate only normalized HTTP(S) links. New-window links use `noopener noreferrer` and do not send a referrer.
-- Keep the app CSP free of Meta embed/script origins. No new third-party browser connection is permitted.
+- Add only `media-src 'self'` to the authenticated app CSP for native archived-video playback. Keep the CSP free of Meta embed/script origins and permit no new third-party browser connection.
 - Encrypt OAuth tokens with AES-GCM, rotate nonces, redact provider request paths/query values, and never log Threads text, CDN query strings, OAuth codes, state values, or tokens.
 - Telemetry records only safe route templates, status buckets, provider class, media type, size bucket, duration bucket, and fixed error dimensions.
 

@@ -684,6 +684,9 @@ test("detail and status declarations belong to real rules in the required media 
     display: "grid", "grid-template-columns": "1fr",
   });
   assertOwnRule(repositories, "repo-panel > section > h2", { "grid-column": "1 / -1" });
+  assertOwnRule(repositories, "repo-panel > .repository-empty", {
+    "padding-block-start": "var(--space-8)",
+  });
   assertOwnRule(repositories,
     "repo-capture [data-capture-status]:has([data-capture-message]:empty)", { display: "none" });
   assertOwnRule(repositories, 'main > p[role="status"]:empty', { display: "none" });

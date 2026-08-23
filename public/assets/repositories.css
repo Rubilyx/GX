@@ -39,6 +39,7 @@
     gap: var(--space-4);
   }
 
+  repo-panel > .repository-empty { padding-block-start: var(--space-8); }
   repo-panel > section > h2 { grid-column: 1 / -1; }
   repo-panel > * + * { margin-top: var(--layout-gap); }
 

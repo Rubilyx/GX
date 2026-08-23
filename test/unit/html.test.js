@@ -194,6 +194,8 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(empty, /<dialog data-repository-delete-dialog/);
   assert.match(empty, /class="status-marker" aria-hidden="true"/);
   assert.match(empty,
+    /<section class="repository-empty"><h2>저장한 저장소가 없습니다<\/h2><p role="status"><span class="status-marker" aria-hidden="true"><\/span>GitHub 저장소 URL 추가 필요<\/p><\/section>/);
+  assert.match(empty,
     /<nav class="category-filter" aria-label="Primary category"><a href="\/\?page=1" aria-current="page">All 0<\/a>/);
 });
 

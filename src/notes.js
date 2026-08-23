@@ -12,11 +12,17 @@ function invalidStorage() {
   throw new AppError("storage_unavailable", 503);
 }
 
+/** @param {unknown} value */
+function validStoredBody(value) {
+  return typeof value === "string" && value.length >= 1 && value.length <= 4_000 &&
+    value.trim() === value && value.normalize("NFC") === value;
+}
+
 /** @param {any} row */
 function noteRow(row) {
   if (!row || typeof row.id !== "string" || !row.id ||
     typeof row.repository_id !== "string" || !row.repository_id ||
-    typeof row.body !== "string" || !row.body || row.body.length > 4_000 ||
+    !validStoredBody(row.body) ||
     !Number.isInteger(row.created_at) || row.created_at < 0 ||
     !Number.isInteger(row.updated_at) || row.updated_at < row.created_at)
     invalidStorage();
@@ -41,7 +47,7 @@ function countRow(row) {
 
 /** @param {any} result */
 function noteRows(result) {
-  if (!result || !Array.isArray(result.results)) invalidStorage();
+  if (!result || result.success !== true || !Array.isArray(result.results)) invalidStorage();
   return result.results.map(noteRow);
 }
 
@@ -139,7 +145,8 @@ export async function getRepositoryNoteSummary(db, repositoryId) {
        WHERE repository_id = ?`,
     ).bind(repositoryId, repositoryId).first();
     if (!row || !Number.isInteger(row.note_count) || row.note_count < 0 ||
-      !(row.latest_note === null || typeof row.latest_note === "string"))
+      !((row.note_count === 0 && row.latest_note === null) ||
+        (row.note_count > 0 && validStoredBody(row.latest_note))))
       invalidStorage();
     return { noteCount: row.note_count, latestNote: row.latest_note };
   } catch (error) { throw storageError(error); }

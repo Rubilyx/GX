@@ -144,4 +144,35 @@ test("maps failed or malformed D1 responses to storage_unavailable", async () =>
     (error) => error instanceof Error && "code" in error && "status" in error &&
       error.code === "storage_unavailable" && error.status === 503,
   );
+
+  for (const result of [{ results: [] }, { success: false, results: [] }]) {
+    await assert.rejects(
+      listRepositoryNotes(d1Stub({
+        first: [{ present: 1 }, { count: 0 }], all: [result],
+      }), "repo-1", 1),
+      (error) => error instanceof Error && "code" in error && "status" in error &&
+        error.code === "storage_unavailable" && error.status === 503,
+    );
+  }
+
+  for (const body of ["", " padded ", "cafe\u0301", "x".repeat(4001)]) {
+    await assert.rejects(
+      listRepositoryNotes(d1Stub({
+        first: [{ present: 1 }, { count: 1 }],
+        all: [{ success: true, results: [{
+          id: "note-1", repository_id: "repo-1", body, created_at: 1, updated_at: 1,
+        }] }],
+      }), "repo-1", 1),
+      (error) => error instanceof Error && "code" in error && "status" in error &&
+        error.code === "storage_unavailable" && error.status === 503,
+    );
+  }
+
+  for (const latestNote of ["", " padded ", "cafe\u0301", "x".repeat(4001)]) {
+    await assert.rejects(
+      getRepositoryNoteSummary(d1Stub({ first: [{ note_count: 1, latest_note: latestNote }] }), "repo-1"),
+      (error) => error instanceof Error && "code" in error && "status" in error &&
+        error.code === "storage_unavailable" && error.status === 503,
+    );
+  }
 });

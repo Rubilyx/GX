@@ -688,27 +688,27 @@ class RepoPanel extends HTMLElement {
   syncCardNotes(article, noteSummary) {
     setText(article, "[data-repository-link]",
       noteSummary.noteCount > 0 ? `Note ${noteSummary.noteCount}` : "Note");
-    const current = article.querySelector(".repository-memo");
+    const current = article.querySelector(".repository-note-preview");
     if (noteSummary.latestNote === null) {
       current?.remove();
       return;
     }
     if (current instanceof HTMLElement) {
-      setText(current, "[data-repository-memo]", noteSummary.latestNote);
+      setText(current, "[data-repository-note-preview]", noteSummary.latestNote);
       return;
     }
     const metadata = article.querySelector(".repository-metadata");
     if (!(metadata instanceof HTMLElement) || !metadata.parentNode) return;
-    const memo = document.createElement("div");
-    memo.className = "repository-memo";
+    const notePreview = document.createElement("div");
+    notePreview.className = "repository-note-preview";
     const heading = document.createElement("h3");
     heading.textContent = "Note";
     const content = document.createElement("p");
-    content.dataset.repositoryMemo = "";
+    content.dataset.repositoryNotePreview = "";
     content.textContent = noteSummary.latestNote;
-    memo.appendChild(heading);
-    memo.appendChild(content);
-    metadata.parentNode.insertBefore(memo, metadata);
+    notePreview.appendChild(heading);
+    notePreview.appendChild(content);
+    metadata.parentNode.insertBefore(notePreview, metadata);
   }
 
   /** @param {HTMLElement} root @param {string} message @param {string} [state] */

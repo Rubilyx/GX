@@ -150,15 +150,15 @@ test("analysis failure cards keep one failure message and expose both actions", 
   const card = page.locator('article[data-analysis-card-status="error"]');
   const description = card.locator('[data-analysis-summary-status="error"]');
   const detail = card.getByRole("link", { name: "자세히 보기", exact: true });
-  const memo = card.locator("[data-repository-link]");
+  const noteLink = card.locator("[data-repository-link]");
   await expect(card).toHaveCSS("background-color", "rgb(241, 240, 237)");
   await expect(card).toHaveCSS("color", "rgb(107, 105, 99)");
   await expect(description).toHaveText("AI 분석 실패");
   await expect(description).toHaveCSS("background-color", "rgb(253, 235, 236)");
   await expect(card.locator('[data-analysis-status="error"]')).toHaveCount(0);
   await expect(detail).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
-  await expect(memo).toHaveText("Note");
-  await expect(memo).toHaveAttribute(
+  await expect(noteLink).toHaveText("Note");
+  await expect(noteLink).toHaveAttribute(
     "href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee/notes",
   );
 });
@@ -168,28 +168,28 @@ test("repository card exposes separate detail and note actions", async ({ page }
   await loginAndSeed(page);
   const card = page.locator("repo-panel article").first();
   const detail = card.getByRole("link", { name: "자세히 보기", exact: true });
-  const memo = card.locator("[data-repository-link]");
+  const noteLink = card.locator("[data-repository-link]");
   const actions = card.locator(".repository-actions");
   const summary = card.locator("[data-analysis-summary-status]");
 
   await expect(detail).toHaveAttribute("href", /\/repositories\/[0-9a-f-]+$/);
   await expect(detail).toHaveCSS("text-decoration-line", "none");
-  await expect(memo).toHaveText("Note");
-  await expect(memo).toHaveCSS("text-decoration-line", "none");
+  await expect(noteLink).toHaveText("Note");
+  await expect(noteLink).toHaveCSS("text-decoration-line", "none");
   await expect(summary).toHaveCSS("font-weight", "500");
-  await expect(card.locator("[data-repository-memo]")).toHaveCount(0);
+  await expect(card.locator("[data-repository-note-preview]")).toHaveCount(0);
   await expect(card.locator('[data-repository-field="activity"]')).toContainText("활동");
   await expect(card.getByRole("button", { name: "OpenAI/example 활동 새로고침" }))
     .toHaveText("");
-  const [actionsBox, memoBox] = await Promise.all([actions.boundingBox(), memo.boundingBox()]);
+  const [actionsBox, noteLinkBox] = await Promise.all([actions.boundingBox(), noteLink.boundingBox()]);
   expect(actionsBox).not.toBeNull();
-  expect(memoBox).not.toBeNull();
-  if (!actionsBox || !memoBox) throw new Error("repository_action_bounds_missing");
-  expect(Math.abs((actionsBox.x + actionsBox.width) - (memoBox.x + memoBox.width))).toBeLessThanOrEqual(1);
+  expect(noteLinkBox).not.toBeNull();
+  if (!actionsBox || !noteLinkBox) throw new Error("repository_action_bounds_missing");
+  expect(Math.abs((actionsBox.x + actionsBox.width) - (noteLinkBox.x + noteLinkBox.width))).toBeLessThanOrEqual(1);
   await detail.hover();
   await expect(detail).toHaveCSS("color", "rgb(159, 47, 45)");
-  await memo.hover();
-  await expect(memo).toHaveCSS("color", "rgb(159, 47, 45)");
+  await noteLink.hover();
+  await expect(noteLink).toHaveCSS("color", "rgb(159, 47, 45)");
 });
 
 test("repository actions stay 44px tall with uneven card content", async ({ page, harness }) => {
@@ -522,7 +522,7 @@ test.describe("desktop Note manager", () => {
     }
 
     await expect(opener).toHaveText("Note 6");
-    await expect(card.locator("[data-repository-memo]")).toHaveText("Note 6");
+    await expect(card.locator("[data-repository-note-preview]")).toHaveText("Note 6");
     await expect(dialog.locator("[data-repository-note-item]")).toHaveCount(5);
     const pagination = dialog.locator("[data-repository-note-pagination]");
     await expect(pagination.getByRole("link", { name: "1", exact: true }))
@@ -570,7 +570,7 @@ test.describe("desktop Note manager", () => {
     await newest.getByRole("button", { name: "삭제", exact: true }).click();
     await confirmation.getByRole("button", { name: "Note 삭제", exact: true }).click();
     await expect(opener).toHaveText("Note 4");
-    await expect(card.locator("[data-repository-memo]")).toHaveText("Note 5");
+    await expect(card.locator("[data-repository-note-preview]")).toHaveText("Note 5");
 
     await dialog.getByRole("button", { name: "닫기", exact: true }).click();
     await expect(dialog).toBeHidden();

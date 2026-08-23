@@ -691,7 +691,7 @@ test("detail and status declarations belong to real rules in the required media 
     "background-color": "var(--color-bg-subtle)",
     "font-weight": "500",
   });
-  assertOwnRule(repositories, ".repository-memo > h3", {
+  assertOwnRule(repositories, ".repository-note-preview > h3", {
     margin: "0", color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
   });
   assertOwnRule(repositories, 'repo-panel article[data-analysis-card-status="error"]', {

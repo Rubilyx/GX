@@ -121,7 +121,7 @@ test("index exposes complete native forms and safe enhancement controls", () => 
   assert.match(card,
     /<div class="repository-actions"><a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">자세히 보기<\/a><a data-repository-link href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes">Note 3<\/a><\/div>/);
   assert.match(card,
-    /<div class="repository-memo"><h3>Note<\/h3><p data-repository-memo>&lt;\/textarea&gt;&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/p><\/div>/);
+    /<div class="repository-note-preview"><h3>Note<\/h3><p data-repository-note-preview>&lt;\/textarea&gt;&lt;script&gt;alert\(&quot;note&quot;\)&lt;\/script&gt;<\/p><\/div>/);
   assert.match(card, /<p data-analysis-summary-status="error">&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.doesNotMatch(card, /<dt>Analysis status<\/dt>/);
   assert.match(card,
@@ -283,9 +283,9 @@ test("index cards show only the newest Note directly after the description", () 
     html.match(/<article[^>]*>[\s\S]*?<\/article>/g) ?? [];
 
   assert.match(savedCard,
-    /<p data-analysis-summary-status="error">[\s\S]*?<\/p><div class="repository-memo"><h3>Note<\/h3><p data-repository-memo>첫 줄\n둘째 줄<\/p><\/div>/);
+    /<p data-analysis-summary-status="error">[\s\S]*?<\/p><div class="repository-note-preview"><h3>Note<\/h3><p data-repository-note-preview>첫 줄\n둘째 줄<\/p><\/div>/);
   assert.match(savedCard, /<a data-repository-link href="[^"]+\/notes">Note 2<\/a>/);
-  assert.doesNotMatch(emptyCard, /repository-memo|data-repository-memo|>None</);
+  assert.doesNotMatch(emptyCard, /repository-note-preview|data-repository-note-preview|>None</);
   assert.match(emptyCard, /<a data-repository-link href="[^"]+\/notes">Note<\/a>/);
 });
 

@@ -171,12 +171,12 @@ function repositoryCard(repository, now, csrfToken) {
   const activityForm = `<form method="post" action="${htmlAttr(`${detail}/activity`)}" data-repository-activity-form>${csrf(csrfToken)}<button type="submit" data-repository-activity-refresh aria-label="${htmlAttr(activityLabel)}">${activityIcon}</button></form>`;
   const activityStatus = '<span class="visually-hidden" data-repository-activity-status role="status" aria-live="polite"></span>';
   const metadata = `<dl class="repository-metadata"><div data-repository-field="category"><dt>Primary category</dt><dd><span class="repository-badge repository-badge--primary">${htmlText(category)}</span></dd></div><div data-repository-field="tags"><dt>Tags</dt><dd><span class="repository-badge-list">${tagBadges}</span></dd></div><div data-repository-field="stars"><dt>Stars</dt><dd>${htmlText(compactMetric(repository.stars))}</dd></div><div data-repository-field="forks"><dt>Forks</dt><dd>${htmlText(compactMetric(repository.forks))}</dd></div><div data-repository-field="language"><dt>Language</dt><dd>${htmlText(repository.primaryLanguage || "알 수 없음")}</dd></div><div data-repository-field="activity"><dt class="visually-hidden">Repository Activity</dt><dd><span data-repository-activity-value>${activityValue}</span>${activityForm}${activityStatus}</dd></div></dl>`;
-  const memo = repository.latestNote
-    ? `<div class="repository-memo"><h3>Note</h3><p data-repository-memo>${htmlText(repository.latestNote)}</p></div>`
+  const notePreview = repository.latestNote
+    ? `<div class="repository-note-preview"><h3>Note</h3><p data-repository-note-preview>${htmlText(repository.latestNote)}</p></div>`
     : "";
   const noteAction = repository.noteCount > 0 ? `Note ${repository.noteCount}` : "Note";
   const actions = `<div class="repository-actions"><a href="${htmlAttr(detail)}">자세히 보기</a><a data-repository-link href="${htmlAttr(`${detail}/notes`)}">${htmlText(noteAction)}</a></div>`;
-  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p>${memo}${metadata}${actions}</article>`;
+  return `<article${cardStatus}>${remove}<h2><img class="repository-avatar" src="${htmlAttr(avatar)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="repository-title"><span class="repository-owner">${htmlText(repository.owner)}/</span><span class="repository-name">${htmlText(repository.name)}</span></span></h2><p data-analysis-summary-status="${analysisStatus}">${htmlText(summary)}</p>${notePreview}${metadata}${actions}</article>`;
 }
 
 /** @param {{ q?: string, category?: string, tag?: string }} filters @param {number} page */

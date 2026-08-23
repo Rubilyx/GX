@@ -101,19 +101,19 @@
     padding-inline-end: 2.75rem;
   }
 
-  .repository-memo {
+  .repository-note-preview {
     display: grid;
     gap: var(--space-1);
     min-width: 0;
   }
 
-  .repository-memo > h3 {
+  .repository-note-preview > h3 {
     margin: 0;
     color: var(--color-text-secondary);
     font-size: var(--text-sm);
   }
 
-  .repository-memo > p {
+  .repository-note-preview > p {
     margin: 0;
     overflow-wrap: anywhere;
     white-space: pre-wrap;

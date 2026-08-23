@@ -164,14 +164,18 @@ function linkStatements(db, entry, kind, postId, generation, parentId = null,
     requiredMediaId, requiredMediaId));
 }
 
-const CANDIDATE_KEYS = ["id", "threads_media_id", "sync_generation", "status", "created_at"];
+const CANDIDATE_KEYS = [
+  "id", "threads_media_id", "sync_generation", "status", "created_at",
+  "job_generation", "job_status",
+];
 /** @param {any} row */
 function candidateRow(row) {
   row = exactRow(row, CANDIDATE_KEYS);
   if (typeof row.id !== "string" || !row.id ||
     !(row.threads_media_id === null || typeof row.threads_media_id === "string") ||
     !Number.isSafeInteger(row.sync_generation) || row.sync_generation < 1 ||
-    !POST_STATUSES.has(row.status)) invalidStorage();
+    !POST_STATUSES.has(row.status) || !Number.isSafeInteger(row.job_generation) ||
+    row.job_generation < 1 || !JOB_STATUSES.has(row.job_status)) invalidStorage();
   d1NonnegativeInteger(row.created_at);
   return row;
 }
@@ -213,15 +217,28 @@ function ownerCorrectionStatements(db, winner, loser, providerId, claim, now) {
   return [
     db.prepare(
       `UPDATE threads_posts AS winner SET threads_media_id = ?
-       WHERE id = ? AND threads_media_id IS NULL AND sync_generation = ?
+       WHERE id = ? AND threads_media_id IS NULL AND sync_generation = ? AND status = ?
          AND status <> 'deleting'
          AND EXISTS (
            SELECT 1 FROM threads_sync_jobs winner_job
            WHERE winner_job.threads_post_id = winner.id
-             AND winner_job.generation = winner.sync_generation
-             AND winner_job.status IN ('queued','resolving','collecting')
+             AND winner_job.generation = ? AND winner_job.generation = winner.sync_generation
+             AND winner_job.status = ?
+         )
+         AND EXISTS (
+           SELECT 1 FROM threads_posts loser
+           JOIN threads_sync_jobs loser_job
+             ON loser_job.threads_post_id = loser.id
+             AND loser_job.generation = loser.sync_generation
+           WHERE loser.id = ? AND loser.threads_media_id = ?
+             AND loser.sync_generation = ? AND loser.status = ?
+             AND loser.status <> 'deleting'
+             AND loser_job.generation = ? AND loser_job.status = ?
          )`,
-    ).bind(claim, winner.id, winner.sync_generation),
+    ).bind(claim, winner.id, winner.sync_generation, winner.status,
+      winner.job_generation, winner.job_status,
+      loser.id, providerId, loser.sync_generation, loser.status,
+      loser.job_generation, loser.job_status),
     db.prepare(
       `UPDATE threads_sync_jobs SET status = 'error',
          error_code = 'threads_archive_duplicate', completed_at = ?, updated_at = ?
@@ -271,8 +288,12 @@ export async function saveResolvedThreadsRoot(db, input) {
   const conversationCursor = nullableString(input?.conversationCursor);
   try {
     const candidates = selectRows(await db.prepare(
-      `SELECT id, threads_media_id, sync_generation, status, created_at
-       FROM threads_posts WHERE id = ? OR threads_media_id = ? ORDER BY created_at, id`,
+      `SELECT p.id, p.threads_media_id, p.sync_generation, p.status, p.created_at,
+         j.generation AS job_generation, j.status AS job_status
+       FROM threads_posts p
+       LEFT JOIN threads_sync_jobs j
+         ON j.threads_post_id = p.id AND j.generation = p.sync_generation
+       WHERE p.id = ? OR p.threads_media_id = ? ORDER BY p.created_at, p.id`,
     ).bind(postId, root.id).all(), CANDIDATE_KEYS).map(candidateRow);
     const current = candidates.find((row) => row.id === postId);
     if (!current || current.sync_generation !== generation || current.status === "deleting") return false;

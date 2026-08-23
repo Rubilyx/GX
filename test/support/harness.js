@@ -112,6 +112,19 @@ export async function seedRepository(db, overrides = {}) {
   }
 }
 
+/** @param {any} db @param {{ id?: string, repositoryId?: string, body?: string, createdAt?: number, updatedAt?: number }} [overrides] */
+export async function seedRepositoryNote(db, overrides = {}) {
+  const row = {
+    id: "note-1", repositoryId: "repo-1", body: "Note body",
+    createdAt: 1, updatedAt: 1, ...overrides,
+  };
+  await db.prepare(
+    "INSERT INTO repository_notes " +
+    "(id, repository_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+  ).bind(row.id, row.repositoryId, row.body, row.createdAt, row.updatedAt).run();
+  return row;
+}
+
 /** @param {any} db @param {number} count @param {{ matchingName?: string }} [options] */
 export async function seedNamedRepositories(db, count, options = {}) {
   for (let index = 0; index < count; index += 1) {

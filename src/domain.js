@@ -31,6 +31,14 @@ export function validatePersonalNote(raw) {
 }
 
 /** @param {unknown} raw */
+export function validateRepositoryNote(raw) {
+  if (typeof raw !== "string") throw new AppError("invalid_repository_note", 400);
+  const body = raw.trim().normalize("NFC");
+  if (!body || body.length > 4_000) throw new AppError("invalid_repository_note", 400);
+  return body;
+}
+
+/** @param {unknown} raw */
 export function normalizeGitHubUrl(raw) {
   let url;
   try { url = new URL(String(raw).trim()); }
@@ -72,6 +80,18 @@ export function parseListQuery(url) {
     throw new AppError("invalid_list_query", 400);
   const page = Number(url.searchParams.get("page"));
   return { q, category, tag, page: Number.isInteger(page) && page > 0 ? page : 1 };
+}
+
+/** @param {URL} url */
+export function parseNotePage(url) {
+  for (const key of url.searchParams.keys()) {
+    if (key !== "page" || url.searchParams.getAll(key).length !== 1)
+      throw new AppError("invalid_note_query", 400);
+  }
+  const raw = url.searchParams.get("page");
+  if (raw === null || !/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw)))
+    return { page: 1 };
+  return { page: Number(raw) };
 }
 
 /** @param {{ personalNote: string, primaryCategory: string, tags: string[] } & Record<string, unknown>} input */

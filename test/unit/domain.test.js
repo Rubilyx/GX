@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  AppError, normalizeGitHubUrl, normalizeTags, parseListQuery, validateRepositoryEdit,
+  AppError, normalizeGitHubUrl, normalizeTags, parseListQuery, parseNotePage,
+  validateRepositoryEdit, validateRepositoryNote,
 } from "../../src/domain.js";
 
 test("normalizes the one accepted GitHub URL shape", () => {
@@ -54,5 +55,31 @@ test("rejects malformed repository edit shapes with safe errors", () => {
       () => validateRepositoryEdit(/** @type {any} */ (input)),
       (error) => error instanceof AppError && error.code === "invalid_repository_edit" && error.status === 400,
     );
+  }
+});
+
+test("normalizes and bounds a repository Note body", () => {
+  assert.equal(validateRepositoryNote("  cafe\u0301  "), "café");
+  assert.equal(validateRepositoryNote("x".repeat(4000)).length, 4000);
+  for (const value of ["   ", "x".repeat(4001), null, 12]) {
+    assert.throws(
+      () => validateRepositoryNote(value),
+      (error) => error instanceof AppError &&
+        error.code === "invalid_repository_note" && error.status === 400,
+    );
+  }
+});
+
+test("accepts only the Note list page query", () => {
+  assert.equal(parseNotePage(new URL("https://app.test/repositories/repo-1/notes")).page, 1);
+  assert.equal(parseNotePage(new URL("https://app.test/repositories/repo-1/notes?page=3")).page, 3);
+  for (const search of ["?page=1&page=2", "?q=x"]) {
+    assert.throws(
+      () => parseNotePage(new URL("https://app.test/repositories/repo-1/notes" + search)),
+      /invalid_note_query/,
+    );
+  }
+  for (const search of ["?page=0", "?page=-1", "?page=x"]) {
+    assert.equal(parseNotePage(new URL("https://app.test/repositories/repo-1/notes" + search)).page, 1);
   }
 });

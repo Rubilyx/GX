@@ -82,7 +82,7 @@ before(async () => { harness = await startHarness(); });
 beforeEach(async () => { await harness.reset(); });
 after(async () => { await harness.close(); });
 
-test("migration creates four tables and enforces five tags", async () => {
+test("migration creates five tables and enforces five tags", async () => {
   const env = await harness.worker.getEnv();
   const rows = await env.PROD_DB.prepare(
     `SELECT name FROM sqlite_schema
@@ -92,7 +92,7 @@ test("migration creates four tables and enforces five tags", async () => {
      ORDER BY name`,
   ).all();
   assert.deepEqual(rows.results.map((row) => row.name), [
-    "auth_attempts", "repositories", "repository_tags", "telemetry_daily",
+    "auth_attempts", "repositories", "repository_notes", "repository_tags", "telemetry_daily",
   ]);
   const columns = await env.PROD_DB.prepare("PRAGMA table_info(repositories)").all();
   assert.equal(columns.results.some((column) => column.name === "github_pushed_at"), true);
@@ -809,4 +809,33 @@ test("activity migration preserves populated v1 rows as unsynchronized", async (
   ).first(), {
     github_pushed_at: null, activity_refreshed_at: null, activity_refresh_generation: 0,
   });
+});
+
+test("repository notes migration leaves legacy personal notes behind and cascades", async () => {
+  const env = await harness.worker.getEnv();
+  await env.PROD_DB.exec("DROP TABLE IF EXISTS repository_notes");
+  await seedRepository(env.PROD_DB, {
+    id: "legacy", githubId: "legacy", personalNote: "legacy must not migrate",
+  });
+
+  const noteMigration = await readFile("migrations/0003_repository_notes.sql", "utf8");
+  for (const statement of noteMigration.split(";").map((value) => value.trim()).filter(Boolean))
+    await env.PROD_DB.prepare(statement).run();
+
+  assert.equal(await env.PROD_DB.prepare(
+    "SELECT COUNT(*) FROM repository_notes",
+  ).first("COUNT(*)"), 0);
+  assert.deepEqual(
+    await env.PROD_DB.prepare("PRAGMA foreign_key_list(repository_notes)").all()
+      .then((result) => result.results.map((row) => [row.table, row.from, row.on_delete])),
+    [["repositories", "repository_id", "CASCADE"]],
+  );
+
+  await env.PROD_DB.prepare(
+    "INSERT INTO repository_notes (id, repository_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+  ).bind("note-legacy", "legacy", "New note", 1, 1).run();
+  await env.PROD_DB.prepare("DELETE FROM repositories WHERE id = ?").bind("legacy").run();
+  assert.equal(await env.PROD_DB.prepare(
+    "SELECT COUNT(*) FROM repository_notes",
+  ).first("COUNT(*)"), 0);
 });

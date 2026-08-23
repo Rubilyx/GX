@@ -724,6 +724,66 @@ function interceptFirstBatch(db, beforeBatch) {
   };
 }
 
+/** @param {D1Database} db */
+async function collisionLoserSnapshot(db) {
+  return {
+    post: await db.prepare("SELECT * FROM threads_posts WHERE id = 'newer-local'").first(),
+    job: await db.prepare(
+      "SELECT * FROM threads_sync_jobs WHERE threads_post_id = 'newer-local' AND generation = 1",
+    ).first(),
+  };
+}
+
+test("Threads collision race leaves the newer owner untouched when the older winner becomes stale", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedCollisionCandidate(db, "older-local", 10);
+  await seedCollisionCandidate(db, "newer-local", 20);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "newer-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 21,
+  }), true);
+  const loserBefore = await collisionLoserSnapshot(db);
+  const raced = interceptFirstBatch(db, () => db.prepare(
+    "UPDATE threads_posts SET sync_generation = 2 WHERE id = 'older-local'",
+  ).run());
+  assert.equal(await saveResolvedThreadsRoot(raced, {
+    postId: "older-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 22,
+  }), false);
+  assert.deepEqual(await collisionLoserSnapshot(db), loserBefore);
+  assert.equal(await db.prepare(
+    "SELECT threads_media_id FROM threads_posts WHERE id = 'older-local'",
+  ).first("threads_media_id"), null);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE threads_media_id LIKE 'claim:%'",
+  ).first("count"), 0);
+});
+
+test("Threads collision race leaves the newer owner untouched when deletion wins for the older winner", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedCollisionCandidate(db, "older-local", 10);
+  await seedCollisionCandidate(db, "newer-local", 20);
+  assert.equal(await saveResolvedThreadsRoot(db, {
+    postId: "newer-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 21,
+  }), true);
+  const loserBefore = await collisionLoserSnapshot(db);
+  const raced = interceptFirstBatch(db, () => db.prepare(
+    "UPDATE threads_posts SET status = 'deleting' WHERE id = 'older-local'",
+  ).run());
+  assert.equal(await saveResolvedThreadsRoot(raced, {
+    postId: "older-local", generation: 1, profile: profile("provider-owner", "provider"),
+    root: collisionRoot(), profileCursor: null, conversationCursor: null, nowSeconds: 22,
+  }), false);
+  assert.deepEqual(await collisionLoserSnapshot(db), loserBefore);
+  assert.equal(await db.prepare(
+    "SELECT threads_media_id FROM threads_posts WHERE id = 'older-local'",
+  ).first("threads_media_id"), null);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE threads_media_id LIKE 'claim:%'",
+  ).first("count"), 0);
+});
+
 test("Threads review finalization commits no media after its generation becomes stale", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const input = await seedFinalizable(db, "stale-finalize");

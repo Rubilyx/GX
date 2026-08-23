@@ -106,8 +106,8 @@ export function providerProfile(value) {
   return profile;
 }
 
-/** @param {any} db @param {Record<string, any>} profile @param {string} postId @param {number} generation @param {number} now */
-function authorStatement(db, profile, postId, generation, now) {
+/** @param {any} db @param {Record<string, any>} profile @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] */
+function authorStatement(db, profile, postId, generation, now, requiredMediaId = null) {
   return db.prepare(
     `INSERT INTO threads_authors
        (threads_user_id, username, display_name, created_at, updated_at)
@@ -115,15 +115,16 @@ function authorStatement(db, profile, postId, generation, now) {
      WHERE EXISTS (
        SELECT 1 FROM threads_posts
        WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+         AND (? IS NULL OR threads_media_id = ?)
      )
      ON CONFLICT(threads_user_id) DO UPDATE SET
        username = excluded.username, display_name = excluded.display_name,
        updated_at = excluded.updated_at`,
   ).bind(profile.id, profile.username, profile.name ?? profile.username, now, now,
-    postId, generation);
+    postId, generation, requiredMediaId, requiredMediaId);
 }
-/** @param {any} db @param {Record<string, any>} entry @param {"root"|"author_reply"} kind @param {string} postId @param {number} generation @param {number} now */
-function primaryEntryStatement(db, entry, kind, postId, generation, now) {
+/** @param {any} db @param {Record<string, any>} entry @param {"root"|"author_reply"} kind @param {string} postId @param {number} generation @param {number} now @param {string | null} [requiredMediaId] */
+function primaryEntryStatement(db, entry, kind, postId, generation, now, requiredMediaId = null) {
   return db.prepare(
     `INSERT INTO threads_entries
        (id, threads_post_id, source_media_id, kind, author_id, text, permalink,
@@ -133,6 +134,7 @@ function primaryEntryStatement(db, entry, kind, postId, generation, now) {
      WHERE EXISTS (
        SELECT 1 FROM threads_posts
        WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+         AND (? IS NULL OR threads_media_id = ?)
      )
      ON CONFLICT(threads_post_id, source_media_id)
        WHERE kind IN ('root','author_reply')
@@ -140,11 +142,12 @@ function primaryEntryStatement(db, entry, kind, postId, generation, now) {
   ).bind(
     crypto.randomUUID(), postId, entry.id, kind, entry.ownerId, entry.text,
     entry.permalink, entry.timestamp, entry.mediaType, entry.altText ?? null,
-    now, now, now, postId, generation,
+    now, now, now, postId, generation, requiredMediaId, requiredMediaId,
   );
 }
-/** @param {any} db @param {Record<string, any>} entry @param {string} kind @param {string} postId @param {number} generation @param {string | null} parentId */
-function linkStatements(db, entry, kind, postId, generation, parentId = null) {
+/** @param {any} db @param {Record<string, any>} entry @param {string} kind @param {string} postId @param {number} generation @param {string | null} parentId @param {string | null} [requiredMediaId] */
+function linkStatements(db, entry, kind, postId, generation, parentId = null,
+  requiredMediaId = null) {
   return extractThreadsLinks(entry.text, entry.linkAttachmentUrl).map((link) => db.prepare(
     `INSERT INTO threads_links (id, entry_id, url, source, ordinal)
      SELECT ?, e.id, ?, ?, ? FROM threads_entries e
@@ -153,10 +156,12 @@ function linkStatements(db, entry, kind, postId, generation, parentId = null) {
        AND EXISTS (
          SELECT 1 FROM threads_posts
          WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+           AND (? IS NULL OR threads_media_id = ?)
        )
      ON CONFLICT(entry_id, url) DO NOTHING`,
   ).bind(crypto.randomUUID(), link.url, link.source, link.ordinal,
-    postId, entry.id, kind, parentId, parentId, postId, generation));
+    postId, entry.id, kind, parentId, parentId, postId, generation,
+    requiredMediaId, requiredMediaId));
 }
 
 const CANDIDATE_KEYS = ["id", "threads_media_id", "sync_generation", "status", "created_at"];
@@ -194,6 +199,57 @@ function duplicateStatements(db, postId, generation, now) {
     ).bind(now, postId, generation),
   ];
 }
+/** @param {any} db @param {any} winner @param {any} loser @param {string} providerId @param {string} claim @param {number} now */
+function ownerCorrectionStatements(db, winner, loser, providerId, claim, now) {
+  const winnerClaim = `EXISTS (
+    SELECT 1 FROM threads_posts winner
+    JOIN threads_sync_jobs winner_job
+      ON winner_job.threads_post_id = winner.id
+      AND winner_job.generation = winner.sync_generation
+    WHERE winner.id = ? AND winner.threads_media_id = ?
+      AND winner.sync_generation = ? AND winner.status <> 'deleting'
+      AND winner_job.status IN ('queued','resolving','collecting')
+  )`;
+  return [
+    db.prepare(
+      `UPDATE threads_posts AS winner SET threads_media_id = ?
+       WHERE id = ? AND threads_media_id IS NULL AND sync_generation = ?
+         AND status <> 'deleting'
+         AND EXISTS (
+           SELECT 1 FROM threads_sync_jobs winner_job
+           WHERE winner_job.threads_post_id = winner.id
+             AND winner_job.generation = winner.sync_generation
+             AND winner_job.status IN ('queued','resolving','collecting')
+         )`,
+    ).bind(claim, winner.id, winner.sync_generation),
+    db.prepare(
+      `UPDATE threads_sync_jobs SET status = 'error',
+         error_code = 'threads_archive_duplicate', completed_at = ?, updated_at = ?
+       WHERE threads_post_id = ? AND generation = ?
+         AND EXISTS (
+           SELECT 1 FROM threads_posts loser
+           WHERE loser.id = ? AND loser.threads_media_id = ?
+             AND loser.sync_generation = ? AND loser.status <> 'deleting'
+         ) AND ${winnerClaim}`,
+    ).bind(now, now, loser.id, loser.sync_generation,
+      loser.id, providerId, loser.sync_generation,
+      winner.id, claim, winner.sync_generation),
+    db.prepare(
+      `UPDATE threads_posts SET status = 'error',
+         error_code = 'threads_archive_duplicate', updated_at = ?
+       WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
+         AND status <> 'deleting' AND ${winnerClaim}`,
+    ).bind(now, loser.id, providerId, loser.sync_generation,
+      winner.id, claim, winner.sync_generation),
+    db.prepare(
+      `UPDATE threads_posts SET threads_media_id = NULL
+       WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
+         AND status = 'error' AND error_code = 'threads_archive_duplicate'
+         AND ${winnerClaim}`,
+    ).bind(loser.id, providerId, loser.sync_generation,
+      winner.id, claim, winner.sync_generation),
+  ];
+}
 /** @param {any} db @param {string} postId @param {number} generation @param {number} now */
 export async function markDuplicateArchive(db, postId, generation, now) {
   const changes = mutationBatch(await db.batch(
@@ -225,34 +281,39 @@ export async function saveResolvedThreadsRoot(db, input) {
       await markDuplicateArchive(db, postId, generation, now);
       return false;
     }
-    const correction = owner ? [
-      ...duplicateStatements(db, owner.id, owner.sync_generation, now),
-      db.prepare(
-        `UPDATE threads_posts SET threads_media_id = NULL
-         WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
-           AND status = 'error' AND error_code = 'threads_archive_duplicate'
-           AND EXISTS (
-             SELECT 1 FROM threads_posts winner
-             WHERE winner.id = ? AND winner.sync_generation = ?
-               AND winner.status <> 'deleting' AND winner.created_at = ?
-           )`,
-      ).bind(owner.id, root.id, owner.sync_generation, postId, generation, current.created_at),
-    ] : [];
+    const claim = owner ? `claim:${root.id}` : null;
+    const correction = owner
+      ? ownerCorrectionStatements(db, current, owner, root.id,
+        /** @type {string} */ (claim), now) : [];
+    const postStatement = owner ? db.prepare(
+      `UPDATE threads_posts AS winner SET
+         canonical_url = ?, root_author_id = ?, status = 'collecting',
+         error_code = NULL, updated_at = ?
+       WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
+         AND status <> 'deleting'
+         AND EXISTS (
+           SELECT 1 FROM threads_sync_jobs winner_job
+           WHERE winner_job.threads_post_id = winner.id
+             AND winner_job.generation = winner.sync_generation
+             AND winner_job.status IN ('queued','resolving','collecting')
+         )`,
+    ).bind(root.permalink, profile.id, now, postId, claim, generation) : db.prepare(
+      `UPDATE threads_posts SET
+         threads_media_id = ?, canonical_url = ?, root_author_id = ?,
+         status = 'collecting', error_code = NULL, updated_at = ?
+       WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+         AND (threads_media_id IS NULL OR threads_media_id = ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM threads_posts other
+           WHERE other.threads_media_id = ? AND other.id <> ?
+         )`,
+    ).bind(root.id, root.permalink, profile.id, now, postId, generation,
+      root.id, root.id, postId);
+    const requiredIdentity = owner ? claim : root.id;
     const statements = [
       ...correction,
-      authorStatement(db, profile, postId, generation, now),
-      db.prepare(
-        `UPDATE threads_posts SET
-           threads_media_id = ?, canonical_url = ?, root_author_id = ?,
-           status = 'collecting', error_code = NULL, updated_at = ?
-         WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
-           AND (threads_media_id IS NULL OR threads_media_id = ?)
-           AND NOT EXISTS (
-             SELECT 1 FROM threads_posts other
-             WHERE other.threads_media_id = ? AND other.id <> ?
-           )`,
-      ).bind(root.id, root.permalink, profile.id, now, postId, generation,
-        root.id, root.id, postId),
+      authorStatement(db, profile, postId, generation, now, claim),
+      postStatement,
       db.prepare(
         `UPDATE threads_sync_jobs SET
            status = 'collecting', profile_cursor = ?, conversation_cursor = ?,
@@ -268,14 +329,39 @@ export async function saveResolvedThreadsRoot(db, input) {
                AND threads_media_id = ?
            )`,
       ).bind(profileCursor, conversationCursor, root.quotedPostId ?? null, postId, root.id,
-        now, postId, generation, postId, generation, root.id),
-      primaryEntryStatement(db, root, "root", postId, generation, now),
-      ...linkStatements(db, root, "root", postId, generation),
+        now, postId, generation, postId, generation, requiredIdentity),
+      primaryEntryStatement(db, root, "root", postId, generation, now, claim),
+      ...linkStatements(db, root, "root", postId, generation, null, claim),
+      ...(owner ? [db.prepare(
+        `UPDATE threads_posts AS winner SET threads_media_id = ?
+         WHERE id = ? AND threads_media_id = ? AND sync_generation = ?
+           AND status = 'collecting' AND error_code IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM threads_posts other
+             WHERE other.threads_media_id = ? AND other.id <> winner.id
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_sync_jobs winner_job
+             WHERE winner_job.threads_post_id = winner.id
+               AND winner_job.generation = winner.sync_generation
+               AND winner_job.status = 'collecting'
+           )`,
+      ).bind(root.id, postId, claim, generation, root.id)] : []),
     ];
     const changes = mutationBatch(await db.batch(statements), statements.length);
     if (changes.some((count) => count > 1)) invalidStorage();
-    if (owner && correction.some((_, index) => changes[index] !== 1)) invalidStorage();
     const base = correction.length;
+    if (owner) {
+      if (changes[0] === 0) {
+        if (changes.some((count) => count !== 0)) invalidStorage();
+        return false;
+      }
+      for (const index of [0, 1, 2, 3, base, base + 1, base + 2, base + 3,
+        changes.length - 1]) {
+        if (changes[index] !== 1) invalidStorage();
+      }
+      return true;
+    }
     return changes[base + 1] === 1 && changes[base + 2] === 1 && changes[base + 3] === 1;
   } catch (error) { throw storageError(error); }
 }

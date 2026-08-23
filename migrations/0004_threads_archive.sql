@@ -65,13 +65,22 @@ END;
 CREATE TRIGGER threads_entries_validate_parent_update
 BEFORE UPDATE OF threads_post_id, kind, parent_entry_id ON threads_entries
 FOR EACH ROW
-WHEN NEW.kind = 'quote'
-  AND NOT EXISTS (
-    SELECT 1 FROM threads_entries parent
-    WHERE parent.id = NEW.parent_entry_id
-      AND parent.threads_post_id = NEW.threads_post_id
-      AND parent.kind IN ('root', 'author_reply')
-  )
+WHEN (NEW.kind = 'quote' AND NOT EXISTS (
+        SELECT 1 FROM threads_entries parent
+        WHERE parent.id = NEW.parent_entry_id
+          AND parent.threads_post_id = NEW.threads_post_id
+          AND parent.kind IN ('root', 'author_reply')
+      ))
+  OR (NEW.kind NOT IN ('root', 'author_reply') AND EXISTS (
+        SELECT 1 FROM threads_entries child
+        WHERE child.parent_entry_id = OLD.id AND child.kind = 'quote'
+      ))
+  OR (NEW.threads_post_id <> OLD.threads_post_id AND EXISTS (
+        SELECT 1 FROM threads_entries child
+        WHERE child.parent_entry_id = OLD.id
+          AND child.kind = 'quote'
+          AND child.threads_post_id <> NEW.threads_post_id
+      ))
 BEGIN
   SELECT RAISE(ABORT, 'threads_entry_invalid_parent');
 END;

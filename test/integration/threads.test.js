@@ -47,6 +47,14 @@ test("Threads entries enforce identity, quote parents, cascades, and OAuth singl
     () => assert.fail("cross-post update unexpectedly succeeded"),
     () => undefined,
   );
+  await db.prepare("UPDATE threads_entries SET threads_post_id = 'post-2' WHERE id = 'reply-a'").run().then(
+    () => assert.fail("referenced parent move unexpectedly succeeded"),
+    () => undefined,
+  );
+  await db.prepare("UPDATE threads_entries SET kind = 'quote', parent_entry_id = 'root' WHERE id = 'reply-b'").run().then(
+    () => assert.fail("referenced parent kind change unexpectedly succeeded"),
+    () => undefined,
+  );
   await assert.rejects(entry("nested-quote", "nested-media", "quote", "quote-a", "reply"));
   await db.prepare("UPDATE threads_entries SET parent_entry_id = 'quote-a' WHERE id = 'quote-b'").run().then(
     () => assert.fail("nested-quote update unexpectedly succeeded"),

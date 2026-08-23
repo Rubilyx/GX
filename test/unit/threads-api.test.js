@@ -24,6 +24,16 @@ const media = {
   alt_text: "Root image", root_post: { id: "root-1" }, replied_to: { id: "parent-1" },
 };
 
+const officialDebugData = {
+  app_id: "client", type: "USER", application: "Repo Atlas", user_id: "user-1",
+  data_access_expires_at: 5_100_000, expires_at: 5_184_100, issued_at: 100,
+  is_valid: true, scopes: THREADS_SCOPES,
+  granular_scopes: [
+    { scope: "threads_basic" },
+    { scope: "threads_profile_discovery", target_ids: ["author-1", "author-2"] },
+  ],
+};
+
 /** @param {string} code @param {number} status */
 const isAppError = (code, status) => (/** @type {unknown} */ error) =>
   error instanceof AppError && error.code === code && error.status === status;
@@ -39,7 +49,7 @@ test("uses the fixed scopes, Graph requests, bearer header, field projections, a
     if (url.pathname.endsWith("/oauth/access_token")) return Response.json({ access_token: "short", user_id: "user-1" });
     if (url.pathname.endsWith("/access_token")) return Response.json({ access_token: "long", token_type: "bearer", expires_in: 5_184_000 });
     if (url.pathname.endsWith("/refresh_access_token")) return Response.json({ access_token: "refreshed", token_type: "bearer", expires_in: 5_184_000 });
-    if (url.pathname.endsWith("/debug_token")) return Response.json({ data: { app_id: "client", user_id: "user-1", is_valid: true, expires_at: 5_184_100, scopes: THREADS_SCOPES } });
+    if (url.pathname.endsWith("/debug_token")) return Response.json({ data: officialDebugData });
     if (url.pathname.endsWith("/profile_lookup")) return Response.json({ id: "author-1", username: "meta", name: "Meta", threads_profile_picture_url: "https://scontent.cdninstagram.com/avatar" });
     if (url.pathname.endsWith("/profile_posts")) return Response.json({ data: [media], paging: { next: "https://graph.threads.net/v1.0/profile_posts?after=next-1" } });
     if (url.pathname.endsWith("/conversation")) return Response.json({ data: [{ ...media, id: "reply-1", media_type: "TEXT_POST", children: undefined, is_quote_post: false, quoted_post: undefined, root_post: { id: "root-1" }, replied_to: { id: "root-1" }, text: "reply" }] });
@@ -189,11 +199,19 @@ test("rejects malformed token, profile, page, and paging-next response shapes", 
 });
 
 test("rejects malformed access-token debugger shapes without exposing token data", async () => {
-  const valid = { app_id: "app-1", user_id: "user-1", is_valid: true, expires_at: 5_184_100, scopes: THREADS_SCOPES };
+  const valid = { ...officialDebugData, app_id: "app-1" };
   for (const data of [
     { ...valid, extra: true }, { ...valid, app_id: "" }, { ...valid, user_id: 1 },
     { ...valid, is_valid: "true" }, { ...valid, expires_at: 1.5 },
     { ...valid, scopes: "threads_basic" }, { ...valid, scopes: ["threads_basic", 1] },
+    { ...valid, type: "" }, { ...valid, application: "a".repeat(257) },
+    { ...valid, data_access_expires_at: -1 }, { ...valid, issued_at: 1.5 },
+    { ...valid, granular_scopes: {} },
+    { ...valid, granular_scopes: [{ scope: "threads_basic", extra: true }] },
+    { ...valid, granular_scopes: [{}] },
+    { ...valid, granular_scopes: [{ scope: "" }] },
+    { ...valid, granular_scopes: [{ scope: "threads_basic", target_ids: "author-1" }] },
+    { ...valid, granular_scopes: [{ scope: "threads_basic", target_ids: [""] }] },
   ]) await assert.rejects(
     debugThreadsAccessToken(async () => Response.json({ data }), { accessToken: "secret-debug-token", signal: AbortSignal.timeout(1_000) }),
     (error) => isAppError("threads_provider_protocol_error", 502)(error) && error instanceof Error && !error.message.includes("secret-debug-token"),
@@ -202,6 +220,15 @@ test("rejects malformed access-token debugger shapes without exposing token data
     debugThreadsAccessToken(async () => Response.json({ data: valid, extra: true }), { accessToken: "secret-debug-token", signal: AbortSignal.timeout(1_000) }),
     isAppError("threads_provider_protocol_error", 502),
   );
+});
+
+test("maps the full official debugger fixture while returning only trusted critical fields", async () => {
+  assert.deepEqual(await debugThreadsAccessToken(providerFixture({ threadsDebug: officialDebugData }), {
+    accessToken: "long-token", signal: AbortSignal.timeout(1_000),
+  }), {
+    appId: "client", userId: "user-1", isValid: true,
+    expiresAt: 5_184_100, scopes: THREADS_SCOPES,
+  });
 });
 
 test("accepts three short redirects, cancels their bodies, and rejects a fourth", async () => {

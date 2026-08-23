@@ -212,7 +212,16 @@ export function providerFixture(options = {}) {
   threadsMedia = { "root-1": threadsRootMedia },
   threadsStatus = 200,
   threadsRetryAfter,
-  threadsDebug = { app_id: "test-threads-app", user_id: "author-1", is_valid: true, expires_at: 2_000_000_000, scopes: ["threads_basic", "threads_profile_discovery", "threads_read_replies"] },
+  threadsDebug = {
+    app_id: "test-threads-app", type: "USER", application: "Repo Atlas",
+    user_id: "author-1", data_access_expires_at: 1_999_000_000,
+    expires_at: 2_000_000_000, issued_at: 1_900_000_000, is_valid: true,
+    scopes: ["threads_basic", "threads_profile_discovery", "threads_read_replies"],
+    granular_scopes: [
+      { scope: "threads_basic" },
+      { scope: "threads_profile_discovery", target_ids: ["author-1"] },
+    ],
+  },
   mediaBodies = { "fixture-avatar": "avatar", "fixture-image": "image" },
   calls,
   } = options;

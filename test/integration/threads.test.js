@@ -146,9 +146,9 @@ test("Threads OAuth credential callback stores ciphertext and decrypts only with
   })).accessToken, "long-token");
 });
 
-test("Threads OAuth credential accepts the provider boundary's maximum token length", async () => {
+test("Threads OAuth credential accepts an exact 256-byte UTF-8 token", async () => {
   const env = await harness.worker.getEnv();
-  const accessToken = "t".repeat(256);
+  const accessToken = "é".repeat(128);
   const base = providerFixture();
   const fetcher = async (/** @type {RequestInfo | URL} */ input, /** @type {RequestInit} */ init = {}) => {
     const request = new Request(input, init);
@@ -165,6 +165,53 @@ test("Threads OAuth credential accepts the provider boundary's maximum token len
     fetcher: async () => assert.fail("far-future credential must not refresh"),
     randomBytes: crypto.getRandomValues.bind(crypto),
   })).accessToken, accessToken);
+});
+
+test("Threads OAuth credential rejects multibyte tokens above 256 UTF-8 bytes before D1 write", async () => {
+  const env = await harness.worker.getEnv();
+  for (const accessToken of ["é".repeat(129), "가".repeat(256)]) {
+    const base = providerFixture();
+    const fetcher = async (/** @type {RequestInfo | URL} */ input, /** @type {RequestInit} */ init = {}) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/v1.0/access_token")
+        return Response.json({ access_token: accessToken, token_type: "bearer", expires_in: 5_184_000 });
+      if (url.pathname === "/v1.0/debug_token")
+        return Response.json({ data: { app_id: "test-threads-app", user_id: "author-1", is_valid: true, expires_at: 5_185_001, scopes: SCOPES } });
+      return base(request);
+    };
+    await assert.rejects(connect(env.PROD_DB, { fetcher }), isReconnect);
+    assert.equal(await env.PROD_DB.prepare(
+      "SELECT COUNT(*) AS count FROM threads_oauth_credentials",
+    ).first("count"), 0);
+  }
+});
+
+test("Threads OAuth credential rejects legacy plaintext above 256 UTF-8 bytes after decryption", async () => {
+  const env = await harness.worker.getEnv();
+  const db = env.PROD_DB;
+  await connect(db);
+  const encoder = new TextEncoder();
+  const material = await crypto.subtle.importKey(
+    "raw", Buffer.from(TOKEN_KEY, "base64"), "HKDF", false, ["deriveBits"],
+  );
+  const keyBytes = await crypto.subtle.deriveBits({
+    name: "HKDF", hash: "SHA-256", salt: encoder.encode("repo-atlas-threads-v1"),
+    info: encoder.encode("token-aes-v1"),
+  }, material, 256);
+  const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const nonce = new Uint8Array(12).fill(11);
+  const ciphertext = await crypto.subtle.encrypt({
+    name: "AES-GCM", iv: nonce, additionalData: encoder.encode("threads-access-token-v1"),
+  }, key, encoder.encode("é".repeat(129)));
+  await db.prepare(
+    "UPDATE threads_oauth_credentials SET encrypted_access_token = ?, token_nonce = ? WHERE singleton_id = 1",
+  ).bind(Buffer.from(ciphertext).toString("base64url"), Buffer.from(nonce).toString("base64url")).run();
+  await assert.rejects(getThreadsAccessToken(db, {
+    appId: "test-threads-app", tokenKey: TOKEN_KEY, nowSeconds: 1_001,
+    fetcher: async () => assert.fail("far-future credential must not refresh"),
+    randomBytes: crypto.getRandomValues.bind(crypto),
+  }), isReconnect);
 });
 
 test("Threads OAuth credential callback rejects debugger scope and identity mismatches without writing", async () => {
@@ -234,6 +281,35 @@ test("credential refresh rejects debugger mismatches without rotating stored byt
     } }),
     randomBytes: (length) => new Uint8Array(length).fill(4),
   }), { refreshed: false, reconnectRequired: true });
+  assert.deepEqual(
+    await db.prepare("SELECT * FROM threads_oauth_credentials WHERE singleton_id = 1").first(),
+    before,
+  );
+});
+
+test("credential refresh rejects an oversized UTF-8 token before debugger and D1 rotation", async () => {
+  const env = await harness.worker.getEnv();
+  const db = env.PROD_DB;
+  await connect(db, { expiresAt: 605_801, tokenByte: 3 });
+  const before = await db.prepare("SELECT * FROM threads_oauth_credentials WHERE singleton_id = 1").first();
+  const base = providerFixture();
+  let debugCalls = 0;
+  const fetcher = async (/** @type {RequestInfo | URL} */ input, /** @type {RequestInit} */ init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.pathname === "/v1.0/refresh_access_token")
+      return Response.json({ access_token: "é".repeat(129), token_type: "bearer", expires_in: 5_184_000 });
+    if (url.pathname === "/v1.0/debug_token") {
+      debugCalls += 1;
+      return Response.json({ data: {} });
+    }
+    return base(request);
+  };
+  assert.deepEqual(await refreshStoredThreadsCredential(db, {
+    appId: "test-threads-app", tokenKey: TOKEN_KEY, nowSeconds: 1_001,
+    fetcher, randomBytes: (length) => new Uint8Array(length).fill(4),
+  }), { refreshed: false, reconnectRequired: true });
+  assert.equal(debugCalls, 0);
   assert.deepEqual(
     await db.prepare("SELECT * FROM threads_oauth_credentials WHERE singleton_id = 1").first(),
     before,

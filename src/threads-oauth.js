@@ -12,6 +12,7 @@ const REFRESH_SECONDS = 604_800;
 const HKDF_SALT = encoder.encode("repo-atlas-threads-v1");
 const TOKEN_AAD = encoder.encode("threads-access-token-v1");
 const MAXIMUM_PROVIDER_VALUE = 256;
+const MAXIMUM_ACCESS_TOKEN_BYTES = 256;
 const MAXIMUM_CIPHERTEXT_VALUE = 384;
 
 /** @typedef {(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>} Fetcher */
@@ -29,6 +30,15 @@ function boundedString(value) {
   if (typeof value !== "string" || !value || value.length > MAXIMUM_PROVIDER_VALUE)
     throw new AppError("threads_reconnect_required", 401);
   return value;
+}
+
+/** @param {unknown} value */
+function boundedAccessToken(value) {
+  if (typeof value !== "string" || !value) throw new AppError("threads_reconnect_required", 401);
+  const bytes = encoder.encode(value);
+  if (bytes.byteLength > MAXIMUM_ACCESS_TOKEN_BYTES)
+    throw new AppError("threads_reconnect_required", 401);
+  return { value, bytes };
 }
 
 /** @param {unknown} value @param {number} maximum */
@@ -201,11 +211,11 @@ async function readState(cookieHeader, tokenKeyValue, nowSeconds) {
 
 /** @param {string} value @param {string} tokenKeyValue @param {RandomBytes | undefined} randomBytes */
 async function encryptAccessToken(value, tokenKeyValue, randomBytes) {
-  const accessToken = boundedString(value);
+  const accessToken = boundedAccessToken(value);
   const nonce = freshBytes(randomBytes, 12);
   const ciphertext = await crypto.subtle.encrypt({
     name: "AES-GCM", iv: nonce, additionalData: TOKEN_AAD,
-  }, await tokenKey(tokenKeyValue, ["encrypt"]), encoder.encode(accessToken));
+  }, await tokenKey(tokenKeyValue, ["encrypt"]), accessToken.bytes);
   return { encryptedAccessToken: toBase64Url(new Uint8Array(ciphertext)), tokenNonce: toBase64Url(nonce) };
 }
 
@@ -218,7 +228,7 @@ async function decryptAccessToken(credential, tokenKeyValue) {
   const plaintext = await crypto.subtle.decrypt({
     name: "AES-GCM", iv: nonce, additionalData: TOKEN_AAD,
   }, await tokenKey(tokenKeyValue, ["decrypt"]), ciphertext);
-  return boundedString(decoder.decode(plaintext));
+  return boundedAccessToken(decoder.decode(plaintext)).value;
 }
 
 /** @param {unknown} value @returns {Credential | null} */
@@ -309,12 +319,13 @@ export async function finishThreadsOAuth(db, input) {
     const longLived = await exchangeLongLivedThreadsToken(input.fetcher, {
       clientSecret: appSecret, accessToken: exchanged.accessToken, signal: input?.signal,
     });
+    const longAccessToken = boundedAccessToken(longLived.accessToken).value;
     const debug = await debugThreadsAccessToken(input.fetcher, {
-      accessToken: longLived.accessToken, signal: input?.signal,
+      accessToken: longAccessToken, signal: input?.signal,
     });
     if (!verifiedDebug(debug, appId, exchanged.userId, nowSeconds))
       oauthFailure("threads_reconnect_required", 401);
-    const encrypted = await encryptAccessToken(longLived.accessToken, input?.tokenKey, input?.randomBytes);
+    const encrypted = await encryptAccessToken(longAccessToken, input?.tokenKey, input?.randomBytes);
     const statement = db.prepare(
       `INSERT INTO threads_oauth_credentials
         (singleton_id, provider_user_id, encrypted_access_token, token_nonce, scopes_json,
@@ -356,7 +367,9 @@ export async function refreshStoredThreadsCredential(db, input) {
   let debug;
   try {
     refreshed = await refreshThreadsAccessToken(input.fetcher, { accessToken, signal: input?.signal });
-    debug = await debugThreadsAccessToken(input.fetcher, { accessToken: refreshed.accessToken, signal: input?.signal });
+    const refreshedAccessToken = boundedAccessToken(refreshed.accessToken).value;
+    debug = await debugThreadsAccessToken(input.fetcher, { accessToken: refreshedAccessToken, signal: input?.signal });
+    refreshed = { ...refreshed, accessToken: refreshedAccessToken };
   } catch (error) {
     if (error instanceof AppError && error.code === "threads_reconnect_required")
       return { refreshed: false, reconnectRequired: true };

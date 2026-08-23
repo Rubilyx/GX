@@ -261,10 +261,27 @@ export async function debugThreadsAccessToken(fetcher, input) {
     });
     if (!response.ok) throw await threadsProviderError(response);
     const root = exactKnownKeys(await readJsonAtMost(response, JSON_MAXIMUM_BYTES), ["data"]);
-    const raw = exactKnownKeys(root.data, ["app_id", "user_id", "is_valid", "expires_at", "scopes"]);
+    const raw = exactKnownKeys(root.data, [
+      "app_id", "type", "application", "user_id", "data_access_expires_at",
+      "expires_at", "issued_at", "is_valid", "scopes", "granular_scopes",
+    ]);
     if (typeof raw.is_valid !== "boolean" || !Number.isSafeInteger(raw.expires_at) ||
       /** @type {number} */ (raw.expires_at) <= 0 || !Array.isArray(raw.scopes) || raw.scopes.length > 64)
       protocolError();
+    for (const key of ["type", "application"]) if (Object.hasOwn(raw, key)) providerId(raw[key]);
+    for (const key of ["data_access_expires_at", "issued_at"]) if (Object.hasOwn(raw, key) &&
+      (!Number.isSafeInteger(raw[key]) || /** @type {number} */ (raw[key]) < 0)) protocolError();
+    if (Object.hasOwn(raw, "granular_scopes")) {
+      if (!Array.isArray(raw.granular_scopes) || raw.granular_scopes.length > 64) protocolError();
+      for (const value of raw.granular_scopes) {
+        const granular = exactKnownKeys(value, ["scope", "target_ids"]);
+        providerId(granular.scope);
+        if (Object.hasOwn(granular, "target_ids")) {
+          if (!Array.isArray(granular.target_ids) || granular.target_ids.length > 64) protocolError();
+          for (const targetId of granular.target_ids) providerId(targetId);
+        }
+      }
+    }
     return {
       appId: providerId(raw.app_id), userId: providerId(raw.user_id), isValid: raw.is_valid,
       expiresAt: /** @type {number} */ (raw.expires_at), scopes: raw.scopes.map(providerId),

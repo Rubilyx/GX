@@ -37,3 +37,20 @@ test("provider fixture accepts only exact official Threads and media boundaries"
     new Request("https://scontent.cdninstagram.com/fixture-image?unexpected=1"),
   ]) assert.equal((await fixture.fetch(request)).status, 502);
 });
+
+test("provider fixture debugger returns the full official metadata shape", async () => {
+  const response = await fixture.fetch(new Request(
+    "https://graph.threads.net/v1.0/debug_token?input_token=long-token",
+    { headers: { Authorization: "Bearer long-token" } },
+  ));
+  assert.deepEqual(await response.json(), { data: {
+    app_id: "test-threads-app", type: "USER", application: "Repo Atlas",
+    user_id: "author-1", data_access_expires_at: 1_999_000_000,
+    expires_at: 2_000_000_000, issued_at: 1_900_000_000, is_valid: true,
+    scopes: ["threads_basic", "threads_profile_discovery", "threads_read_replies"],
+    granular_scopes: [
+      { scope: "threads_basic" },
+      { scope: "threads_profile_discovery", target_ids: ["author-1"] },
+    ],
+  } });
+});

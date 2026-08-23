@@ -574,6 +574,90 @@ test("repository cards keep 20px inner spacing on every side", async () => {
   assertOwnRule(repositories, "repo-panel article", { padding: "20px" });
 });
 
+test("Note manager dialog and create form own the bounded viewport layout", async () => {
+  const repositories = await asset("repositories.css").then(parseCss);
+  assertOwnRule(repositories, "dialog[data-repository-dialog]", {
+    width: "min(44rem, calc(100vw - 2 * var(--space-4)))",
+    "max-height": "calc(100vh - 2 * var(--space-4))",
+    overflow: "auto",
+  });
+  assertOwnRule(repositories, "[data-repository-note-create-form]", {
+    display: "grid", gap: "var(--space-3)", "min-width": "0",
+  });
+});
+
+test("Note rows own unstyled dividers, readable bodies, metadata, and inline editing", async () => {
+  const repositories = await asset("repositories.css").then(parseCss);
+  assertOwnRule(repositories, ".repository-note-list", {
+    margin: "0", padding: "0", "list-style": "none",
+  });
+  assertOwnRule(repositories, ".repository-note-list > li", {
+    display: "grid", gap: "var(--space-2)", padding: "var(--space-4) 0",
+    "border-top": "1px solid var(--color-border-default)",
+  });
+  assertOwnRule(repositories, ".repository-note-body", {
+    "white-space": "pre-wrap", "overflow-wrap": "anywhere",
+  });
+  assertOwnRule(repositories, ".repository-note-meta", {
+    color: "var(--color-text-secondary)", "font-size": "var(--text-sm)",
+  });
+  assertOwnRule(repositories, "[data-repository-note-update-form]", {
+    display: "grid", gap: "var(--space-2)", "min-width": "0",
+  });
+  assertOwnRule(repositories, "[data-repository-note-update-form] textarea", {
+    "min-height": "8rem",
+  });
+});
+
+test("Note actions and numbered pagination own 44px targets and current styling", async () => {
+  const [core, repositories] = await Promise.all([
+    asset("core.css").then(parseCss), asset("repositories.css").then(parseCss),
+  ]);
+  const noteTarget = {
+    display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem",
+  };
+  for (const selector of [
+    "[data-repository-note-edit]", "[data-repository-note-delete]",
+    "[data-repository-note-edit-cancel]", ".repository-note-pagination > a",
+  ]) assertOwnRule(repositories, selector, noteTarget);
+  assertOwnRule(repositories, ".repository-note-pagination", {
+    display: "flex", "flex-wrap": "wrap", gap: "var(--space-2)",
+    "align-items": "center",
+  });
+  assertOwnRule(repositories, '.repository-note-pagination > a[aria-current="page"]', {
+    color: "#ffffff", "background-color": "var(--color-action-primary)",
+    "border-color": "var(--color-action-primary)",
+  });
+  const dangerHover = assertOwnRule(core, ".button-danger:hover", {
+    background: "var(--color-action-danger-hover)",
+    "border-color": "var(--color-action-danger-hover)",
+  });
+  assert.deepEqual([...dangerHover.declarations.keys()], ["background", "border-color"]);
+});
+
+test("Note empty, confirmation, live-state, and mobile containment rules are explicit", async () => {
+  const repositories = await asset("repositories.css").then(parseCss);
+  assertOwnRule(repositories, '[data-repository-note-list][data-empty="true"]', {
+    padding: "var(--space-4)", "background-color": "var(--color-bg-subtle)",
+    "border-radius": "var(--radius-control)",
+  });
+  assertOwnRule(repositories, "[data-repository-note-delete-excerpt]", {
+    "white-space": "pre-wrap", "overflow-wrap": "anywhere",
+  });
+  assertOwnRule(repositories, "[data-repository-note-status][data-state=\"success\"]", {
+    color: "var(--color-status-success)",
+  });
+  assertOwnRule(repositories, "[data-repository-note-status][data-state=\"error\"]", {
+    color: "var(--color-status-danger)",
+  });
+  assertOwnRule(repositories, "[data-repository-note-list-heading]", {
+    "overflow-wrap": "anywhere",
+  });
+  assertOwnRule(repositories, "main:has([data-repository-notes-heading])", {
+    "max-width": "100%", "overflow-x": "clip",
+  });
+});
+
 test("detail and status declarations belong to real rules in the required media subtree", async () => {
   const [tokens, core, login, repositories] = await Promise.all([
     asset("tokens.css").then(parseCss), asset("core.css").then(parseCss),

@@ -158,7 +158,9 @@ test("analysis failure cards keep one failure message and expose both actions", 
   await expect(card.locator('[data-analysis-status="error"]')).toHaveCount(0);
   await expect(detail).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
   await expect(memo).toHaveText("Note");
-  await expect(memo).toHaveAttribute("href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+  await expect(memo).toHaveAttribute(
+    "href", "/repositories/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee/notes",
+  );
 });
 
 test("repository card exposes separate detail and note actions", async ({ page }) => {
@@ -343,7 +345,7 @@ test("card delete dialog fits its confirmation content at the desktop reference 
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("heading", { name: "저장소를 삭제할까요?" })).toBeVisible();
   await expect(dialog.getByText("삭제 대상", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("저장소와 개인 메모가 영구 삭제되며 복구할 수 없습니다.", {
+  await expect(dialog.getByText("저장소와 모든 Note가 영구 삭제되며 복구할 수 없습니다.", {
     exact: true,
   })).toBeVisible();
   const cancel = dialog.getByRole("button", { name: "취소", exact: true });
@@ -401,65 +403,123 @@ test("card delete confirms, restores focus, and submits the protected native for
   await expect(page.getByText("저장소를 삭제했습니다.", { exact: true })).toBeVisible();
 });
 
-test("desktop repository link opens the native detail dialog and restores focus", async ({ page }) => {
-  test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
-  await loginAndSeed(page);
-  const opener = page.getByRole("link", { name: "Note", exact: true }).first();
-  await opener.focus();
-  await opener.click();
-  const dialog = page.locator("[data-repository-dialog]");
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("heading", { name: "OpenAI/example" })).toBeVisible();
-  await expect(dialog.locator("[data-repository-summary]")).toHaveValue(
-    "예제 저장소의 핵심 사용법을 보여준다.",
-  );
-  await expect(dialog.locator("[data-repository-detail-link]")).toHaveAttribute(
-    "href", /\/repositories\/[0-9a-f-]+$/,
-  );
-  await page.keyboard.press("Escape");
-  await expect(dialog).toBeHidden();
-  await expect(opener).toBeFocused();
+test.describe("desktop Note manager", () => {
+  test.describe.configure({ mode: "serial" });
+
+  test("creates, pages, edits, deletes, synchronizes the card, and restores focus", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await page.setViewportSize({ width: 1200, height: 900 });
+    await loginAndSeed(page);
+    const opener = page.locator("[data-repository-link]").first();
+    const card = opener.locator("xpath=ancestor::article");
+    const dialog = page.locator("[data-repository-dialog]");
+
+    await opener.focus();
+    await opener.click();
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "OpenAI/example Note" })).toBeVisible();
+    await expect(dialog.locator("[data-repository-notes-summary]"))
+      .toHaveText("예제 저장소의 핵심 사용법을 보여준다.");
+    const draft = dialog.getByRole("textbox", { name: "새 Note", exact: true });
+    await expect(draft).toBeFocused();
+
+    for (let number = 1; number <= 6; number += 1) {
+      await draft.fill(`Note ${number}`);
+      await dialog.getByRole("button", { name: "저장", exact: true }).click();
+      await expect(draft).toHaveValue("");
+      await expect(dialog.locator(".repository-note-body").first()).toHaveText(`Note ${number}`);
+    }
+
+    await expect(opener).toHaveText("Note 6");
+    await expect(card.locator("[data-repository-memo]")).toHaveText("Note 6");
+    await expect(dialog.locator("[data-repository-note-item]")).toHaveCount(5);
+    const pagination = dialog.locator("[data-repository-note-pagination]");
+    await expect(pagination.getByRole("link", { name: "1", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    await expect(pagination.getByRole("link", { name: "2", exact: true })).toBeVisible();
+
+    await pagination.getByRole("link", { name: "2", exact: true }).click();
+    await expect(pagination.getByRole("link", { name: "2", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    await expect(dialog.locator("[data-repository-note-item]")).toHaveCount(1);
+    let noteOne = dialog.locator("[data-repository-note-item]").filter({ hasText: "Note 1" });
+    await noteOne.getByRole("button", { name: "수정", exact: true }).click();
+    const edit = noteOne.getByRole("textbox", { name: "Note 수정", exact: true });
+    await expect(edit).toBeFocused();
+    await edit.fill("Note 1 수정");
+    await noteOne.getByRole("button", { name: "저장", exact: true }).click();
+
+    noteOne = dialog.locator("[data-repository-note-item]").filter({ hasText: "Note 1 수정" });
+    await expect(noteOne.locator(".repository-note-meta")).toContainText("작성");
+    await expect(noteOne.locator(".repository-note-meta")).toContainText("수정");
+    await expect(pagination.getByRole("link", { name: "2", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+
+    let deleteButton = noteOne.getByRole("button", { name: "삭제", exact: true });
+    await deleteButton.click();
+    const confirmation = page.locator("[data-repository-note-delete-dialog]");
+    await expect(confirmation).toBeVisible();
+    await expect(confirmation.locator("[data-repository-note-delete-date]"))
+      .toHaveText(/^\d{4}\.\d{2}\.\d{2}$/);
+    await expect(confirmation.locator("[data-repository-note-delete-excerpt]"))
+      .toHaveText("Note 1 수정");
+    await confirmation.getByRole("button", { name: "취소", exact: true }).click();
+    await expect(confirmation).toBeHidden();
+    await expect(deleteButton).toBeFocused();
+
+    await deleteButton.click();
+    await confirmation.getByRole("button", { name: "Note 삭제", exact: true }).click();
+    await expect(confirmation).toBeHidden();
+    await expect(dialog.locator("[data-repository-note-item]")).toHaveCount(5);
+    await expect(pagination.getByRole("link", { name: "1", exact: true }))
+      .toHaveAttribute("aria-current", "page");
+    await expect(dialog.locator("[data-repository-note-list-heading]")).toBeFocused();
+
+    const newest = dialog.locator("[data-repository-note-item]").filter({ hasText: "Note 6" });
+    await newest.getByRole("button", { name: "삭제", exact: true }).click();
+    await confirmation.getByRole("button", { name: "Note 삭제", exact: true }).click();
+    await expect(opener).toHaveText("Note 4");
+    await expect(card.locator("[data-repository-memo]")).toHaveText("Note 5");
+
+    await dialog.getByRole("button", { name: "닫기", exact: true }).click();
+    await expect(dialog).toBeHidden();
+    await expect(opener).toBeFocused();
+  });
+
+  test("failed create preserves the draft and re-enables retry", async ({ page }) => {
+    test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
+    await loginAndSeed(page);
+    await page.locator("[data-repository-link]").first().click();
+    const dialog = page.locator("[data-repository-dialog]");
+    const draft = dialog.getByRole("textbox", { name: "새 Note", exact: true });
+    const save = dialog.getByRole("button", { name: "저장", exact: true });
+    await draft.fill("재시도할 Note");
+    await page.route("**/repositories/*/notes", (route) => route.request().method() === "POST"
+      ? route.fulfill({
+        status: 503, contentType: "application/json",
+        body: JSON.stringify({ errorCode: "storage_unavailable" }),
+      }) : route.continue());
+
+    await save.click();
+    await expect(dialog.getByRole("status")).toHaveText("저장 공간을 사용할 수 없습니다. 다시 시도하세요.");
+    await expect(draft).toHaveValue("재시도할 Note");
+    await expect(save).toBeEnabled();
+    await page.unroute("**/repositories/*/notes");
+    await save.click();
+    await expect(dialog.locator(".repository-note-body").first()).toHaveText("재시도할 Note");
+  });
 });
 
-test("desktop memo dialog saves an editable personal note and stays compact", async ({ page }) => {
-  test.skip(["mobile-chrome", "mobile-safari", "chromium-no-js"].includes(test.info().project.name));
-  await page.setViewportSize({ width: 1200, height: 900 });
+test("mobile Note action opens the native Note page without a modal", async ({ page }) => {
+  test.skip(!["mobile-chrome", "mobile-safari"].includes(test.info().project.name));
   await loginAndSeed(page);
 
-  const cardMemo = page.locator("[data-repository-memo]").first();
-  await expect(cardMemo).toHaveCount(0);
+  await page.locator("[data-repository-link]").first().click();
 
-  const noteAction = page.locator("[data-repository-link]").first();
-  await expect(noteAction).toHaveText("Note");
-  await noteAction.click();
-  const dialog = page.locator("[data-repository-dialog]");
-  const note = dialog.getByRole("textbox", { name: "개인 메모", exact: true });
-  await note.fill("다시 확인할 개인 메모");
-  const saveResponse = page.waitForResponse((response) =>
-    /\/repositories\/[0-9a-f-]+\/note$/.test(new URL(response.url()).pathname));
-  await dialog.getByRole("button", { name: "저장", exact: true }).click();
-
-  expect((await saveResponse).status()).toBe(200);
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("status")).toHaveText("저장 완료");
-  await expect(cardMemo).toHaveText("다시 확인할 개인 메모");
-  await expect(noteAction).toHaveText("Note 1");
-  const box = await dialog.boundingBox();
-  expect(box).not.toBeNull();
-  expect(box?.height).toBeLessThan(868);
-
-  await dialog.getByRole("button", { name: "닫기", exact: true }).click();
-  await page.getByRole("link", { name: "Note 1", exact: true }).first().click();
-  await expect(dialog.getByRole("textbox", { name: "개인 메모", exact: true }))
-    .toHaveValue("다시 확인할 개인 메모");
-
-  await note.fill("");
-  const clearResponse = page.waitForResponse((response) =>
-    /\/repositories\/[0-9a-f-]+\/note$/.test(new URL(response.url()).pathname));
-  await dialog.getByRole("button", { name: "저장", exact: true }).click();
-  expect((await clearResponse).status()).toBe(200);
-  await expect(cardMemo).toHaveCount(0);
-  await expect(noteAction).toHaveText("Note");
+  await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+\/notes$/);
+  await expect(page.getByRole("heading", { name: "OpenAI/example Note" })).toBeVisible();
+  await expect(page.locator("[data-repository-dialog]:visible")).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
 test("activity button refreshes only pushed activity in place", async ({ page, harness }) => {
@@ -595,19 +655,18 @@ test("capture partial success still opens the saved detail", async ({ page, harn
 
 test("detail edits, refreshes replacement analysis, deletes, and logs out through native forms", async ({ page }) => {
   await loginAndSeed(page);
-  const href = await page.locator("[data-repository-link]").first().getAttribute("href");
+  const href = await page.getByRole("link", { name: "자세히 보기", exact: true })
+    .first().getAttribute("href");
   if (!href) throw new Error("detail_href_missing");
   await page.goto(href);
-  await page.getByRole("textbox", { name: "개인 메모", exact: true }).fill("보관할 메모");
   await page.getByLabel("주 분류", { exact: true }).selectOption("Backend");
   await page.getByLabel("태그 (쉼표로 구분)").fill("example, node-js");
   await page.getByRole("button", { name: "변경 저장" }).click();
-  await expect(page.getByRole("status")).toHaveText("분류와 메모를 저장했습니다.");
+  await expect(page.getByRole("status")).toHaveText("분류를 저장했습니다.");
   await page.getByLabel(/AI 요약, 주 분류와 태그가 새 분석 결과로 교체됨/).check();
   await page.getByRole("button", { name: "GitHub 정보와 분석 새로고침" }).click();
   await expect(page.getByRole("status")).toHaveText("GitHub 정보와 분석을 새로고쳤습니다.");
-  await expect(page.getByRole("textbox", { name: "개인 메모", exact: true })).toHaveValue("보관할 메모");
-  await page.getByLabel(/이 저장소와 개인 메모를 영구 삭제함/).check();
+  await page.getByLabel(/이 저장소와 모든 Note를 영구 삭제함/).check();
   await page.getByRole("button", { name: "저장소 삭제" }).click();
   await expect(page.getByText("저장소를 삭제했습니다.", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "로그아웃" }).click();

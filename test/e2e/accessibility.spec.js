@@ -12,15 +12,33 @@ async function expectNoBlockingAxe(page) {
   expect(results.violations.filter(({ impact }) => impact === "serious" || impact === "critical")).toEqual([]);
 }
 
-test("index and detail have no serious or critical axe violations", async ({ page }) => {
+/** @param {import("@playwright/test").Page} page @param {import("@playwright/test").Locator} target */
+async function tabTo(page, target) {
+  const focusableCount = await page.locator("a[href], button, input, select, textarea").count();
+  for (let count = 0; count < focusableCount * 2 && !await target.evaluate(
+    (element) => document.activeElement === element,
+  ); count += 1) await page.keyboard.press("Tab");
+  await expect(target).toBeFocused();
+}
+
+test("index, Note manager, Note confirmation, and repository confirmation pass axe", async ({ page }) => {
   await expectNoBlockingAxe(page);
   await page.locator("[data-repository-link]").first().click();
   if (["mobile-chrome", "mobile-safari"].includes(test.info().project.name)) {
-    await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+/);
+    await expect(page).toHaveURL(/\/repositories\/[0-9a-f-]+\/notes$/);
+    await expectNoBlockingAxe(page);
   } else {
-    await expect(page.getByRole("dialog")).toBeVisible();
+    const manager = page.locator("[data-repository-dialog]");
+    await expect(manager).toBeVisible();
+    await expectNoBlockingAxe(page);
+    await manager.getByRole("textbox", { name: "새 Note", exact: true }).fill("삭제 확인용 Note");
+    await manager.getByRole("button", { name: "저장", exact: true }).click();
+    await manager.getByRole("button", { name: "삭제", exact: true }).click();
+    const confirmation = page.locator("[data-repository-note-delete-dialog]");
+    await expect(confirmation).toBeVisible();
+    await expectNoBlockingAxe(page);
+    await confirmation.getByRole("button", { name: "취소", exact: true }).click();
   }
-  await expectNoBlockingAxe(page);
   await page.goto("/");
   await page.getByRole("link", { name: "OpenAI/example 삭제", exact: true }).click();
   await expect(page.locator("[data-repository-delete-dialog]")).toBeVisible();
@@ -48,6 +66,40 @@ test("keyboard focus is visible and native dialog stays focused then returns it"
   })).toBe(true);
   await page.keyboard.press("Escape");
   await expect(opener).toBeFocused();
+});
+
+test("keyboard-only Note create, edit, and cancel keeps content and focus", async ({ page }) => {
+  test.skip(!["chromium", "firefox", "chrome", "edge"].includes(test.info().project.name));
+  const opener = page.locator("[data-repository-link]").first();
+  await page.keyboard.press("Tab");
+  await tabTo(page, opener);
+  await page.keyboard.press("Enter");
+  const dialog = page.locator("[data-repository-dialog]");
+  const draft = dialog.getByRole("textbox", { name: "새 Note", exact: true });
+  await expect(draft).toBeFocused();
+  await page.keyboard.type("키보드 Note");
+  await page.keyboard.press("Tab");
+  const create = dialog.getByRole("button", { name: "저장", exact: true });
+  await expect(create).toBeFocused();
+  await page.keyboard.press("Enter");
+  const item = dialog.locator("[data-repository-note-item]").filter({ hasText: "키보드 Note" });
+  await expect(item.locator(".repository-note-body")).toHaveText("키보드 Note");
+
+  const edit = item.getByRole("button", { name: "수정", exact: true });
+  await tabTo(page, edit);
+  await page.keyboard.press("Enter");
+  const textarea = item.getByRole("textbox", { name: "Note 수정", exact: true });
+  await expect(textarea).toBeFocused();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("취소할 수정");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  const cancel = item.getByRole("button", { name: "취소", exact: true });
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  await expect(item.locator(".repository-note-body")).toHaveText("키보드 Note");
+  await expect(edit).toBeFocused();
 });
 
 test("WebKit keeps dialog focus trapped and returns it after a pointer open", async ({ page }) => {

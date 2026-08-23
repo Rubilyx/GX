@@ -32,23 +32,35 @@ function noteRow(row) {
   };
 }
 
-/** @param {any} row */
-function presentRow(row) {
-  if (row === null) return false;
-  if (!row || row.present !== 1) invalidStorage();
-  return true;
-}
-
-/** @param {any} row */
-function countRow(row) {
-  if (!row || !Number.isInteger(row.count) || row.count < 0) invalidStorage();
-  return row.count;
-}
-
-/** @param {any} result */
-function noteRows(result) {
+/** @param {any} result @param {string} repositoryId @param {number} pageRequest */
+function notePage(result, repositoryId, pageRequest) {
   if (!result || result.success !== true || !Array.isArray(result.results)) invalidStorage();
-  return result.results.map(noteRow);
+  if (result.results.length === 0) return null;
+  const [{ total, page }] = result.results;
+  if (!Number.isSafeInteger(total) || total < 0 || !Number.isSafeInteger(page) || page < 1)
+    invalidStorage();
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (page !== Math.min(pageRequest, totalPages) || result.results.some((/** @type {any} */ row) =>
+    row.parent_repository_id !== repositoryId || row.total !== total || row.page !== page))
+    invalidStorage();
+  if (total === 0) {
+    const [row] = result.results;
+    if (result.results.length !== 1 ||
+      [row.id, row.repository_id, row.body, row.created_at, row.updated_at]
+        .some((value) => value !== null)) invalidStorage();
+    return { notes: [], page, totalPages, total };
+  }
+  const expectedRows = Math.min(PAGE_SIZE, total - (page - 1) * PAGE_SIZE);
+  if (result.results.length !== expectedRows) invalidStorage();
+  const notes = result.results.map(noteRow);
+  if (notes.some((/** @type {any} */ note) => note.repositoryId !== repositoryId)) invalidStorage();
+  for (let index = 1; index < notes.length; index += 1) {
+    const previous = notes[index - 1];
+    const current = notes[index];
+    if (previous.createdAt < current.createdAt ||
+      (previous.createdAt === current.createdAt && previous.id <= current.id)) invalidStorage();
+  }
+  return { notes, page, totalPages, total };
 }
 
 /** @param {any} result */
@@ -63,23 +75,48 @@ function mutationChanges(result) {
 export async function listRepositoryNotes(db, repositoryId, requestedPage) {
   const pageRequest = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
   try {
-    const present = presentRow(await db.prepare(
-      "SELECT 1 AS present FROM repositories WHERE id = ?",
-    ).bind(repositoryId).first());
-    if (!present) return null;
-    const total = countRow(await db.prepare(
-      "SELECT COUNT(*) AS count FROM repository_notes WHERE repository_id = ?",
-    ).bind(repositoryId).first());
-    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-    const page = Math.min(pageRequest, totalPages);
-    const rows = noteRows(await db.prepare(
-      `SELECT id, repository_id, body, created_at, updated_at
-       FROM repository_notes
-       WHERE repository_id = ?
-       ORDER BY created_at DESC, id DESC
-       LIMIT ? OFFSET ?`,
-    ).bind(repositoryId, PAGE_SIZE, (page - 1) * PAGE_SIZE).all());
-    return { notes: rows, page, totalPages, total };
+    const result = await db.prepare(
+      `WITH parent_repository AS (
+        SELECT id FROM repositories WHERE id = ?
+      ),
+      ordered_notes AS (
+        SELECT
+          note_rows.id,
+          note_rows.repository_id,
+          note_rows.body,
+          note_rows.created_at,
+          note_rows.updated_at,
+          COUNT(*) OVER () AS total,
+          ROW_NUMBER() OVER (
+            ORDER BY note_rows.created_at DESC, note_rows.id DESC
+          ) AS row_number
+        FROM repository_notes AS note_rows
+        INNER JOIN parent_repository AS parent
+          ON parent.id = note_rows.repository_id
+      ),
+      page_metadata AS (
+        SELECT
+          COALESCE(MAX(total), 0) AS total,
+          min(?, max(1, CAST((COALESCE(MAX(total), 0) + ? - 1) / ? AS INTEGER))) AS page
+        FROM ordered_notes
+      )
+      SELECT
+        parent.id AS parent_repository_id,
+        page_metadata.total,
+        page_metadata.page,
+        ordered_notes.id,
+        ordered_notes.repository_id,
+        ordered_notes.body,
+        ordered_notes.created_at,
+        ordered_notes.updated_at
+      FROM parent_repository AS parent
+      CROSS JOIN page_metadata
+      LEFT JOIN ordered_notes
+        ON ordered_notes.row_number > (page_metadata.page - 1) * ?
+       AND ordered_notes.row_number <= page_metadata.page * ?
+      ORDER BY ordered_notes.created_at DESC, ordered_notes.id DESC`,
+    ).bind(repositoryId, pageRequest, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE).all();
+    return notePage(result, repositoryId, pageRequest);
   } catch (error) { throw storageError(error); }
 }
 

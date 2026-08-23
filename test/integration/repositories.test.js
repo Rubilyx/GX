@@ -67,6 +67,17 @@ function d1Stub(options = {}) {
   };
 }
 
+/** @param {any} db */
+function withoutLegacyRepositoryReads(db) {
+  return {
+    prepare(/** @type {string} */ sql) {
+      if (/^\s*SELECT\b/i.test(sql) && (/\br\.\*/i.test(sql) || /\bpersonal_note\b/i.test(sql)))
+        throw new Error("legacy repository column read");
+      return db.prepare(sql);
+    },
+  };
+}
+
 /** @param {Promise<any>} promise */
 async function rejectsStorage(promise) {
   await assert.rejects(
@@ -476,6 +487,28 @@ test("Note summary joins use newest timestamp then id and omit legacy personal n
     { noteCount: 0, latestNote: null },
   );
   assert.equal(Object.hasOwn(byId.get("repo-second"), "personalNote"), false);
+});
+
+test("repository detail and list reads never request the legacy personal-note column", async () => {
+  const env = await harness.worker.getEnv();
+  await seedRepository(env.PROD_DB, {
+    id: "repo-notes", githubId: "notes", personalNote: "legacy-only poison",
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-current", repositoryId: "repo-notes", body: "current searchable Note",
+    createdAt: 10, updatedAt: 10,
+  });
+  const guardedDb = withoutLegacyRepositoryReads(env.PROD_DB);
+
+  const detail = await getRepository(guardedDb, "repo-notes");
+  assert.ok(detail);
+  assert.deepEqual({ noteCount: detail.noteCount, latestNote: detail.latestNote }, {
+    noteCount: 1, latestNote: "current searchable Note",
+  });
+  const listed = await listRepositories(guardedDb, {
+    q: "current searchable", category: "", tag: "", page: 1,
+  });
+  assert.deepEqual(listed.repositories.map((/** @type {any} */ repository) => repository.id), ["repo-notes"]);
 });
 
 test("Note body search finds older Notes and escapes literal wildcards", async () => {
@@ -906,6 +939,17 @@ test("repository notes migration leaves legacy personal notes behind and cascade
     await env.PROD_DB.prepare("PRAGMA foreign_key_list(repository_notes)").all()
       .then((result) => result.results.map((row) => [row.table, row.from, row.on_delete])),
     [["repositories", "repository_id", "CASCADE"]],
+  );
+  const indexes = await env.PROD_DB.prepare("PRAGMA index_list(repository_notes)").all();
+  assert.equal(indexes.results.some((row) =>
+    row.name === "repository_notes_repository_order_idx" && row.unique === 0), true);
+  assert.deepEqual(
+    await env.PROD_DB.prepare(
+      "PRAGMA index_xinfo(repository_notes_repository_order_idx)",
+    ).all().then((result) => result.results
+      .filter((row) => row.key === 1)
+      .map((row) => [row.name, row.desc])),
+    [["repository_id", 0], ["created_at", 1], ["id", 1]],
   );
 
   await env.PROD_DB.prepare(

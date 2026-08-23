@@ -52,11 +52,21 @@ test("assigns increasing creation times to same-second Notes", async () => {
 test("lists deterministic Notes in five-row pages and clamps oversized pages", async () => {
   const env = await harness.worker.getEnv();
   await seedRepository(env.PROD_DB);
-  for (let index = 1; index <= 6; index += 1) {
+  for (let index = 1; index <= 5; index += 1) {
     await seedRepositoryNote(env.PROD_DB, {
       id: `note-${index}`, body: `Note ${index}`, createdAt: index, updatedAt: index,
     });
   }
+  assert.deepEqual(await listRepositoryNotes(env.PROD_DB, "repo-1", 99), {
+    notes: [5, 4, 3, 2, 1].map((index) => ({
+      id: `note-${index}`, repositoryId: "repo-1", body: `Note ${index}`,
+      createdAt: index, updatedAt: index,
+    })),
+    page: 1, totalPages: 1, total: 5,
+  });
+  await seedRepositoryNote(env.PROD_DB, {
+    id: "note-6", body: "Note 6", createdAt: 6, updatedAt: 6,
+  });
   assert.deepEqual(await listRepositoryNotes(env.PROD_DB, "repo-1", 1), {
     notes: [6, 5, 4, 3, 2].map((index) => ({
       id: `note-${index}`, repositoryId: "repo-1", body: `Note ${index}`,
@@ -64,10 +74,12 @@ test("lists deterministic Notes in five-row pages and clamps oversized pages", a
     })),
     page: 1, totalPages: 2, total: 6,
   });
-  assert.deepEqual(await listRepositoryNotes(env.PROD_DB, "repo-1", 99), {
+  const lastPage = {
     notes: [{ id: "note-1", repositoryId: "repo-1", body: "Note 1", createdAt: 1, updatedAt: 1 }],
     page: 2, totalPages: 2, total: 6,
-  });
+  };
+  assert.deepEqual(await listRepositoryNotes(env.PROD_DB, "repo-1", 2), lastPage);
+  assert.deepEqual(await listRepositoryNotes(env.PROD_DB, "repo-1", 99), lastPage);
 });
 
 test("updates a repository-scoped Note without changing its creation time", async () => {
@@ -133,6 +145,64 @@ function d1Stub(options = {}) {
   };
 }
 
+/** @param {Record<string, any>} [overrides] */
+function storedPageRow(overrides = {}) {
+  return {
+    parent_repository_id: "repo-1", total: 1, page: 1,
+    id: "note-1", repository_id: "repo-1", body: "Note body",
+    created_at: 1, updated_at: 1,
+    ...overrides,
+  };
+}
+
+test("returns a clamped six-Note boundary page from one D1 snapshot", async () => {
+  const db = d1Stub({
+    all: [{ success: true, results: [storedPageRow({
+      total: 6, page: 2, id: "note-oldest", body: "Oldest Note",
+    })] }],
+  });
+  assert.deepEqual(await listRepositoryNotes(db, "repo-1", 99), {
+    notes: [{
+      id: "note-oldest", repositoryId: "repo-1", body: "Oldest Note",
+      createdAt: 1, updatedAt: 1,
+    }],
+    page: 2, totalPages: 2, total: 6,
+  });
+});
+
+test("rejects Note page rows from another repository", async () => {
+  await assert.rejects(
+    listRepositoryNotes(d1Stub({
+      all: [{ success: true, results: [storedPageRow({ repository_id: "repo-2" })] }],
+    }), "repo-1", 1),
+    (error) => error instanceof Error && "code" in error && "status" in error &&
+      error.code === "storage_unavailable" && error.status === 503,
+  );
+});
+
+test("rejects Note page rows outside stable newest-first order", async () => {
+  await assert.rejects(
+    listRepositoryNotes(d1Stub({
+      all: [{ success: true, results: [
+        storedPageRow({ total: 2, id: "note-old", created_at: 1, updated_at: 1 }),
+        storedPageRow({ total: 2, id: "note-new", created_at: 2, updated_at: 2 }),
+      ] }],
+    }), "repo-1", 1),
+    (error) => error instanceof Error && "code" in error && "status" in error &&
+      error.code === "storage_unavailable" && error.status === 503,
+  );
+});
+
+test("rejects Note page cardinality inconsistent with its total", async () => {
+  await assert.rejects(
+    listRepositoryNotes(d1Stub({
+      all: [{ success: true, results: [storedPageRow({ total: 6 })] }],
+    }), "repo-1", 1),
+    (error) => error instanceof Error && "code" in error && "status" in error &&
+      error.code === "storage_unavailable" && error.status === 503,
+  );
+});
+
 test("maps failed or malformed D1 responses to storage_unavailable", async () => {
   await assert.rejects(
     listRepositoryNotes(d1Stub({ first: [{}] }), "repo-1", 1),
@@ -158,10 +228,7 @@ test("maps failed or malformed D1 responses to storage_unavailable", async () =>
   for (const body of ["", " padded ", "cafe\u0301", "x".repeat(4001)]) {
     await assert.rejects(
       listRepositoryNotes(d1Stub({
-        first: [{ present: 1 }, { count: 1 }],
-        all: [{ success: true, results: [{
-          id: "note-1", repository_id: "repo-1", body, created_at: 1, updated_at: 1,
-        }] }],
+        all: [{ success: true, results: [storedPageRow({ body })] }],
       }), "repo-1", 1),
       (error) => error instanceof Error && "code" in error && "status" in error &&
         error.code === "storage_unavailable" && error.status === 503,

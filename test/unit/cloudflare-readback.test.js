@@ -7,6 +7,8 @@ import {
 } from "../../scripts/cloudflare-readback.mjs";
 
 const VERSION_ID = "095f00a7-23a7-43b7-a227-e4c97cab5f22";
+const QUEUE_ID = "0123456789abcdef0123456789abcdef";
+const CONSUMER_ID = "fedcba9876543210fedcba9876543210";
 const D1_ID = "5e031f7f-52cc-495a-9cd9-e080bd0090ac";
 const REQUIRED_SECRETS = [
   "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
@@ -101,6 +103,7 @@ test("version normalization rejects unknown, duplicate, extra, malformed, and va
     { resources: { bindings: version().resources.bindings.map((row) => row.name === "THREADS_MEDIA" ? { ...row, bucket_name: "gx-wrong" } : row) } },
     { resources: { bindings: version().resources.bindings.map((row) => row.name === "THREADS_APP_ID" ? { ...row, text: "000" } : row) } },
     { resources: { bindings: {} } },
+    { id: QUEUE_ID },
   ];
   for (const value of cases)
     assert.throws(() => normalizeVersionBindings(version(value), exactOptions, "version_invalid"), /version_invalid/);
@@ -145,18 +148,22 @@ test("accepts one exact raw schedule envelope and rejects extra schedules or mal
 });
 
 test("resolves exactly one API-shaped Queue row and rejects duplicate, extra, and malformed rows", () => {
-  const queue = { queue_id: VERSION_ID, queue_name: "gx-threads-media", consumers: [], producers: [] };
+  const queue = { queue_id: QUEUE_ID.toUpperCase(), queue_name: "gx-threads-media", consumers: [], producers: [] };
   assert.equal(queueIdFromReadback(envelope([queue], { result_info: { page: 1, per_page: 20 } }),
-    "gx-threads-media", "queue_invalid"), VERSION_ID);
+    "gx-threads-media", "queue_invalid"), QUEUE_ID);
   for (const value of [
     envelope([]), envelope([queue, { ...queue }]), envelope([{ ...queue, queue_name: "gx-wrong" }]),
-    envelope([{ ...queue, queue_id: "not-an-id" }]), envelope([queue], { errors: [{}] }),
+    envelope([{ ...queue, queue_id: "0".repeat(31) }]),
+    envelope([{ ...queue, queue_id: "0".repeat(33) }]),
+    envelope([{ ...queue, queue_id: VERSION_ID }]),
+    envelope([{ ...queue, queue_id: `${"0".repeat(31)}g` }]),
+    envelope([queue], { errors: [{}] }),
   ]) assert.throws(() => queueIdFromReadback(value, "gx-threads-media", "queue_invalid"), /queue_invalid/);
 });
 
 test("validates raw script_name consumers and treats only an empty DLQ string as none", () => {
   const base = {
-    consumer_id: VERSION_ID,
+    consumer_id: CONSUMER_ID.toUpperCase(),
     type: "worker",
     script_name: "gx",
     dead_letter_queue: "",
@@ -177,9 +184,12 @@ test("validates raw script_name consumers and treats only an empty DLQ string as
     [{ ...base, dead_letter_queue: null }],
     [{ ...base, settings: { ...base.settings, batch_size: 2 } }],
     [{ ...base, settings: { ...base.settings, max_retries: 1 } }],
-    [base, { ...base, consumer_id: "195f00a7-23a7-43b7-a227-e4c97cab5f22" }],
+    [base, { ...base, consumer_id: "1".repeat(32) }],
     [{ ...base, type: "http_pull" }],
   ];
   for (const result of cases)
     assert.throws(() => assertQueueConsumerReadback(envelope(result), expected, "consumer_invalid"), /consumer_invalid/);
+  for (const consumerId of ["0".repeat(31), "0".repeat(33), VERSION_ID, `${"0".repeat(31)}g`])
+    assert.throws(() => assertQueueConsumerReadback(envelope([{ ...base, consumer_id: consumerId }]),
+      expected, "consumer_invalid"), /consumer_invalid/);
 });

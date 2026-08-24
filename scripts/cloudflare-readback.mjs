@@ -1,4 +1,5 @@
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const WORKER_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const QUEUE_RESOURCE_ID = /^[0-9a-f]{32}$/i;
 const RELEASE_ID = /^[0-9a-f]{40}$/;
 const MODEL = /^gpt-5\.6-terra(?:-[a-z0-9._-]*[a-z0-9])?$/;
 const ALLOWED_BINDING_TYPES = new Set([
@@ -53,7 +54,7 @@ export function normalizeVersionBindings(rawVersion, options, errorCode) {
   const version = /** @type {Record<string, any>} */ (rawVersion);
   const config = options.config;
   const bindings = version.resources?.bindings;
-  if (!UUID.test(version.id) || !Array.isArray(bindings) ||
+  if (!WORKER_VERSION_ID.test(version.id) || !Array.isArray(bindings) ||
       bindings.some((binding) => !plainObject(binding) || !ALLOWED_BINDING_TYPES.has(binding.type)))
     invalid(errorCode);
 
@@ -180,8 +181,8 @@ export function assertScheduleReadback(envelope, expectedCron, errorCode) {
 export function queueIdFromReadback(envelope, expectedQueue, errorCode) {
   const result = cloudflareResult(envelope, errorCode);
   if (!Array.isArray(result) || result.length !== 1 || !plainObject(result[0]) ||
-      result[0].queue_name !== expectedQueue || !UUID.test(result[0].queue_id)) invalid(errorCode);
-  return result[0].queue_id;
+      result[0].queue_name !== expectedQueue || !QUEUE_RESOURCE_ID.test(result[0].queue_id)) invalid(errorCode);
+  return result[0].queue_id.toLowerCase();
 }
 
 /**
@@ -196,7 +197,7 @@ export function assertQueueConsumerReadback(envelope, expected, errorCode) {
   const consumer = result[0];
   const settings = consumer.settings;
   const expectedDlq = expected.dead_letter_queue ?? "";
-  if (!UUID.test(consumer.consumer_id) || consumer.type !== "worker" || consumer.script_name !== "gx" ||
+  if (!QUEUE_RESOURCE_ID.test(consumer.consumer_id) || consumer.type !== "worker" || consumer.script_name !== "gx" ||
       typeof consumer.dead_letter_queue !== "string" || consumer.dead_letter_queue !== expectedDlq ||
       !plainObject(settings) || !Number.isSafeInteger(settings.batch_size) ||
       settings.batch_size !== expected.max_batch_size || !Number.isSafeInteger(settings.max_retries) ||

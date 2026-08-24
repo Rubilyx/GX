@@ -33,9 +33,10 @@ const threadEntry = {
   links: [{ url: "https://safe.example/path", source: "body", ordinal: 0 }],
   media: [
     { id: "image-1", sourceMediaId: "image-source", kind: "image", ordinal: 0, altText: "저장된 이미지", status: "ready" },
-    { id: "video-1", sourceMediaId: "video-source", kind: "video", ordinal: 1, altText: null, status: "ready" },
+    { id: "video-1", sourceMediaId: "video-source", kind: "video", ordinal: 1, altText: "동영상 <script>", status: "ready" },
     { id: "thumbnail-1", sourceMediaId: "video-source", kind: "video_thumbnail", ordinal: 2, altText: null, status: "ready" },
     { id: "failed-1", sourceMediaId: "failed-source", kind: "image", ordinal: 3, altText: null, status: "error" },
+    { id: "video-fallback", sourceMediaId: "fallback-source", kind: "video", ordinal: 4, altText: null, status: "ready" },
   ],
   quote: null,
 };
@@ -53,7 +54,7 @@ const threadArchive = {
     kind: "author_reply", parentEntryId: null, text: `답글 ${index + 1}`,
     publishedAt: `2026-08-23T15:3${index + 1}:00.000Z`, media: [], links: [], quote: null,
   })),
-  replyCount: 12, mediaProgress: { expected: 4, ready: 3, failed: 1, pending: 0 },
+  replyCount: 12, mediaProgress: { expected: 5, ready: 4, failed: 1, pending: 0 },
   syncGeneration: 2, createdAt: 1, updatedAt: 2,
 };
 
@@ -391,6 +392,7 @@ test("repository document renders canonical GitHub URL and all native mutation f
   assert.match(html, /<h2 id="edit-heading">분류 편집<\/h2>/);
   assert.match(html,
     /<a href="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes">Note 관리<\/a>/);
+  assert.match(html, /<nav class="app-navigation" aria-label="주요 메뉴"><a href="\/" aria-current="page">Repository<\/a><a href="\/threads">Threads<\/a><\/nav>/);
   assert.doesNotMatch(html, /personalNote|personal-note|개인 메모/);
   assert.match(html, /<dt>GitHub ID<\/dt><dd>42&lt;script&gt;<\/dd>/);
   assert.match(html, /<dt>README SHA<\/dt><dd>sha&lt;script&gt;<\/dd>/);
@@ -430,6 +432,7 @@ test("repository Note page renders escaped CRUD forms, Seoul dates, and numbered
 
   assert.match(html,
     /<h1 data-repository-notes-heading>a\/b&lt;script&gt;\/x\?y&quot;&gt;&lt;img src=x&gt; Note<\/h1>/);
+  assert.match(html, /<nav class="app-navigation" aria-label="주요 메뉴"><a href="\/" aria-current="page">Repository<\/a><a href="\/threads">Threads<\/a><\/nav>/);
   assert.match(html, /<p data-repository-notes-summary>&lt;b&gt;summary&lt;\/b&gt;<\/p>/);
   assert.match(html,
     /<form method="post" action="\/repositories\/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\/notes" data-repository-note-create-form>/);
@@ -519,19 +522,20 @@ test("Threads index renders semantic archived cards, native controls, and safe m
     releaseId: "abc123", csrfToken: `csrf"x`, connected: true,
     archives: [threadArchive], page: 1, totalPages: 2, flash: "threads_capture_queued",
   });
-  assert.match(html, /<nav aria-label="주요 메뉴">[\s\S]*Repository[\s\S]*Threads[\s\S]*<\/nav>/);
+  assert.match(html, /<nav class="app-navigation" aria-label="주요 메뉴">[\s\S]*Repository[\s\S]*Threads[\s\S]*<\/nav>/);
   assert.match(html, /<a href="\/threads" aria-current="page">Threads<\/a>/);
   assert.match(html, /<form method="post" action="\/threads\/disconnect">[\s\S]*Threads 연결 해제/);
   assert.match(html, /<form method="post" action="\/threads">[\s\S]*name="url" type="url"/);
   assert.match(html, /<article data-thread-archive data-thread-status="partial">/);
-  assert.match(html, /data-thread-progress>미디어 3\/4 준비 · 실패 1/);
+  assert.match(html, /data-thread-progress>미디어 4\/5 준비 · 실패 1/);
   assert.match(html, /<img data-thread-author-image src="\/threads\/post-1\/media\/author-1" alt=""/);
   assert.match(html, /data-thread-author-name>작성자 &lt;script&gt;<\/strong>/);
   assert.match(html, /data-thread-author-username>@author&lt;script&gt;<\/span>/);
   assert.match(html, /<time data-thread-published-at datetime="2026-08-23T15:30:00\.000Z">2026\.08\.24<\/time>/);
   assert.match(html, /<p data-thread-text>본문 &lt;script&gt; <a href="https:\/\/safe\.example\/path" rel="noreferrer">https:\/\/safe\.example\/path<\/a><\/p>/);
   assert.match(html, /<img src="\/threads\/post-1\/media\/image-1" alt="저장된 이미지"/);
-  assert.match(html, /<video controls preload="metadata" poster="\/threads\/post-1\/media\/thumbnail-1"><source src="\/threads\/post-1\/media\/video-1"><\/video>/);
+  assert.match(html, /<video controls preload="metadata" poster="\/threads\/post-1\/media\/thumbnail-1" aria-label="동영상 &lt;script&gt;"><source src="\/threads\/post-1\/media\/video-1">동영상 &lt;script&gt;<\/video>/);
+  assert.match(html, /<video controls preload="metadata" aria-label="보관된 Threads 동영상"><source src="\/threads\/post-1\/media\/video-fallback">보관된 Threads 동영상<\/video>/);
   assert.match(html, /<section data-thread-quote><p data-thread-text>인용 &lt;b&gt;본문&lt;\/b&gt;<\/p><\/section>/);
   assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 3);
   assert.match(html, /href="\/threads\/post-1#author-replies">작성자 답글 12개 모두 보기<\/a>/);
@@ -554,7 +558,7 @@ test("Threads detail paginates twenty chronological replies and retains shared R
   });
   assert.match(html, /<a href="\/">Repository<\/a>/);
   assert.match(html, /<a href="\/threads" aria-current="page">Threads<\/a>/);
-  assert.match(html, /<a href="\/threads\/connect">Threads 연결하기<\/a>/);
+  assert.match(html, /<a class="thread-connection-action" href="\/threads\/connect">Threads 연결하기<\/a>/);
   assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 20);
   assert.match(html, /<nav class="thread-reply-pagination" aria-label="작성자 답글 페이지">[\s\S]*repliesPage=1[\s\S]*repliesPage=2" aria-current="page"[\s\S]*repliesPage=3/);
   assert.match(html, /Threads 연결을 해제했습니다/);

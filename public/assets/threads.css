@@ -4,7 +4,6 @@
     overflow-x: clip;
   }
 
-  :where(nav[aria-label="주요 메뉴"]),
   .thread-actions,
   .thread-reply-pagination {
     display: flex;
@@ -13,7 +12,6 @@
     gap: var(--space-2);
   }
 
-  :where(nav[aria-label="주요 메뉴"]) > a,
   .thread-actions > a,
   .thread-reply-pagination > a {
     display: inline-flex;
@@ -26,7 +24,6 @@
     text-decoration: none;
   }
 
-  :where(nav[aria-label="주요 메뉴"]) > a[aria-current="page"],
   .thread-reply-pagination > a[aria-current="page"] {
     color: #ffffff;
     background: var(--color-action-primary);
@@ -150,6 +147,22 @@
   [data-thread-media] {
     display: grid;
     gap: var(--space-2);
+  }
+
+  .thread-connection-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-block-size: 2.75rem;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-control);
+    text-decoration: none;
+  }
+
+  .thread-connection-action:focus-visible {
+    outline: 0.1875rem solid var(--color-action-primary);
+    outline-offset: 0.1875rem;
   }
 
   [data-thread-delete] {

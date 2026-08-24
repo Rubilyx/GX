@@ -341,8 +341,27 @@ test("CSS inventory includes the layered responsive Threads archive presentation
   const source = await asset("threads.css");
   assert.match(source, /^@layer components \{/);
   const threads = parseCss(source);
-  assertOwnRule(threads, ':where(nav[aria-label="주요 메뉴"]) > a', {
+  const core = await asset("core.css").then(parseCss);
+  assertOwnRule(core, ".app-navigation", {
+    display: "flex", "flex-wrap": "wrap", "align-items": "center", gap: "var(--space-2)",
+  });
+  assertOwnRule(core, ".app-navigation > a", {
     display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem",
+  });
+  assertOwnRule(core, '.app-navigation > a[aria-current="page"]', {
+    color: "#ffffff", background: "var(--color-action-primary)",
+  });
+  assertOwnRule(core, ".app-navigation > a:focus-visible", {
+    outline: "0.1875rem solid var(--color-action-primary)",
+    "outline-offset": "0.1875rem",
+  });
+  assert.doesNotMatch(source, /app-navigation/);
+  assertOwnRule(threads, ".thread-connection-action", {
+    display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem",
+  });
+  assertOwnRule(threads, ".thread-connection-action:focus-visible", {
+    outline: "0.1875rem solid var(--color-action-primary)",
+    "outline-offset": "0.1875rem",
   });
   assertOwnRule(threads, ".thread-media", {
     display: "grid", "grid-template-columns": "minmax(0, 1fr)", gap: "var(--space-2)",

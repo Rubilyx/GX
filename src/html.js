@@ -117,7 +117,7 @@ function logoutForm(csrfToken) {
 
 /** @param {"repository" | "threads"} active */
 function appNavigation(active) {
-  return `<nav aria-label="주요 메뉴"><a href="/"${active === "repository" ? ' aria-current="page"' : ""}>Repository</a><a href="/threads"${active === "threads" ? ' aria-current="page"' : ""}>Threads</a></nav>`;
+  return `<nav class="app-navigation" aria-label="주요 메뉴"><a href="/"${active === "repository" ? ' aria-current="page"' : ""}>Repository</a><a href="/threads"${active === "threads" ? ' aria-current="page"' : ""}>Threads</a></nav>`;
 }
 
 /** @param {{ releaseId: string, errorCode?: string }} view */
@@ -420,7 +420,9 @@ function threadMedia(postId, media = []) {
     const thumbnail = ready.find((candidate) => candidate.kind === "video_thumbnail" &&
       candidate.sourceMediaId === item.sourceMediaId);
     const poster = thumbnail ? ` poster="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(thumbnail.id)}"` : "";
-    return `<video controls preload="metadata"${poster}><source src="${htmlAttr(href)}"></video>`;
+    const label = typeof item.altText === "string" && item.altText.trim()
+      ? item.altText : "보관된 Threads 동영상";
+    return `<video controls preload="metadata"${poster} aria-label="${htmlAttr(label)}"><source src="${htmlAttr(href)}">${htmlText(label)}</video>`;
   }).join("");
   const retries = media.filter((item) => item?.status === "error").map((item) =>
     `<form method="post" action="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}/retry" data-thread-retry-form><button type="submit">미디어 재시도</button></form>`).join("");
@@ -467,7 +469,7 @@ function threadArchive(archive, replies, detail, csrfToken) {
 /** @param {boolean} connected @param {boolean} reconnectRequired @param {string} csrfToken */
 function threadsConnection(connected, reconnectRequired, csrfToken) {
   if (connected) return `<form method="post" action="/threads/disconnect">${csrf(csrfToken)}<button type="submit">Threads 연결 해제</button></form>`;
-  return `<p data-thread-connection>${reconnectRequired ? "Threads를 다시 연결하세요." : "Threads를 연결해 보관을 시작하세요."} <a href="/threads/connect">${reconnectRequired ? "Threads 다시 연결하기" : "Threads 연결하기"}</a></p>`;
+  return `<p data-thread-connection>${reconnectRequired ? "Threads를 다시 연결하세요." : "Threads를 연결해 보관을 시작하세요."} <a class="thread-connection-action" href="/threads/connect">${reconnectRequired ? "Threads 다시 연결하기" : "Threads 연결하기"}</a></p>`;
 }
 
 /** @param {number} page @param {number} totalPages */

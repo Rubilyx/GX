@@ -213,14 +213,23 @@ async function archiveEntry(message, dependencies) {
 /** @param {Record<string, any>} message @param {any} dependencies */
 async function archiveProfile(message, dependencies) {
   const now = inputTimestamp(dependencies.nowSeconds);
-  await cleanupAuthorProfileState(
-    dependencies.db, dependencies.bucket, message.authorId, now,
-  );
+  let cleanupError = null;
+  try {
+    await cleanupAuthorProfileState(
+      dependencies.db, dependencies.bucket, message.authorId, now,
+    );
+  } catch (error) { cleanupError = error; }
   let row = await readProfileMedia(dependencies.db, message);
-  if (!row) return;
-  if (row.status === "ready") {
-    await recalculateMediaStatus(dependencies, message); return;
+  if (!row) {
+    if (cleanupError) throw cleanupError;
+    return;
   }
+  if (row.status === "ready") {
+    await recalculateMediaStatus(dependencies, message);
+    if (cleanupError) throw cleanupError;
+    return;
+  }
+  if (cleanupError) throw cleanupError;
   if (row.status === "deleting") {
     await cleanupDeletingProfile(dependencies.db, dependencies.bucket, {
       author_id: row.author_id, r2_key: row.r2_key, cleanup_lease: row.cleanup_lease,
@@ -344,6 +353,8 @@ async function deadProfile(message, dependencies) {
     );
   } catch {}
   const row = await readProfileMedia(dependencies.db, message);
+  if (row?.status === "ready")
+    await recalculateMediaStatus(dependencies, message);
   if (!row || row.status === "ready" || row.status === "deleting" ||
     row.upload_lease === null) {
     await terminalizeProfileDeadLetter(message, dependencies); return;

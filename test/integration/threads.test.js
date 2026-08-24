@@ -2773,6 +2773,102 @@ test("winning profile recalculates terminal status before repeated cleanup failu
   ).bind(oldKey).first("count"), 1);
 });
 
+test("persisted ready profile replay reconciles before cleanup retry and DLQ ACK", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, {
+    postId: "profile-ready-replay", shortcode: "ProfileReadyReplay",
+    entryId: "profile-ready-replay-entry", media: [],
+  });
+  const oldKey = testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A);
+  const activeKey = testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_B);
+  for (const [key, value] of [[oldKey, "old"], [activeKey, "active"]])
+    await harness.mediaBucket.put(key,
+      new Blob([value], { type: "image/png" }).stream(),
+      { httpMetadata: { contentType: "image/png" } });
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready', profile_r2_key = ?,
+       profile_content_type = 'image/png', profile_bytes = 6, profile_etag = '"active"',
+       profile_error_code = NULL, profile_upload_lease = NULL,
+       profile_upload_started_at = NULL, profile_pending_r2_key = NULL
+     WHERE threads_user_id = 'author-1'`,
+  ).bind(activeKey).run();
+  await db.prepare(
+    `INSERT INTO threads_profile_cleanup_keys (threads_user_id, r2_key, created_at)
+     VALUES ('author-1', ?, 5160)`,
+  ).bind(oldKey).run();
+  let rejectCleanup = true;
+  let deleteAttempts = 0;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key */
+    async delete(key) {
+      if (key === oldKey) {
+        deleteAttempts += 1;
+        if (rejectCleanup) throw new Error("ready_replay_cleanup_unavailable");
+      }
+      return harness.mediaBucket.delete(key);
+    },
+  };
+  /** @type {Array<{ method: string, path: string }>} */
+  const calls = [];
+  const dependencies = mediaDependencies(db, providerFixture({ calls }), {
+    bucket, nowSeconds: 5_160,
+  });
+  const message = { version: 1, type: "archive-profile",
+    postId: seeded.postId, generation: 1, authorId: "author-1" };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.deepEqual(await handleThreadsMediaMessage(message, dependencies),
+      { action: "retry", delaySeconds: 1 });
+    assert.deepEqual(await db.prepare(
+      `SELECT post.status AS post_status, job.status AS job_status, job.completed_at
+       FROM threads_posts post JOIN threads_sync_jobs job
+         ON job.threads_post_id = post.id AND job.generation = post.sync_generation
+       WHERE post.id = ?`,
+    ).bind(seeded.postId).first(), {
+      post_status: "ready", job_status: "ready", completed_at: 5_160,
+    });
+  }
+  assert.deepEqual(calls, []);
+
+  await db.prepare(
+    "UPDATE threads_posts SET status = 'collecting' WHERE id = ?",
+  ).bind(seeded.postId).run();
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET status = 'media_pending', completed_at = NULL
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(seeded.postId).run();
+  assert.deepEqual(await handleThreadsMediaDeadLetter(message, dependencies),
+    { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT post.status AS post_status, job.status AS job_status, job.completed_at
+     FROM threads_posts post JOIN threads_sync_jobs job
+       ON job.threads_post_id = post.id AND job.generation = post.sync_generation
+     WHERE post.id = ?`,
+  ).bind(seeded.postId).first(), {
+    post_status: "ready", job_status: "ready", completed_at: 5_160,
+  });
+  assert.equal(deleteAttempts, 4);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys WHERE r2_key = ?",
+  ).bind(oldKey).first("count"), 1);
+
+  rejectCleanup = false;
+  const env = await harness.worker.getEnv();
+  const eventEnv = /** @type {any} */ ({
+    ...env, THREADS_MEDIA: bucket,
+    THREADS_CAPTURE_QUEUE: harness.captureQueue, THREADS_MEDIA_QUEUE: harness.mediaQueue,
+    THREADS_CAPTURE_QUEUE_NAME: "capture", THREADS_MEDIA_QUEUE_NAME: "media",
+    THREADS_CAPTURE_DLQ_NAME: "capture-dlq", THREADS_MEDIA_DLQ_NAME: "media-dlq",
+  });
+  await handleThreadsScheduled(eventEnv, { waitUntil() {} }, providerFixture(), 5_200);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys WHERE r2_key = ?",
+  ).bind(oldKey).first("count"), 0);
+  assert.equal(await harness.mediaBucket.head(oldKey), null);
+  assert.notEqual(await harness.mediaBucket.head(activeKey), null);
+});
+
 /** @param {D1Database} db @param {string} id @param {number} createdAt @param {string} [jobStatus] */
 async function seedCollisionCandidate(db, id, createdAt, jobStatus = "resolving") {
   return seedThreadsArchive(db, {

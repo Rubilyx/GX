@@ -38,3 +38,32 @@ test("local browser projects trust only the test harness certificate", async () 
   assert.match(releaseSmoke, /form\[action="\/repositories\/\$\{createdId\}\/delete"\]/);
   assert.match(releaseSmoke, /\?flash=repository_deleted/);
 });
+
+test("Threads browser enhancements are reachable, same-origin, abortable, and native-safe", async () => {
+  const [app, capture, panel, worker, manifest] = await Promise.all([
+    readFile(new URL("../../public/assets/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../../public/assets/thread-capture.js", import.meta.url), "utf8"),
+    readFile(new URL("../../public/assets/thread-panel.js", import.meta.url), "utf8"),
+    readFile(new URL("../../src/worker.js", import.meta.url), "utf8"),
+    readFile(new URL("../../public/modulepreload.json", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /import "\.\/thread-capture\.js";/);
+  assert.match(app, /import "\.\/thread-panel\.js";/);
+  assert.deepEqual(JSON.parse(manifest), [
+    "dom.js", "repo-capture.js", "repo-filter.js", "repo-panel.js",
+    "thread-capture.js", "thread-panel.js",
+  ]);
+  for (const name of ["threads.css", "thread-capture.js", "thread-panel.js"])
+    assert.match(worker, new RegExp(`"${name.replace(".", "\\.")}"`));
+  for (const source of [capture, panel]) {
+    assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML/);
+    assert.doesNotMatch(source, /WebSocket|EventSource|XMLHttpRequest|https?:\/\//);
+  }
+  assert.match(capture, /formJson\(form, controller\.signal\)/);
+  assert.match(panel, /credentials:\s*"same-origin"/);
+  assert.match(panel, /document\.visibilityState/);
+  assert.match(panel, /visibilitychange/);
+  assert.match(panel, /AbortController/);
+  assert.match(panel, /event\.button === 0[\s\S]*!event\.ctrlKey[\s\S]*!event\.metaKey/);
+  assert.match(panel, /textContent/);
+});

@@ -47,6 +47,7 @@ const ASSET_PATH = /^\/assets\/([^/]+)\/([^/]+)$/;
 const ASSETS = new Set([
   "layers.css", "tokens.css", "core.css", "login.css", "repositories.css",
   "threads.css", "app.js", "dom.js", "repo-capture.js", "repo-filter.js", "repo-panel.js",
+  "thread-capture.js", "thread-panel.js",
   "favicon.svg",
 ]);
 const FLASH = new Set([

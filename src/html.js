@@ -432,7 +432,8 @@ function threadMedia(postId, media = []) {
 /** @param {string} postId @param {any} entry @param {boolean} reply */
 function threadEntry(postId, entry, reply = false) {
   if (!entry) return "";
-  const replyAttribute = reply ? " data-thread-author-reply" : "";
+  const replyAttribute = reply
+    ? ` data-thread-author-reply data-thread-entry-id="${htmlAttr(entry.id ?? "")}"` : "";
   return `<article${replyAttribute}>${threadAuthor(postId, entry.author)}<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media)}</div></article>`;
 }
 
@@ -463,7 +464,12 @@ function threadArchive(archive, replies, detail, csrfToken) {
   const replyMarkup = replies.map((reply) => threadEntry(postId, reply, true)).join("");
   const allReplies = archive.replyCount > replies.length && !detail
     ? `<a data-thread-all-replies href="${htmlAttr(`${postPath}#author-replies`)}">작성자 답글 ${htmlText(archive.replyCount)}개 모두 보기</a>` : "";
-  return `<article data-thread-archive data-thread-status="${status}">${threadAuthor(postId, archive.author)}<p data-thread-status-label>${threadsStatusText(archive.status)}</p>${threadProgress(archive)}${threadRoot(postId, archive.root)}${quote}<section${repliesId} data-thread-replies>${replyMarkup}</section><div class="thread-actions"><form method="post" action="${htmlAttr(`${postPath}/sync`)}" data-thread-sync-form>${csrf(csrfToken)}<button type="submit">동기화</button></form>${allReplies}</div><details data-thread-delete><summary>보관 삭제</summary><form method="post" action="${htmlAttr(`${postPath}/delete`)}">${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">보관 삭제</button></form></details></article>`;
+  return `<article data-thread-archive data-thread-id="${htmlAttr(postId)}" data-thread-status="${status}">${threadAuthor(postId, archive.author)}<p data-thread-status-label>${threadsStatusText(archive.status)}</p>${threadProgress(archive)}${threadRoot(postId, archive.root)}${quote}<section${repliesId} data-thread-replies>${replyMarkup}</section><div class="thread-actions"><form method="post" action="${htmlAttr(`${postPath}/sync`)}" data-thread-sync-form>${csrf(csrfToken)}<button type="submit">동기화</button></form>${allReplies}</div><details data-thread-delete><summary>보관 삭제</summary><form method="post" action="${htmlAttr(`${postPath}/delete`)}">${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">보관 삭제</button></form></details></article>`;
+}
+
+/** @param {string} csrfToken */
+function threadDeleteDialog(csrfToken) {
+  return `<dialog data-thread-delete-dialog><h2>Threads 보관을 삭제할까요?</h2><p>삭제 대상 <strong data-thread-delete-author></strong></p><p>게시일 <span data-thread-delete-date></span></p><p>보관한 본문과 미디어를 삭제하며 복구할 수 없습니다.</p><form method="post" data-thread-delete-form>${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><div class="thread-dialog-actions"><button type="button" data-thread-delete-cancel>취소</button><button type="submit" class="button-danger" data-thread-delete-confirm disabled>보관 삭제</button></div><p role="status" aria-live="polite" data-thread-delete-status></p></form></dialog>`;
 }
 
 /** @param {boolean} connected @param {boolean} reconnectRequired @param {string} csrfToken */
@@ -486,10 +492,11 @@ export function renderThreadsIndexPage(view) {
   const connection = threadsConnection(Boolean(view.connected), Boolean(view.reconnectRequired), view.csrfToken);
   const list = archives.length ? archives.map(/** @param {any} archive */ (archive) =>
     threadArchive(archive, (archive.firstReplies ?? []).slice(0, 3), false, view.csrfToken)).join("")
-    : '<section data-thread-empty><h2>보관한 Threads가 없습니다</h2><p>Threads URL을 추가하세요.</p></section>';
+    : '<section data-thread-empty><h2 data-thread-empty-heading tabindex="-1">보관한 Threads가 없습니다</h2><p>Threads URL을 추가하세요.</p></section>';
   return document({
     releaseId: view.releaseId, page: "threads.css", title: "Threads - Repo Atlas",
-    body: `<main id="main" class="thread-page">${appNavigation("threads")}<header><h1>Threads</h1>${connection}</header>${errorStatus(view.flash)}<section class="thread-capture"><form method="post" action="/threads">${csrf(view.csrfToken)}<label for="threads-url">Threads 게시물 URL</label><input id="threads-url" name="url" type="url" inputmode="url" required><button type="submit">보관하기</button></form></section><section data-thread-archive-list>${list}</section>${threadsIndexPagination(view.page ?? 1, view.totalPages ?? 1)}${logoutForm(view.csrfToken)}</main>`,
+    app: true, modulePreloads: view.modulePreloads,
+    body: `<main id="main" class="thread-page">${appNavigation("threads")}<header><h1>Threads</h1>${connection}</header>${errorStatus(view.flash)}<thread-capture class="thread-capture"><form method="post" action="/threads">${csrf(view.csrfToken)}<label for="threads-url">Threads 게시물 URL</label><input id="threads-url" name="url" type="url" inputmode="url" required><button type="submit">보관하기</button><p role="status" aria-live="polite" data-thread-capture-message></p></form></thread-capture><thread-panel><h2 data-thread-list-heading tabindex="-1">보관 목록</h2><section data-thread-archive-list>${list}</section>${threadsIndexPagination(view.page ?? 1, view.totalPages ?? 1)}${threadDeleteDialog(view.csrfToken)}<p role="status" aria-live="polite" data-thread-panel-message></p></thread-panel>${logoutForm(view.csrfToken)}</main>`,
   });
 }
 
@@ -505,6 +512,7 @@ export function renderThreadsDetailPage(view) {
   const pagination = numbers ? `<nav class="thread-reply-pagination" aria-label="작성자 답글 페이지">${page > 1 ? `<a rel="prev" href="${htmlAttr(`${postPath}?repliesPage=${page - 1}`)}">이전</a>` : ""}${numbers}${page < totalPages ? `<a rel="next" href="${htmlAttr(`${postPath}?repliesPage=${page + 1}`)}">다음</a>` : ""}</nav>` : "";
   return document({
     releaseId: view.releaseId, page: "threads.css", title: "Threads 보관 - Repo Atlas",
-    body: `<main id="main" class="thread-page">${appNavigation("threads")}<p><a href="/threads">Threads 목록</a></p>${threadsConnection(Boolean(view.connected), Boolean(view.reconnectRequired), view.csrfToken)}${errorStatus(view.flash)}${threadArchive(archive, replies, true, view.csrfToken)}${pagination}${logoutForm(view.csrfToken)}</main>`,
+    app: true, modulePreloads: view.modulePreloads,
+    body: `<main id="main" class="thread-page">${appNavigation("threads")}<p><a href="/threads">Threads 목록</a></p>${threadsConnection(Boolean(view.connected), Boolean(view.reconnectRequired), view.csrfToken)}${errorStatus(view.flash)}<thread-panel>${threadArchive(archive, replies, true, view.csrfToken)}${pagination}${threadDeleteDialog(view.csrfToken)}<p role="status" aria-live="polite" data-thread-panel-message></p></thread-panel>${logoutForm(view.csrfToken)}</main>`,
   });
 }

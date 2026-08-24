@@ -526,7 +526,9 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /<a href="\/threads" aria-current="page">Threads<\/a>/);
   assert.match(html, /<form method="post" action="\/threads\/disconnect">[\s\S]*Threads 연결 해제/);
   assert.match(html, /<form method="post" action="\/threads">[\s\S]*name="url" type="url"/);
-  assert.match(html, /<article data-thread-archive data-thread-status="partial">/);
+  assert.match(html, /<thread-capture class="thread-capture">[\s\S]*data-thread-capture-message/);
+  assert.match(html, /<thread-panel>[\s\S]*data-thread-archive-list/);
+  assert.match(html, /<article data-thread-archive data-thread-id="post-1" data-thread-status="partial">/);
   assert.match(html, /data-thread-progress>미디어 4\/5 준비 · 실패 1/);
   assert.match(html, /<img data-thread-author-image src="\/threads\/post-1\/media\/author-1" alt=""/);
   assert.match(html, /data-thread-author-name>작성자 &lt;script&gt;<\/strong>/);
@@ -542,6 +544,10 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /<form method="post" action="\/threads\/post-1\/sync" data-thread-sync-form>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry" data-thread-retry-form>/);
   assert.match(html, /<details data-thread-delete>[\s\S]*action="\/threads\/post-1\/delete"[\s\S]*name="confirm" value="yes"/);
+  assert.equal((html.match(/data-thread-delete-dialog/g) ?? []).length, 1);
+  assert.match(html, /<dialog data-thread-delete-dialog>[\s\S]*data-thread-delete-author[\s\S]*data-thread-delete-date/);
+  assert.match(html, /data-thread-delete-confirm[^>]*disabled/);
+  assert.match(html, /data-thread-list-heading[^>]*tabindex="-1"/);
   assert.match(html, /Threads 가져오기를 대기열에 추가했습니다/);
   assert.doesNotMatch(html, /threads\.net\/embed|cdninstagram\.com|<script[^>]+src="https:|profile_r2_key|https:\/\/www\.threads\.net\/@author/);
 });
@@ -562,5 +568,16 @@ test("Threads detail paginates twenty chronological replies and retains shared R
   assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 20);
   assert.match(html, /<nav class="thread-reply-pagination" aria-label="작성자 답글 페이지">[\s\S]*repliesPage=1[\s\S]*repliesPage=2" aria-current="page"[\s\S]*repliesPage=3/);
   assert.match(html, /Threads 연결을 해제했습니다/);
-  assert.doesNotMatch(html, /<script|threads\.net\/embed|cdninstagram\.com/);
+  assert.doesNotMatch(html, /<script[^>]+src="https:|threads\.net\/embed|cdninstagram\.com/);
+  assert.match(html, /<thread-panel>[\s\S]*<dialog data-thread-delete-dialog>/);
+});
+
+test("Threads empty state exposes the progressive capture and deletion focus targets", () => {
+  const html = renderThreadsIndexPage({
+    releaseId: "abc123", modulePreloads: [], csrfToken: "csrf", connected: false,
+    archives: [], page: 1, totalPages: 1, flash: "",
+  });
+  assert.match(html, /<thread-capture class="thread-capture">/);
+  assert.match(html, /data-thread-empty-heading tabindex="-1">보관한 Threads가 없습니다/);
+  assert.equal((html.match(/<dialog data-thread-delete-dialog>/g) ?? []).length, 1);
 });

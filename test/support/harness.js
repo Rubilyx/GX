@@ -1,4 +1,5 @@
 import { createTestHarness } from "wrangler";
+import { readFile } from "node:fs/promises";
 import { handleThreadsCaptureMessage } from "../../src/threads-capture.js";
 import {
   deleteThreadsArchive, handleThreadsMediaMessage,
@@ -6,6 +7,8 @@ import {
 import { recalculateThreadsStatus } from "../../src/threads.js";
 import { handleRequest } from "../../src/worker.js";
 import { validateCaptureMessage, validateMediaMessage } from "../../src/threads-domain.js";
+
+const browserAssetRoot = new URL("../../public/assets/", import.meta.url);
 
 const secrets = Object.freeze({
   PROD_PIN_SALT: "cmVwby1hdGxhcy10ZXN0LXNhbHQ=",
@@ -591,10 +594,9 @@ export async function startHarness() {
   const assets = { async fetch(/** @type {Request} */ request) {
     if (assetMode.reject) throw new Error("test_asset_rejection");
     const name = new URL(request.url).pathname.split("/").pop();
-    if (name === "app.js") return new Response("export {};\n");
-    if (name?.endsWith(".css")) return new Response("@layer components {}\n");
-    if (name === "favicon.svg") return new Response('<svg xmlns="http://www.w3.org/2000/svg"/>');
-    return new Response("Not Found", { status: 404 });
+    if (!name || !/^[a-z0-9.-]+$/.test(name)) return new Response("Not Found", { status: 404 });
+    try { return new Response(await readFile(new URL(name, browserAssetRoot))); }
+    catch { return new Response("Not Found", { status: 404 }); }
   } };
   /** @type {{ getEnv(): Promise<Env>, applyD1Migrations(name: "PROD_DB"): Promise<void>, fetch(input: any, init?: any): Promise<Response> }} */
   const worker = {

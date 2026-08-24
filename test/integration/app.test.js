@@ -676,6 +676,12 @@ test("assets require the current release and receive exact immutable cache and M
   assert.equal(js.headers.get("referrer-policy"), "same-origin");
   assert.equal(js.headers.get("vary"), "Accept-Encoding");
   assert.equal(js.headers.get("x-content-type-options"), "nosniff");
+  assert.match(await js.text(), /import "\.\/thread-capture\.js";/);
+  const threadPanel = await harness.worker.fetch(
+    `${origin}/assets/test-release/thread-panel.js`,
+  );
+  assert.equal(threadPanel.status, 200);
+  assert.match(await threadPanel.text(), /customElements\.define\("thread-panel"/);
   const css = await harness.worker.fetch(`${origin}/assets/test-release/core.css`);
   assert.equal(css.headers.get("content-type"), "text/css; charset=utf-8");
   const favicon = await harness.worker.fetch(`${origin}/assets/test-release/favicon.svg`);

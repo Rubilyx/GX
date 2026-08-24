@@ -375,6 +375,12 @@ test("CSS inventory includes the layered responsive Threads archive presentation
   assertOwnRule(threads, "[data-thread-text]", {
     "white-space": "pre-wrap", "overflow-wrap": "anywhere",
   });
+  assertOwnRule(threads, "thread-capture", { display: "grid", "min-width": "0" });
+  assertOwnRule(threads, "thread-panel", { display: "grid", gap: "var(--space-4)", "min-width": "0" });
+  assertOwnRule(threads, "dialog[data-thread-delete-dialog]", {
+    width: "min(28rem, calc(100% - 2rem))", "max-height": "calc(100% - 2rem)",
+    overflow: "auto",
+  });
   assertOwnRule(threads, "[data-thread-archive-list] > [data-thread-archive] [data-thread-text]", {
     display: "-webkit-box", "-webkit-line-clamp": "4", "-webkit-box-orient": "vertical", overflow: "hidden",
   });

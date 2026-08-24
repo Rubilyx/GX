@@ -2,5 +2,7 @@
   "dom.js",
   "repo-capture.js",
   "repo-filter.js",
-  "repo-panel.js"
+  "repo-panel.js",
+  "thread-capture.js",
+  "thread-panel.js"
 ]

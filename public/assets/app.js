@@ -1,6 +1,8 @@
 import "./repo-capture.js";
 import "./repo-filter.js";
 import "./repo-panel.js";
+import "./thread-capture.js";
+import "./thread-panel.js";
 
 if (typeof window !== "undefined") {
   /** @param {{ eventType: string, metricName: string, value: number, code?: string }} event */

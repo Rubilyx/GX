@@ -9,11 +9,14 @@ const ACK = { action: "ack" };
 /** @param {Record<string, unknown>} row */
 function mediaDb(row) {
   return {
-    prepare() {
+    prepare(/** @type {string} */ sql) {
       return {
         bind() {
           return {
-            async first() { return structuredClone(row); },
+            async first() {
+              return String(sql).includes("COUNT(*) AS count") ?
+                { count: 1 } : structuredClone(row);
+            },
             async run() { return { success: true, meta: { changes: 1 } }; },
           };
         },
@@ -42,16 +45,21 @@ function streamingResponse(body, init) {
 }
 
 function recordingBucket() {
-  /** @type {Map<string, { bytes: Uint8Array, contentType: string }>} */
+  /** @type {Map<string, { bytes: Uint8Array, contentType: string, etag: string }>} */
   const objects = new Map();
   /** @type {string[]} */
   const deleted = [];
   return {
     objects, deleted,
     /** @param {string} key @param {ReadableStream<Uint8Array>} body
-     * @param {{ httpMetadata: { contentType: string } }} options */
+     * @param {{ httpMetadata: { contentType: string },
+     * onlyIf?: { etagMatches?: string, etagDoesNotMatch?: string } }} options */
     async put(key, body, options) {
       assert.ok(body instanceof ReadableStream);
+      const current = objects.get(key);
+      if (options.onlyIf?.etagMatches !== undefined &&
+        current?.etag !== options.onlyIf.etagMatches) return null;
+      if (options.onlyIf?.etagDoesNotMatch === "*" && current) return null;
       const reader = body.getReader();
       /** @type {Uint8Array[]} */
       const chunks = [];
@@ -65,8 +73,15 @@ function recordingBucket() {
       const bytes = new Uint8Array(size);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-      objects.set(key, { bytes, contentType: options.httpMetadata.contentType });
+      objects.set(key, { bytes, contentType: options.httpMetadata.contentType,
+        etag: "unit-etag" });
       return { key, size, etag: "unit-etag", httpEtag: '"unit-etag"' };
+    },
+    /** @param {string} key */
+    async head(key) {
+      const object = objects.get(key);
+      return object ? { key, size: object.bytes.byteLength, etag: object.etag,
+        httpEtag: `"${object.etag}"` } : null;
     },
     /** @param {string} key */
     async delete(key) { deleted.push(key); objects.delete(key); },
@@ -110,7 +125,7 @@ async function archiveEntry(options = {}) {
       media_id: "media-1", entry_id: "entry-1", source_media_id: "source-1",
       kind: "image", ordinal: 0, status: "pending", r2_key: null,
       content_type: null, bytes: null, etag: null, error_code: null,
-      attempt_count: 0,
+      attempt_count: 0, upload_lease: null, upload_started_at: null,
     }), bucket, fetcher, getAccessToken: async () => ({ accessToken: "token" }),
     recalculateStatus: async (/** @type {unknown} */ db,
       /** @type {unknown} */ input) => { recalculations.push({ db, input }); },
@@ -127,7 +142,8 @@ test("streams allowlisted image media to one deterministic key without response 
     assert.deepEqual(archived.result, ACK);
     assert.deepEqual([...archived.bucket.objects], [[
       "threads/posts/post-1/source-1/image-0",
-      { bytes: new Uint8Array([1, 2, 3, 4]), contentType: "image/jpeg" },
+      { bytes: new Uint8Array([1, 2, 3, 4]), contentType: "image/jpeg",
+        etag: "unit-etag" },
     ]]);
     assert.equal(archived.cdnCalls, 1);
   }
@@ -146,6 +162,8 @@ test("rejects CDN suffix lookalikes and custom ports before a media request", as
     "https://evilcdninstagram.com/object",
     "https://cdninstagram.com.example.test/object",
     "https://fbcdn.net.example.test/object",
+    "https://cdninstagram.com:443/object",
+    "https://cdninstagram.com:0443/object",
     "https://cdninstagram.com:444/object",
   ]) {
     const archived = await archiveEntry({ url });
@@ -183,6 +201,17 @@ test("allows three HTTPS CDN redirects, cancels them, and rejects a downgrade or
   } });
   assert.equal(downgrade.cdnCalls, 1);
   assert.equal(downgrade.bucket.objects.size, 0);
+
+  for (const port of ["443", "0443", "444"]) {
+    for (const location of [
+      `https://scontent.cdninstagram.com:${port}/object`,
+      `//scontent.cdninstagram.com:${port}/object`,
+    ]) {
+      const explicitPort = await archiveEntry({ cdn() { return redirect(location); } });
+      assert.equal(explicitPort.cdnCalls, 1, location);
+      assert.equal(explicitPort.bucket.objects.size, 0, location);
+    }
+  }
 });
 
 test("enforces declared and counted byte limits without retaining a partial object", async () => {

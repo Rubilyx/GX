@@ -60,9 +60,18 @@ function providerString(value, nullable = false) {
 }
 
 /** @param {unknown} value */
-function safeHttpsUrl(value) {
+function safeHttpsUrl(value, rejectExplicitPort = false) {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || !value || value.length > 4_096) protocolError();
+  if (rejectExplicitPort) {
+    const authorityStart = value.slice(0, 8).toLowerCase() === "https://" ? 8 : -1;
+    const separators = authorityStart >= 0 ? [value.indexOf("/", authorityStart),
+      value.indexOf("?", authorityStart), value.indexOf("#", authorityStart)]
+      .filter((index) => index >= 0) : [];
+    const authorityEnd = separators.length ? Math.min(...separators) : value.length;
+    const authority = authorityStart >= 0 ? value.slice(authorityStart, authorityEnd) : "";
+    if (authority.slice(authority.lastIndexOf("@") + 1).includes(":")) protocolError();
+  }
   try {
     const url = new URL(value);
     if (url.protocol !== "https:" || url.username || url.password) protocolError();
@@ -202,7 +211,8 @@ function mapMedia(value) {
     id: mediaId(raw.id), ownerId: providerId(owner.id), username: raw.username, text: raw.text,
     permalink: normalizedPermalink.canonicalUrl, timestamp: isoTimestamp(raw.timestamp),
     mediaType: /** @type {ThreadsMedia["mediaType"]} */ (raw.media_type),
-    mediaUrl: safeHttpsUrl(raw.media_url), thumbnailUrl: safeHttpsUrl(raw.thumbnail_url),
+    mediaUrl: safeHttpsUrl(raw.media_url, true),
+    thumbnailUrl: safeHttpsUrl(raw.thumbnail_url, true),
     children: childIds(raw.children), quotedPostId, linkAttachmentUrl: safeHttpsUrl(raw.link_attachment_url),
     altText: providerString(raw.alt_text, true), rootPostId: relatedMediaId(raw.root_post),
     repliedToId: relatedMediaId(raw.replied_to),
@@ -308,7 +318,7 @@ export async function fetchThreadsProfile(fetcher, input) {
   try {
     const raw = exactKnownKeys(await graphGet(fetcher, "profile_lookup", new URLSearchParams({ fields: PROFILE_FIELDS, username: providerId(input?.username) }), providerId(input?.accessToken), input?.signal), ["id", "username", "name", "threads_profile_picture_url"]);
     if (typeof raw.username !== "string" || !raw.username) protocolError();
-    return { id: providerId(raw.id), username: raw.username, name: providerString(raw.name, true), profilePictureUrl: safeHttpsUrl(raw.threads_profile_picture_url) };
+    return { id: providerId(raw.id), username: raw.username, name: providerString(raw.name, true), profilePictureUrl: safeHttpsUrl(raw.threads_profile_picture_url, true) };
   } catch (error) { throw threadsError(error); }
 }
 

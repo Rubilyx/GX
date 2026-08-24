@@ -2367,7 +2367,7 @@ async function seedPendingMedia(db, options = {}) {
   ];
   await seedThreadsArchive(db, {
     id: postId, shortcode: options.shortcode ?? "MediaPostOne",
-    threadsMediaId: "media-root-1", status: "collecting", jobStatus: "media_pending",
+    threadsMediaId: `${postId}-root`, status: "collecting", jobStatus: "media_pending",
     rootEntryId: entryId, rootMediaType: "CAROUSEL_ALBUM", createdAt: 5_000,
     updatedAt: 5_000,
   });
@@ -2391,6 +2391,14 @@ function mediaDependencies(db, fetcher, overrides = {}) {
     getAccessToken: async () => ({ accessToken: "long-token" }),
     recalculateStatus: recalculateThreadsStatus, nowSeconds: 5_100, ...overrides,
   };
+}
+
+/** @returns {{ promise: Promise<void>, resolve: () => void }} */
+function deferred() {
+  let resolve = () => {};
+  /** @type {Promise<void>} */
+  const promise = new Promise((done) => { resolve = () => done(); });
+  return { promise, resolve };
 }
 
 test("Threads media streams entry and profile objects before marking D1 ready and redelivery converges", async () => {
@@ -2517,6 +2525,440 @@ test("Threads media removes an uncommitted R2 object when deletion wins after pu
   ).first(), { status: "pending", r2_key: null });
 });
 
+test("ready shared profiles recalculate every addressed archive without provider or R2 work", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const first = await seedPendingMedia(db, {
+    postId: "ready-profile-post-a", shortcode: "ReadyProfileA",
+    entryId: "ready-profile-entry-a", media: [],
+  });
+  const second = await seedPendingMedia(db, {
+    postId: "ready-profile-post-b", shortcode: "ReadyProfileB",
+    entryId: "ready-profile-entry-b", media: [],
+  });
+  const key = "threads/authors/author-1/profile";
+  const object = await harness.mediaBucket.put(
+    key, new Blob(["profile"], { type: "image/png" }).stream(),
+    { httpMetadata: { contentType: "image/png" } },
+  );
+  if (!object) throw new Error("test_ready_profile_put_failed");
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready', profile_r2_key = ?,
+       profile_content_type = 'image/png', profile_bytes = ?, profile_etag = ?
+     WHERE threads_user_id = 'author-1'`,
+  ).bind(key, object.size, object.httpEtag).run();
+  let externalCalls = 0;
+  const fetcher = async () => { externalCalls += 1; throw new Error("unexpected_fetch"); };
+  let tokenCalls = 0;
+  for (const postId of [first.postId, second.postId]) assert.deepEqual(
+    await handleThreadsMediaMessage({
+      version: 1, type: "archive-profile", postId, generation: 1,
+      authorId: "author-1",
+    }, mediaDependencies(db, fetcher, {
+      getAccessToken: async () => { tokenCalls += 1; return { accessToken: "token" }; },
+    })), { action: "ack" },
+  );
+  assert.equal(externalCalls, 0);
+  assert.equal(tokenCalls, 0);
+  assert.deepEqual(await db.prepare(
+    `SELECT threads_post_id, status, ready_media_count, failed_media_count
+     FROM threads_sync_jobs WHERE threads_post_id IN (?, ?) ORDER BY threads_post_id`,
+  ).bind(first.postId, second.postId).all().then((result) => result.results), [
+    { threads_post_id: first.postId, status: "ready", ready_media_count: 1,
+      failed_media_count: 0 },
+    { threads_post_id: second.postId, status: "ready", ready_media_count: 1,
+      failed_media_count: 0 },
+  ]);
+});
+
+test("ready entry redelivery recovers a prior recalculation failure without redownloading", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [
+    { id: "ready-recalc-media", sourceId: "ready-recalc-source", kind: "image", ordinal: 0 },
+  ] });
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready',
+       profile_r2_key = 'threads/authors/author-1/profile',
+       profile_content_type = 'image/png', profile_bytes = 1, profile_etag = '"profile"'
+     WHERE threads_user_id = 'author-1'`,
+  ).run();
+  /** @type {Array<{ method: string, path: string }>} */
+  const calls = [];
+  const fetcher = providerFixture({ calls, threadsMedia: {
+    "ready-recalc-source": rawThreadsMedia(
+      "ready-recalc-source", "ReadyRecalc", "author-1", {
+        media_type: "IMAGE", media_url:
+          "https://scontent.cdninstagram.com/ready-recalc",
+      },
+    ),
+  }, mediaBodies: {
+    "ready-recalc": new Blob(["ready"], { type: "image/jpeg" }),
+  } });
+  let recalculations = 0;
+  const dependencies = mediaDependencies(db, fetcher, {
+    recalculateStatus: async (/** @type {any} */ database,
+      /** @type {any} */ input) => {
+      recalculations += 1;
+      if (recalculations === 1) throw new AppError("storage_unavailable", 503);
+      return recalculateThreadsStatus(database, input);
+    },
+  });
+  const message = {
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "ready-recalc-media",
+  };
+  assert.deepEqual(await handleThreadsMediaMessage(message, dependencies),
+    { action: "retry", delaySeconds: 1 });
+  assert.equal(await db.prepare(
+    "SELECT status FROM threads_media WHERE id = 'ready-recalc-media'",
+  ).first("status"), "ready");
+  const before = structuredClone(harness.mediaObjects());
+  const callCount = calls.length;
+  assert.deepEqual(await handleThreadsMediaMessage(message, dependencies),
+    { action: "ack" });
+  assert.equal(recalculations, 2);
+  assert.equal(calls.length, callCount);
+  assert.deepEqual(harness.mediaObjects(), before);
+  assert.equal(await db.prepare(
+    "SELECT status FROM threads_sync_jobs WHERE threads_post_id = ?",
+  ).bind(seeded.postId).first("status"), "ready");
+});
+
+test("Threads media schema exposes exclusive upload and profile cleanup leases", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const media = await db.prepare("PRAGMA table_info(threads_media)").all();
+  assert.deepEqual(media.results.filter((row) => [
+    "upload_lease", "upload_started_at",
+  ].includes(String(row.name))).map((row) => [row.name, row.notnull, row.dflt_value]), [
+    ["upload_lease", 0, null], ["upload_started_at", 0, null],
+  ]);
+  const authors = await db.prepare("PRAGMA table_info(threads_authors)").all();
+  assert.deepEqual(authors.results.filter((row) => [
+    "profile_attempt_count", "profile_upload_lease", "profile_upload_started_at",
+    "profile_cleanup_lease",
+  ].includes(String(row.name))).map((row) => [row.name, row.notnull, row.dflt_value]), [
+    ["profile_attempt_count", 1, "0"],
+    ["profile_upload_lease", 0, null],
+    ["profile_upload_started_at", 0, null],
+    ["profile_cleanup_lease", 0, null],
+  ]);
+});
+
+test("concurrent duplicate entry delivery has one upload owner and one R2 result", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [
+    { id: "lease-entry-media", sourceId: "lease-entry-source", kind: "image", ordinal: 0 },
+  ] });
+  await db.prepare(
+    "UPDATE threads_authors SET profile_media_status = 'error' WHERE threads_user_id = 'author-1'",
+  ).run();
+  const firstGate = deferred();
+  const firstStarted = deferred();
+  let graphCalls = 0;
+  let cdnCalls = 0;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") {
+      graphCalls += 1;
+      if (graphCalls === 1) { firstStarted.resolve(); await firstGate.promise; }
+      return Response.json(rawThreadsMedia(
+        "lease-entry-source", "LeaseEntry", "author-1", {
+          media_type: "IMAGE", media_url:
+            "https://scontent.cdninstagram.com/lease-entry",
+        },
+      ));
+    }
+    cdnCalls += 1;
+    return new Response(new Blob(["lease-entry"], { type: "image/jpeg" }));
+  };
+  const message = {
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "lease-entry-media",
+  };
+  const dependencies = mediaDependencies(db, fetcher);
+  const first = handleThreadsMediaMessage(message, dependencies);
+  await firstStarted.promise;
+  const duplicate = await handleThreadsMediaMessage(message, dependencies);
+  firstGate.resolve();
+  assert.deepEqual(duplicate, { action: "retry", delaySeconds: 1 });
+  assert.deepEqual(await first, { action: "ack" });
+  assert.equal(graphCalls, 1);
+  assert.equal(cdnCalls, 1);
+  const row = await db.prepare(
+    `SELECT status, attempt_count, upload_lease, upload_started_at,
+       bytes, etag FROM threads_media WHERE id = 'lease-entry-media'`,
+  ).first();
+  assert.deepEqual(row, { status: "ready", attempt_count: 1,
+    upload_lease: null, upload_started_at: null, bytes: 11, etag: '"r2-11"' });
+  const object = harness.mediaObjects()[0];
+  assert.equal(object?.size, row?.bytes);
+  assert.equal(object?.httpEtag, row?.etag);
+  assert.equal(new TextDecoder().decode(object?.bytes), "lease-entry");
+});
+
+test("concurrent shared-profile delivery has one upload owner and recalculates both posts", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const firstPost = await seedPendingMedia(db, {
+    postId: "lease-profile-post-a", shortcode: "LeaseProfileA",
+    entryId: "lease-profile-entry-a", media: [],
+  });
+  const secondPost = await seedPendingMedia(db, {
+    postId: "lease-profile-post-b", shortcode: "LeaseProfileB",
+    entryId: "lease-profile-entry-b", media: [],
+  });
+  const firstGate = deferred();
+  const firstStarted = deferred();
+  let profileCalls = 0;
+  let cdnCalls = 0;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") {
+      profileCalls += 1;
+      if (profileCalls === 1) { firstStarted.resolve(); await firstGate.promise; }
+      return Response.json({ id: "author-1", username: "meta", name: "Meta",
+        threads_profile_picture_url: "https://scontent.cdninstagram.com/lease-profile" });
+    }
+    cdnCalls += 1;
+    return new Response(new Blob(["lease-profile"], { type: "image/png" }));
+  };
+  const first = handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: firstPost.postId, generation: 1,
+    authorId: "author-1",
+  }, mediaDependencies(db, fetcher));
+  await firstStarted.promise;
+  const duplicate = await handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: secondPost.postId, generation: 1,
+    authorId: "author-1",
+  }, mediaDependencies(db, fetcher));
+  firstGate.resolve();
+  assert.deepEqual(duplicate, { action: "retry", delaySeconds: 1 });
+  assert.deepEqual(await first, { action: "ack" });
+  assert.equal(profileCalls, 1);
+  assert.equal(cdnCalls, 1);
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: secondPost.postId, generation: 1,
+    authorId: "author-1",
+  }, mediaDependencies(db, fetcher)), { action: "ack" });
+  assert.equal(profileCalls, 1);
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_attempt_count, profile_upload_lease,
+       profile_upload_started_at, profile_bytes, profile_etag
+     FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first(), { profile_media_status: "ready", profile_attempt_count: 1,
+    profile_upload_lease: null, profile_upload_started_at: null,
+    profile_bytes: 13, profile_etag: '"r2-13"' });
+  assert.deepEqual(await db.prepare(
+    `SELECT threads_post_id, status FROM threads_sync_jobs
+     WHERE threads_post_id IN (?, ?) ORDER BY threads_post_id`,
+  ).bind(firstPost.postId, secondPost.postId).all().then((result) => result.results), [
+    { threads_post_id: firstPost.postId, status: "ready" },
+    { threads_post_id: secondPost.postId, status: "ready" },
+  ]);
+});
+
+test("a delayed stale upload owner cannot overwrite the manual-retry winner", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [
+    { id: "fenced-media", sourceId: "fenced-source", kind: "image", ordinal: 0 },
+  ] });
+  await db.prepare(
+    "UPDATE threads_authors SET profile_media_status = 'error' WHERE threads_user_id = 'author-1'",
+  ).run();
+  let graphCalls = 0;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") {
+      graphCalls += 1;
+      return Response.json(rawThreadsMedia(
+        "fenced-source", "FencedSource", "author-1", {
+          media_type: "IMAGE", media_url: graphCalls === 1 ?
+            "https://scontent.cdninstagram.com/stale-owner" :
+            "https://scontent.cdninstagram.com/winner-owner",
+        },
+      ));
+    }
+    return new Response(new Blob([
+      url.pathname === "/stale-owner" ? "stale-bytes" : "winner-bytes",
+    ], { type: "image/jpeg" }));
+  };
+  const stalePutStarted = deferred();
+  const releaseStalePut = deferred();
+  let puts = 0;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key @param {ReadableStream<Uint8Array>} body
+     * @param {Record<string, any>} options */
+    async put(key, body, options) {
+      puts += 1;
+      if (puts === 1) { stalePutStarted.resolve(); await releaseStalePut.promise; }
+      return harness.mediaBucket.put(key, body, options);
+    },
+  };
+  const archive = {
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "fenced-media",
+  };
+  const stale = handleThreadsMediaMessage(archive,
+    mediaDependencies(db, fetcher, { bucket }));
+  await stalePutStarted.promise;
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "retry-media", postId: seeded.postId, generation: 1,
+    mediaId: "fenced-media",
+  }, mediaDependencies(db, fetcher, { bucket })), { action: "ack" });
+  releaseStalePut.resolve();
+  assert.deepEqual(await stale, { action: "retry", delaySeconds: 1 });
+  const row = await db.prepare(
+    `SELECT status, bytes, etag, upload_lease, upload_started_at
+     FROM threads_media WHERE id = 'fenced-media'`,
+  ).first();
+  const object = harness.mediaObjects()[0];
+  assert.deepEqual(row, { status: "ready", bytes: 12, etag: '"r2-12"',
+    upload_lease: null, upload_started_at: null });
+  assert.equal(object?.size, row?.bytes);
+  assert.equal(object?.httpEtag, row?.etag);
+  assert.equal(new TextDecoder().decode(object?.bytes), "winner-bytes");
+});
+
+test("a stale mismatched upload cannot delete the manual-retry winner", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [
+    { id: "fenced-delete-media", sourceId: "fenced-delete-source", kind: "image", ordinal: 0 },
+  ] });
+  await db.prepare(
+    "UPDATE threads_authors SET profile_media_status = 'error' WHERE threads_user_id = 'author-1'",
+  ).run();
+  let graphCalls = 0;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") {
+      graphCalls += 1;
+      return Response.json(rawThreadsMedia(
+        "fenced-delete-source", "FencedDelete", "author-1", {
+          media_type: "IMAGE", media_url: graphCalls === 1 ?
+            "https://scontent.cdninstagram.com/stale-mismatch" :
+            "https://scontent.cdninstagram.com/delete-winner",
+        },
+      ));
+    }
+    if (url.pathname === "/stale-mismatch") return new Response(
+      new Blob(["stale"], { type: "image/jpeg" }),
+      { headers: { "Content-Type": "image/jpeg", "Content-Length": "99" } },
+    );
+    return new Response(new Blob(["delete-winner"], { type: "image/jpeg" }));
+  };
+  const staleWritten = deferred();
+  const releaseStaleResult = deferred();
+  let puts = 0;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key @param {ReadableStream<Uint8Array>} body
+     * @param {Record<string, any>} options */
+    async put(key, body, options) {
+      puts += 1;
+      const result = await harness.mediaBucket.put(key, body, options);
+      if (puts === 1) { staleWritten.resolve(); await releaseStaleResult.promise; }
+      return result;
+    },
+  };
+  const archive = {
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "fenced-delete-media",
+  };
+  const stale = handleThreadsMediaMessage(archive,
+    mediaDependencies(db, fetcher, { bucket }));
+  await staleWritten.promise;
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "retry-media", postId: seeded.postId, generation: 1,
+    mediaId: "fenced-delete-media",
+  }, mediaDependencies(db, fetcher, { bucket })), { action: "ack" });
+  releaseStaleResult.resolve();
+  assert.deepEqual(await stale, { action: "ack" });
+  const row = await db.prepare(
+    `SELECT status, bytes, etag FROM threads_media WHERE id = 'fenced-delete-media'`,
+  ).first();
+  const object = harness.mediaObjects()[0];
+  assert.deepEqual(row, { status: "ready", bytes: 13, etag: '"r2-13"' });
+  assert.equal(object?.size, row?.bytes);
+  assert.equal(object?.httpEtag, row?.etag);
+  assert.equal(new TextDecoder().decode(object?.bytes), "delete-winner");
+});
+
+test("manual retry and DLQ recover crash-held entry and profile upload leases", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [
+    { id: "crash-retry-media", sourceId: "crash-retry-source", kind: "image", ordinal: 0 },
+    { id: "crash-dlq-media", sourceId: "crash-dlq-source", kind: "image", ordinal: 1 },
+  ] });
+  await db.prepare(
+    `UPDATE threads_media SET upload_lease = CASE id
+         WHEN 'crash-retry-media' THEN 'crash-retry-lease' ELSE 'crash-dlq-lease' END,
+       upload_started_at = 5000, attempt_count = 1
+     WHERE id IN ('crash-retry-media','crash-dlq-media')`,
+  ).run();
+  await db.prepare(
+    `UPDATE threads_authors SET profile_upload_lease = 'profile-crash-lease',
+       profile_upload_started_at = 5000, profile_attempt_count = 1
+     WHERE threads_user_id = 'author-1'`,
+  ).run();
+  /** @type {Array<{ method: string, path: string }>} */
+  const calls = [];
+  const fetcher = providerFixture({ calls, threadsMedia: {
+    "crash-retry-source": rawThreadsMedia(
+      "crash-retry-source", "CrashRetry", "author-1", {
+        media_type: "IMAGE", media_url:
+          "https://scontent.cdninstagram.com/crash-retry",
+      },
+    ),
+  }, mediaBodies: {
+    "crash-retry": new Blob(["recovered"], { type: "image/jpeg" }),
+  } });
+  const dependencies = mediaDependencies(db, fetcher);
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "crash-retry-media",
+  }, dependencies), { action: "retry", delaySeconds: 1 });
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "retry-media", postId: seeded.postId, generation: 1,
+    mediaId: "crash-retry-media",
+  }, dependencies), { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT status, attempt_count, upload_lease, upload_started_at
+     FROM threads_media WHERE id = 'crash-retry-media'`,
+  ).first(), { status: "ready", attempt_count: 2,
+    upload_lease: null, upload_started_at: null });
+
+  assert.deepEqual(await handleThreadsMediaDeadLetter({
+    version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
+    entryId: seeded.entryId, mediaId: "crash-dlq-media",
+  }, dependencies), { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code, upload_lease, upload_started_at
+     FROM threads_media WHERE id = 'crash-dlq-media'`,
+  ).first(), { status: "error", error_code: "media_retries_exhausted",
+    upload_lease: null, upload_started_at: null });
+
+  assert.deepEqual(await handleThreadsMediaDeadLetter({
+    version: 1, type: "archive-profile", postId: seeded.postId, generation: 1,
+    authorId: "author-1",
+  }, dependencies), { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_error_code, profile_attempt_count,
+       profile_upload_lease, profile_upload_started_at
+     FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first(), { profile_media_status: "error",
+    profile_error_code: "media_retries_exhausted", profile_attempt_count: 1,
+    profile_upload_lease: null, profile_upload_started_at: null });
+});
+
 test("Threads media retry reacquires a fresh provider URL and terminal corruption makes only that item partial", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const seeded = await seedPendingMedia(db, { media: [
@@ -2619,6 +3061,7 @@ test("profile media failure and media DLQ terminalize current pending items but 
     new Blob(["ready"], { type: "image/jpeg" }).stream(),
     { httpMetadata: { contentType: "image/jpeg" } },
   );
+  if (!ready) throw new Error("test_dlq_ready_put_failed");
   await db.prepare(
     `UPDATE threads_media SET status = 'ready', r2_key = ?, content_type = 'image/jpeg',
        bytes = ?, etag = ? WHERE id = 'dlq-ready'`,
@@ -2669,6 +3112,7 @@ test("Threads media serves archive-scoped full HEAD and one exact range with pri
     new Blob(["0123456789"], { type: "video/mp4" }).stream(),
     { httpMetadata: { contentType: "video/mp4" } },
   );
+  if (!object) throw new Error("test_serve_media_put_failed");
   await db.prepare(
     `UPDATE threads_media SET status = 'ready', r2_key = ?, content_type = 'video/mp4',
        bytes = ?, etag = ? WHERE id = 'serve-media'`,
@@ -2809,7 +3253,6 @@ test("Threads deletion keeps shared profiles until unreferenced and concurrent a
       db, bucket: harness.mediaBucket,
     }),
   ));
-  assert.deepEqual(results, [{ action: "ack" }, { action: "ack" }]);
   assert.equal(await db.prepare(
     "SELECT COUNT(*) AS count FROM threads_posts WHERE id LIKE 'delete-concurrent-%'",
   ).first("count"), 0);
@@ -2817,6 +3260,7 @@ test("Threads deletion keeps shared profiles until unreferenced and concurrent a
     "SELECT COUNT(*) AS count FROM threads_authors WHERE threads_user_id = 'shared-delete-author'",
   ).first("count"), 0);
   assert.deepEqual(harness.mediaObjects(), []);
+  assert.deepEqual(results, [{ action: "ack" }, { action: "ack" }]);
 });
 
 test("Threads deletion leaves tombstones on object failure and retries a deleting profile after its post is gone", async () => {
@@ -2852,6 +3296,7 @@ test("Threads deletion leaves tombstones on object failure and retries a deletin
   const bucket = {
     ...harness.mediaBucket,
     /** @param {string} key */
+    /** @param {string} key */
     async delete(key) {
       if (key === profileKey && rejectProfile) throw new Error("test_profile_delete_rejection");
       return harness.mediaBucket.delete(key);
@@ -2879,6 +3324,174 @@ test("Threads deletion leaves tombstones on object failure and retries a deletin
     "SELECT COUNT(*) AS count FROM threads_authors WHERE threads_user_id = 'shared-delete-author'",
   ).first("count"), 0);
   assert.equal(harness.mediaObjects().length, 0);
+});
+
+test("failed profile cleanup reactivates safely when a new archive references the author", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const oldKey = "threads/authors/shared-delete-author/profile";
+  const entryKey = deletingEntryKey("cleanup-reuse-delete");
+  await seedDeletingArchive(db, "cleanup-reuse-delete", "cleanup-reuse-entry", entryKey);
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready', profile_r2_key = ?,
+       profile_content_type = 'image/jpeg', profile_bytes = 3, profile_etag = '"old"'
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).bind(oldKey).run();
+  for (const [key, body] of [[entryKey, "x"], [oldKey, "old"]])
+    await harness.mediaBucket.put(key,
+      new Blob([body], { type: "image/jpeg" }).stream(),
+      { httpMetadata: { contentType: "image/jpeg" } });
+  let rejectOldProfile = true;
+  const failingBucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key */
+    async delete(key) {
+      if (key === oldKey && rejectOldProfile) throw new Error("cleanup_rejected");
+      return harness.mediaBucket.delete(key);
+    },
+  };
+  assert.deepEqual(await deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId: "cleanup-reuse-delete",
+  }, { db, bucket: failingBucket }), { action: "retry", delaySeconds: 1 });
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_cleanup_lease FROM threads_authors
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).first(), { profile_media_status: "deleting", profile_cleanup_lease: null });
+
+  await seedThreadsArchive(db, {
+    id: "cleanup-reuse-new", shortcode: "CleanupReuseNew",
+    threadsMediaId: "cleanup-reuse-new-root", status: "collecting",
+    jobStatus: "media_pending", rootEntryId: "cleanup-reuse-new-entry",
+    authorId: "shared-delete-author", username: "shared", displayName: "Shared",
+    createdAt: 7_000, updatedAt: 7_000,
+  });
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET content_completed_at = 7000,
+       expected_entry_count = 1, expected_media_count = 1
+     WHERE threads_post_id = 'cleanup-reuse-new'`,
+  ).run();
+  assert.equal((await recalculateThreadsStatus(db, {
+    postId: "cleanup-reuse-new", generation: 1, nowSeconds: 7_001,
+  })).status, "media_pending");
+  rejectOldProfile = false;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") return Response.json({
+      id: "shared-delete-author", username: "shared", name: "Shared",
+      threads_profile_picture_url: "https://scontent.cdninstagram.com/cleanup-new-profile",
+    });
+    return new Response(new Blob(["new-profile"], { type: "image/png" }));
+  };
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: "cleanup-reuse-new", generation: 1,
+    authorId: "shared-delete-author",
+  }, mediaDependencies(db, fetcher, { bucket: failingBucket })), { action: "ack" });
+  const author = await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_bytes, profile_etag,
+       profile_upload_lease, profile_cleanup_lease FROM threads_authors
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).first();
+  const object = harness.mediaObjects().find((item) => item.key === oldKey);
+  assert.deepEqual(author, { profile_media_status: "ready", profile_r2_key: oldKey,
+    profile_bytes: 11, profile_etag: '"r2-11"', profile_upload_lease: null,
+    profile_cleanup_lease: null });
+  assert.equal(object?.size, author?.profile_bytes);
+  assert.equal(object?.httpEtag, author?.profile_etag);
+  assert.equal(new TextDecoder().decode(object?.bytes), "new-profile");
+  assert.equal(await db.prepare(
+    "SELECT status FROM threads_sync_jobs WHERE threads_post_id = 'cleanup-reuse-new'",
+  ).first("status"), "ready");
+});
+
+test("one cleanup lease fences a delayed sweep before profile reactivation and upload", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedThreadsArchive(db, {
+    id: "cleanup-fence-post", shortcode: "CleanupFence",
+    threadsMediaId: "cleanup-fence-root", status: "collecting",
+    jobStatus: "media_pending", rootEntryId: "cleanup-fence-entry",
+    authorId: "cleanup-fence-author", username: "cleanup", displayName: "Cleanup",
+    createdAt: 7_100, updatedAt: 7_100,
+  });
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET content_completed_at = 7100,
+       expected_entry_count = 1, expected_media_count = 1
+     WHERE threads_post_id = 'cleanup-fence-post'`,
+  ).run();
+  const key = "threads/authors/cleanup-fence-author/profile";
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'deleting', profile_r2_key = ?,
+       profile_content_type = 'image/jpeg', profile_bytes = 3, profile_etag = '"old"'
+     WHERE threads_user_id = 'cleanup-fence-author'`,
+  ).bind(key).run();
+  await harness.mediaBucket.put(key,
+    new Blob(["old"], { type: "image/jpeg" }).stream(),
+    { httpMetadata: { contentType: "image/jpeg" } });
+  assert.equal((await recalculateThreadsStatus(db, {
+    postId: "cleanup-fence-post", generation: 1, nowSeconds: 7_101,
+  })).status, "media_pending");
+  const deleteStarted = deferred();
+  const releaseDelete = deferred();
+  let oldDeletes = 0;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} objectKey */
+    async delete(objectKey) {
+      if (objectKey === key) {
+        oldDeletes += 1;
+        if (oldDeletes === 1) { deleteStarted.resolve(); await releaseDelete.promise; }
+      }
+      return harness.mediaBucket.delete(objectKey);
+    },
+  };
+  const sweep = deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId: "already-gone",
+  }, { db, bucket });
+  await deleteStarted.promise;
+  assert.deepEqual(await deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId: "already-gone",
+  }, { db, bucket }), { action: "ack" });
+  let fetches = 0;
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: "cleanup-fence-post", generation: 1,
+    authorId: "cleanup-fence-author",
+  }, mediaDependencies(db, async () => { fetches += 1; throw new Error("unexpected"); },
+    { bucket })), { action: "retry", delaySeconds: 1 });
+  assert.equal(fetches, 0);
+  assert.equal(oldDeletes, 1);
+  releaseDelete.resolve();
+  assert.deepEqual(await sweep, { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_cleanup_lease
+     FROM threads_authors WHERE threads_user_id = 'cleanup-fence-author'`,
+  ).first(), { profile_media_status: "pending", profile_r2_key: null,
+    profile_cleanup_lease: null });
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") return Response.json({
+      id: "cleanup-fence-author", username: "cleanup", name: "Cleanup",
+      threads_profile_picture_url: "https://scontent.cdninstagram.com/cleanup-fenced-new",
+    });
+    return new Response(new Blob(["fenced-new"], { type: "image/png" }));
+  };
+  assert.deepEqual(await handleThreadsMediaMessage({
+    version: 1, type: "archive-profile", postId: "cleanup-fence-post", generation: 1,
+    authorId: "cleanup-fence-author",
+  }, mediaDependencies(db, fetcher, { bucket })), { action: "ack" });
+  assert.equal(oldDeletes, 1);
+  const object = harness.mediaObjects().find((item) => item.key === key);
+  const author = await db.prepare(
+    `SELECT profile_media_status, profile_bytes, profile_etag,
+       profile_upload_lease, profile_cleanup_lease FROM threads_authors
+     WHERE threads_user_id = 'cleanup-fence-author'`,
+  ).first();
+  assert.deepEqual(author, { profile_media_status: "ready", profile_bytes: 10,
+    profile_etag: '"r2-10"', profile_upload_lease: null, profile_cleanup_lease: null });
+  assert.equal(object?.size, author?.profile_bytes);
+  assert.equal(object?.httpEtag, author?.profile_etag);
+  assert.equal(new TextDecoder().decode(object?.bytes), "fenced-new");
 });
 
 test("delete-object removes only an exact D1-referenced key and media drain is bounded", async () => {

@@ -517,10 +517,18 @@ export async function startHarness() {
   let r2Mode = { putReject: false, getReject: false, deleteReject: false };
   const mediaBucket = {
     /** @param {string} key @param {ReadableStream<Uint8Array>} body
-     * @param {{ httpMetadata?: { contentType?: string } }} [options] */
+     * @param {{ httpMetadata?: { contentType?: string },
+     * onlyIf?: { etagMatches?: string, etagDoesNotMatch?: string } }} [options] */
     async put(key, body, options = {}) {
       if (r2Mode.putReject) throw new Error("test_r2_put_rejection");
       if (!(body instanceof ReadableStream)) throw new Error("test_r2_stream_required");
+      const current = r2Objects.get(key);
+      if (options.onlyIf?.etagMatches !== undefined &&
+        current?.etag !== options.onlyIf.etagMatches) return null;
+      if (options.onlyIf?.etagDoesNotMatch === "*" && current) return null;
+      if (options.onlyIf?.etagDoesNotMatch !== undefined &&
+        options.onlyIf.etagDoesNotMatch !== "*" &&
+        current?.etag === options.onlyIf.etagDoesNotMatch) return null;
       const reader = body.getReader();
       /** @type {Uint8Array[]} */
       const chunks = [];

@@ -12,8 +12,16 @@ CREATE TABLE threads_authors (
   profile_bytes INTEGER CHECK (profile_bytes IS NULL OR profile_bytes >= 0),
   profile_error_code TEXT,
   profile_refreshed_at INTEGER,
+  profile_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (profile_attempt_count >= 0),
+  profile_upload_lease TEXT,
+  profile_upload_started_at INTEGER CHECK (profile_upload_started_at IS NULL OR profile_upload_started_at >= 0),
+  profile_cleanup_lease TEXT,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  CHECK ((profile_upload_lease IS NULL AND profile_upload_started_at IS NULL)
+    OR (profile_upload_lease IS NOT NULL AND profile_upload_started_at IS NOT NULL)),
+  CHECK (profile_cleanup_lease IS NULL OR profile_media_status = 'deleting'),
+  CHECK (profile_media_status <> 'deleting' OR profile_upload_lease IS NULL)
 );
 
 CREATE TABLE threads_posts (
@@ -127,7 +135,11 @@ CREATE TABLE threads_media (
   r2_key TEXT, content_type TEXT,
   bytes INTEGER CHECK (bytes IS NULL OR bytes >= 0), etag TEXT, error_code TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  upload_lease TEXT,
+  upload_started_at INTEGER CHECK (upload_started_at IS NULL OR upload_started_at >= 0),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  CHECK ((upload_lease IS NULL AND upload_started_at IS NULL)
+    OR (upload_lease IS NOT NULL AND upload_started_at IS NOT NULL)),
   UNIQUE(entry_id, source_media_id, kind, ordinal)
 );
 CREATE INDEX threads_media_entry_status_idx ON threads_media(entry_id, status, ordinal);

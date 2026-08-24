@@ -351,7 +351,8 @@ async function aggregateRow(db, postId, generation) {
         WHERE e.threads_post_id = p.id AND m.status = 'pending') +
        (SELECT COUNT(DISTINCT e.author_id) FROM threads_entries e
         JOIN threads_authors a ON a.threads_user_id = e.author_id
-        WHERE e.threads_post_id = p.id AND a.profile_media_status = 'pending') AS pending_count
+        WHERE e.threads_post_id = p.id
+          AND a.profile_media_status IN ('pending','deleting')) AS pending_count
      FROM threads_posts p JOIN threads_sync_jobs j
        ON j.threads_post_id = p.id AND j.generation = ?
      WHERE p.id = ? AND p.sync_generation = ? AND p.status <> 'deleting'

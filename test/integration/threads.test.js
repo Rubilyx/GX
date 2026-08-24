@@ -65,15 +65,16 @@ test("0004 creates the normalized Threads archive schema", async () => {
   ).all();
   assert.deepEqual(tables.results.map(/** @param {Record<string, unknown>} row */ (row) => String(row.name)), [
     "threads_authors", "threads_entries", "threads_links", "threads_media",
-    "threads_oauth_credentials", "threads_posts", "threads_sync_cursors",
-    "threads_sync_jobs",
+    "threads_oauth_credentials", "threads_posts", "threads_profile_cleanup_keys",
+    "threads_sync_cursors", "threads_sync_jobs",
   ]);
   const indexes = await env.PROD_DB.prepare(
     "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'threads_entries' ORDER BY name",
   ).all();
   assert.ok(indexes.results.some(/** @param {Record<string, unknown>} row */ (row) => row.name === "threads_entries_primary_source_idx"));
   assert.ok(indexes.results.some(/** @param {Record<string, unknown>} row */ (row) => row.name === "threads_entries_quote_source_idx"));
-  for (const table of ["threads_entries", "threads_media", "threads_links", "threads_sync_jobs"]) {
+  for (const table of ["threads_entries", "threads_media", "threads_links",
+    "threads_profile_cleanup_keys", "threads_sync_jobs"]) {
     const foreignKeys = await env.PROD_DB.prepare(`PRAGMA foreign_key_list(${table})`).all();
     assert.ok(foreignKeys.results.some(/** @param {Record<string, unknown>} row */ (row) => row.on_delete === "CASCADE"), table);
   }
@@ -1681,6 +1682,90 @@ test("profile discovery root at the page ceiling terminalizes instead of re-enqu
   });
 });
 
+test("profile page 10000 is processed but its page-10001 cursor is never accepted", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/ProfileLastPage", 4_175,
+  );
+  const message = harness.captureMessages.shift();
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET profile_page_count = 9999
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).run();
+  assert.deepEqual(await handleThreadsCaptureMessage(message, {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+    fetcher: providerFixture({ threadsProfilePages: [{
+      data: [], nextCursor: "forbidden-profile-page-10001",
+    }] }),
+    getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_176,
+    deleteArchive: async () => ({ action: "ack" }),
+  }), { action: "ack" });
+  assert.equal(harness.captureMessages.length, 0);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code, profile_cursor, profile_page_count
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "error", error_code: "threads_provider_protocol_error",
+    profile_cursor: null, profile_page_count: 10000,
+  });
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_sync_cursors
+     WHERE threads_post_id = ? AND generation = 1
+       AND cursor = 'forbidden-profile-page-10001'`,
+  ).bind(sync.threadsPostId).first("count"), 0);
+});
+
+test("conversation page 10000 persists content but never accepts page 10001", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue,
+    "https://www.threads.com/@meta/post/ConversationLastPage", 4_177,
+  );
+  harness.captureMessages.length = 0;
+  await claimThreadsJob(db, sync.threadsPostId, 1, "resolving");
+  await saveResolvedThreadsRoot(db, {
+    postId: sync.threadsPostId, generation: 1, profile: profile(),
+    root: media("conversation-last-root", "author-1", {
+      rootPostId: null, repliedToId: null,
+      permalink: "https://www.threads.com/@meta/post/ConversationLastPage",
+    }), nowSeconds: 4_178,
+  });
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET conversation_page_count = 9999
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).run();
+  assert.deepEqual(await handleThreadsCaptureMessage({
+    version: 1, type: "collect-conversation", postId: sync.threadsPostId,
+    generation: 1, cursor: null,
+  }, {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+    fetcher: providerFixture({ threadsConversationPages: [{
+      data: [rawThreadsMedia(
+        "conversation-last-reply", "ConversationLastReply", "author-1",
+      )], nextCursor: "forbidden-conversation-page-10001",
+    }] }),
+    getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_179,
+    deleteArchive: async () => ({ action: "ack" }),
+  }), { action: "ack" });
+  assert.equal(harness.captureMessages.length, 0);
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_entries
+     WHERE threads_post_id = ? AND source_media_id = 'conversation-last-reply'`,
+  ).bind(sync.threadsPostId).first("count"), 1);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code, conversation_cursor, conversation_page_count
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "error", error_code: "threads_provider_protocol_error",
+    conversation_cursor: null, conversation_page_count: 10000,
+  });
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_sync_cursors
+     WHERE threads_post_id = ? AND generation = 1
+       AND cursor = 'forbidden-conversation-page-10001'`,
+  ).bind(sync.threadsPostId).first("count"), 0);
+});
+
 test("capture persists content before optional profile and carousel enrichment failures", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const sync = await createThreadsSync(
@@ -2377,9 +2462,66 @@ test("additive profile refresh preserves the old ready object through failure an
   assert.equal((await serveThreadsMedia(new Request(
     `https://app.test/threads/${sync.threadsPostId}/media/author-1`,
   ), { db, bucket: harness.mediaBucket })).status, 200);
-  assert.equal((await facade.startThreadsMediaRetry(
+
+  assert.deepEqual(await db.prepare(
+    `SELECT status, profile_completed, conversation_completed,
+       content_completed_at, completed_at
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "collecting", profile_completed: 1, conversation_completed: 0,
+    content_completed_at: null, completed_at: null,
+  });
+  const activeSnapshot = {
+    post: await db.prepare("SELECT * FROM threads_posts WHERE id = ?")
+      .bind(sync.threadsPostId).first(),
+    job: await db.prepare(
+      `SELECT * FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+    ).bind(sync.threadsPostId).first(),
+    profile: await db.prepare(
+      "SELECT * FROM threads_authors WHERE threads_user_id = 'author-1'",
+    ).first(),
+  };
+  const queuedBeforeActiveRetry = harness.mediaMessages.length;
+  await assert.rejects(facade.startThreadsMediaRetry(
     db, harness.mediaQueue, sync.threadsPostId, "author-1", 3_044,
+  ), (error) => error instanceof AppError && error.code === "threads_media_not_found");
+  assert.deepEqual({
+    post: await db.prepare("SELECT * FROM threads_posts WHERE id = ?")
+      .bind(sync.threadsPostId).first(),
+    job: await db.prepare(
+      `SELECT * FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+    ).bind(sync.threadsPostId).first(),
+    profile: await db.prepare(
+      "SELECT * FROM threads_authors WHERE threads_user_id = 'author-1'",
+    ).first(),
+  }, activeSnapshot);
+  assert.equal(harness.mediaMessages.length, queuedBeforeActiveRetry);
+
+  await saveThreadsConversationPage(db, {
+    postId: sync.threadsPostId, generation: 2, expectedCursor: null,
+    entries: [], nextCursor: null, nowSeconds: 3_045,
+  });
+  assert.deepEqual(await finalizeThreadsContent(db, harness.mediaQueue, {
+    postId: sync.threadsPostId, generation: 2, nowSeconds: 3_046,
+  }), { status: "partial", ready: 0, failed: 1, expected: 1 });
+  assert.deepEqual(await db.prepare(
+    `SELECT status, profile_completed, conversation_completed,
+       content_completed_at, completed_at
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "partial", profile_completed: 1, conversation_completed: 1,
+    content_completed_at: 3_046, completed_at: 3_046,
+  });
+  assert.equal((await facade.startThreadsMediaRetry(
+    db, harness.mediaQueue, sync.threadsPostId, "author-1", 3_047,
   )).targetType, "profile");
+  assert.deepEqual(await db.prepare(
+    `SELECT status, conversation_completed, content_completed_at, completed_at
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "media_pending", conversation_completed: 1,
+    content_completed_at: 3_046, completed_at: null,
+  });
   const retry = harness.mediaMessages.pop();
   const valid = providerFixture({ mediaBodies: {
     "fixture-avatar": { body: new Uint8Array([4, 5, 6]), headers: {
@@ -2387,7 +2529,7 @@ test("additive profile refresh preserves the old ready object through failure an
     } },
   } });
   assert.deepEqual(await handleThreadsMediaMessage(
-    retry, mediaDependencies(db, valid, { nowSeconds: 3_045 }),
+    retry, mediaDependencies(db, valid, { nowSeconds: 3_048 }),
   ), { action: "ack" });
   const refreshed = await db.prepare(
     `SELECT profile_media_status, profile_r2_key, profile_error_code
@@ -2396,6 +2538,80 @@ test("additive profile refresh preserves the old ready object through failure an
   assert.equal(refreshed?.profile_media_status, "ready");
   assert.equal(refreshed?.profile_error_code, null);
   assert.notEqual(refreshed?.profile_r2_key, oldKey);
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = 'author-1'`,
+  ).first("count"), 0);
+  assert.equal(await harness.mediaBucket.head(oldKey), null);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, conversation_completed, content_completed_at, completed_at
+     FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = 2`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "ready", conversation_completed: 1,
+    content_completed_at: 3_046, completed_at: 3_048,
+  });
+});
+
+test("profile replacement retains cleanup ownership until superseded R2 deletion succeeds", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, {
+    postId: "profile-cleanup-replay", shortcode: "ProfileCleanupReplay",
+    entryId: "profile-cleanup-entry", media: [],
+  });
+  const oldKey = testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A);
+  await harness.mediaBucket.put(oldKey,
+    new Blob(["old-profile"], { type: "image/png" }).stream(),
+    { httpMetadata: { contentType: "image/png" } });
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'pending',
+       profile_r2_key = ?, profile_content_type = 'image/png', profile_bytes = 11,
+       profile_etag = '"old-profile"', profile_error_code = NULL
+     WHERE threads_user_id = 'author-1'`,
+  ).bind(oldKey).run();
+  let rejectOldKey = true;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key */
+    async delete(key) {
+      if (key === oldKey && rejectOldKey) throw new Error("superseded_delete_failed");
+      return harness.mediaBucket.delete(key);
+    },
+  };
+  /** @type {Array<{ method: string, path: string }>} */
+  const calls = [];
+  const fetcher = providerFixture({ calls, mediaBodies: {
+    "fixture-avatar": { body: new Uint8Array([1, 2, 3]), headers: {
+      "Content-Type": "image/png", "Content-Length": "3",
+    } },
+  } });
+  const message = { version: 1, type: "archive-profile",
+    postId: seeded.postId, generation: 1, authorId: "author-1" };
+  assert.deepEqual(await handleThreadsMediaMessage(message,
+    mediaDependencies(db, fetcher, { bucket, nowSeconds: 5_110 })),
+  { action: "retry", delaySeconds: 1 });
+  const winner = await db.prepare(
+    `SELECT profile_media_status, profile_r2_key FROM threads_authors
+     WHERE threads_user_id = 'author-1'`,
+  ).first();
+  assert.equal(winner?.profile_media_status, "ready");
+  assert.notEqual(winner?.profile_r2_key, oldKey);
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = 'author-1' AND r2_key = ?`,
+  ).bind(oldKey).first("count"), 1);
+  assert.notEqual(await harness.mediaBucket.head(oldKey), null);
+  const callCount = calls.length;
+
+  rejectOldKey = false;
+  assert.deepEqual(await handleThreadsMediaMessage(message,
+    mediaDependencies(db, fetcher, { bucket, nowSeconds: 5_111 })),
+  { action: "ack" });
+  assert.equal(calls.length, callCount);
+  assert.equal(await harness.mediaBucket.head(oldKey), null);
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = 'author-1'`,
+  ).first("count"), 0);
 });
 
 /** @param {D1Database} db @param {string} id @param {number} createdAt @param {string} [jobStatus] */
@@ -2840,6 +3056,60 @@ function mediaDependencies(db, fetcher, overrides = {}) {
     recalculateStatus: recalculateThreadsStatus, nowSeconds: 5_100, ...overrides,
   };
 }
+
+test("pending media dominates durable failure until the final item settles", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, {
+    postId: "pending-dominates-failure", shortcode: "PendingDominatesFailure",
+    entryId: "pending-dominates-entry", media: [
+      { id: "already-failed-media", sourceId: "already-failed-source",
+        kind: "image", ordinal: 0 },
+      { id: "late-ready-media", sourceId: "late-ready-source",
+        kind: "image", ordinal: 1 },
+    ],
+  });
+  await db.prepare(
+    `UPDATE threads_media SET status = 'error',
+       error_code = 'threads_media_unavailable'
+     WHERE id = 'already-failed-media'`,
+  ).run();
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready',
+       profile_r2_key = ?, profile_content_type = 'image/png', profile_bytes = 7,
+       profile_etag = '"profile-ready"'
+     WHERE threads_user_id = 'author-1'`,
+  ).bind(testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A)).run();
+  assert.deepEqual(await recalculateThreadsStatus(db, {
+    postId: seeded.postId, generation: 1, nowSeconds: 5_001,
+  }), { status: "media_pending", ready: 1, failed: 1, expected: 3 });
+  assert.deepEqual(await db.prepare(
+    `SELECT post.status AS post_status, job.status AS job_status, job.completed_at
+     FROM threads_posts post JOIN threads_sync_jobs job
+       ON job.threads_post_id = post.id AND job.generation = post.sync_generation
+     WHERE post.id = ?`,
+  ).bind(seeded.postId).first(), {
+    post_status: "collecting", job_status: "media_pending", completed_at: null,
+  });
+
+  await db.prepare(
+    `UPDATE threads_media SET status = 'ready', r2_key = ?,
+       content_type = 'image/jpeg', bytes = 4, etag = '"late-ready"',
+       error_code = NULL WHERE id = 'late-ready-media'`,
+  ).bind(testEntryVersionKey(
+    seeded.postId, "late-ready-source", "image", 1, TEST_UPLOAD_LEASE_B,
+  )).run();
+  assert.deepEqual(await recalculateThreadsStatus(db, {
+    postId: seeded.postId, generation: 1, nowSeconds: 5_002,
+  }), { status: "partial", ready: 2, failed: 1, expected: 3 });
+  assert.deepEqual(await db.prepare(
+    `SELECT post.status AS post_status, job.status AS job_status, job.completed_at
+     FROM threads_posts post JOIN threads_sync_jobs job
+       ON job.threads_post_id = post.id AND job.generation = post.sync_generation
+     WHERE post.id = ?`,
+  ).bind(seeded.postId).first(), {
+    post_status: "partial", job_status: "partial", completed_at: 5_002,
+  });
+});
 
 /** @returns {{ promise: Promise<void>, resolve: () => void }} */
 function deferred() {
@@ -4685,6 +4955,112 @@ test("Threads deletion keeps shared profiles until unreferenced and concurrent a
   ).first("count"), 0);
   assert.deepEqual(harness.mediaObjects(), []);
   assert.deepEqual(results, [{ action: "ack" }, { action: "ack" }]);
+});
+
+test("last-archive deletion owns active pending and superseded profile keys across retry", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const postId = "delete-profile-versions";
+  const entryKey = deletingEntryKey(postId);
+  await seedDeletingArchive(db, postId, "delete-profile-versions-entry", entryKey);
+  const activeKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_A);
+  const pendingKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_B);
+  const supersededKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_C);
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'pending',
+       profile_r2_key = ?, profile_content_type = 'image/png', profile_bytes = 6,
+       profile_etag = '"active"', profile_upload_lease = ?,
+       profile_upload_started_at = 6000, profile_pending_r2_key = ?
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).bind(activeKey, TEST_UPLOAD_LEASE_B, pendingKey).run();
+  await db.prepare(
+    `INSERT INTO threads_profile_cleanup_keys
+       (threads_user_id, r2_key, created_at)
+     VALUES ('shared-delete-author', ?, 6000)`,
+  ).bind(supersededKey).run();
+  for (const [key, body] of [[entryKey, "e"], [activeKey, "active"],
+    [pendingKey, "pending"], [supersededKey, "superseded"]])
+    await harness.mediaBucket.put(key,
+      new Blob([body], { type: "image/png" }).stream(),
+      { httpMetadata: { contentType: "image/png" } });
+  let rejectSuperseded = true;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key */
+    async delete(key) {
+      if (key === supersededKey && rejectSuperseded)
+        throw new Error("superseded_cleanup_rejected");
+      return harness.mediaBucket.delete(key);
+    },
+  };
+  assert.deepEqual(await deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId,
+  }, { db, bucket, nowSeconds: 6_100 }), { action: "retry", delaySeconds: 1 });
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE id = ?",
+  ).bind(postId).first("count"), 0);
+  assert.deepEqual(new Set(harness.mediaObjects().map((object) => object.key)),
+    new Set([supersededKey]));
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).first("count"), 1);
+
+  rejectSuperseded = false;
+  assert.deepEqual(await deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId,
+  }, { db, bucket, nowSeconds: 6_101 }), { action: "ack" });
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE id = ?",
+  ).bind(postId).first("count"), 0);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_authors WHERE threads_user_id = 'shared-delete-author'",
+  ).first("count"), 0);
+  assert.deepEqual(harness.mediaObjects(), []);
+});
+
+test("deleting one shared archive retains every profile key and cleanup owner", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedDeletingArchive(db, "shared-versions-a", "shared-versions-entry-a",
+    deletingEntryKey("shared-versions-a"));
+  await seedDeletingArchive(db, "shared-versions-b", "shared-versions-entry-b",
+    deletingEntryKey("shared-versions-b"));
+  await db.prepare(
+    "UPDATE threads_posts SET status = 'ready' WHERE id = 'shared-versions-b'",
+  ).run();
+  const activeKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_A);
+  const pendingKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_B);
+  const supersededKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_C);
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'pending',
+       profile_r2_key = ?, profile_content_type = 'image/png', profile_bytes = 6,
+       profile_etag = '"active"', profile_upload_lease = ?,
+       profile_upload_started_at = 6000, profile_pending_r2_key = ?
+     WHERE threads_user_id = 'shared-delete-author'`,
+  ).bind(activeKey, TEST_UPLOAD_LEASE_B, pendingKey).run();
+  await db.prepare(
+    `INSERT INTO threads_profile_cleanup_keys
+       (threads_user_id, r2_key, created_at)
+     VALUES ('shared-delete-author', ?, 6000)`,
+  ).bind(supersededKey).run();
+  for (const key of [deletingEntryKey("shared-versions-a"), activeKey,
+    pendingKey, supersededKey]) await harness.mediaBucket.put(key,
+    new Blob(["x"], { type: "image/png" }).stream(),
+    { httpMetadata: { contentType: "image/png" } });
+  assert.deepEqual(await deleteThreadsArchive({
+    version: 1, type: "delete-archive", postId: "shared-versions-a",
+  }, { db, bucket: harness.mediaBucket, nowSeconds: 6_200 }), { action: "ack" });
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE id = 'shared-versions-a'",
+  ).first("count"), 0);
+  assert.equal(await db.prepare(
+    "SELECT COUNT(*) AS count FROM threads_authors WHERE threads_user_id = 'shared-delete-author'",
+  ).first("count"), 1);
+  assert.equal(await db.prepare(
+    `SELECT COUNT(*) AS count FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = 'shared-delete-author' AND r2_key = ?`,
+  ).bind(supersededKey).first("count"), 1);
+  for (const key of [activeKey, pendingKey, supersededKey])
+    assert.notEqual(await harness.mediaBucket.head(key), null);
 });
 
 test("Threads deletion leaves tombstones on object failure and retries a deleting profile after its post is gone", async () => {

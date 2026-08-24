@@ -1,7 +1,8 @@
 import { AppError } from "./domain.js";
 import { validateStoredContentType, validateStoredEtag } from "./thread-media-download.js";
 import {
-  d1NonnegativeInteger, exactRow, inputTimestamp, mutationChanges, requiredString,
+  d1NonnegativeInteger, exactRow, inputTimestamp, mutationBatch, mutationChanges,
+  requiredString,
 } from "./threads-storage.js";
 
 export const MEDIA_ACK = Object.freeze({ action: "ack" });
@@ -367,7 +368,7 @@ export async function readyEntryUpload(db, message, row, object, now) {
 export async function readyProfileUpload(db, message, row, object, now) {
   if (object.key !== row.pending_r2_key)
     throw new AppError("storage_unavailable", 503);
-  const changes = mutationChanges(await db.prepare(
+  const update = db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'ready',
        profile_r2_key = profile_pending_r2_key,
        profile_content_type = ?, profile_bytes = ?, profile_etag = ?,
@@ -388,9 +389,25 @@ export async function readyProfileUpload(db, message, row, object, now) {
      )`,
   ).bind(object.contentType, object.size, object.httpEtag, now, now,
     row.author_id, row.upload_lease, row.upload_started_at, row.pending_r2_key,
-    message.postId, message.generation).run());
-  if (changes > 1) throw new AppError("storage_unavailable", 503);
-  return changes === 1;
+    message.postId, message.generation);
+  if (row.r2_key === null || row.r2_key === object.key) {
+    const changes = mutationChanges(await update.run());
+    if (changes > 1) throw new AppError("storage_unavailable", 503);
+    return changes === 1;
+  }
+  const statements = [update, db.prepare(
+    `INSERT INTO threads_profile_cleanup_keys (threads_user_id, r2_key, created_at)
+     SELECT ?, ?, ? WHERE EXISTS (
+       SELECT 1 FROM threads_authors
+       WHERE threads_user_id = ? AND profile_media_status = 'ready'
+         AND profile_r2_key = ?
+     )
+     ON CONFLICT(r2_key) DO NOTHING`,
+  ).bind(row.author_id, row.r2_key, now, row.author_id, object.key)];
+  const changes = mutationBatch(await db.batch(statements), statements.length);
+  if (changes[0] > 1 || changes.slice(1).some((count) => count > 1))
+    throw new AppError("storage_unavailable", 503);
+  return changes[0] === 1;
 }
 
 /** @param {unknown} error */

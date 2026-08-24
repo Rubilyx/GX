@@ -808,12 +808,15 @@ export async function saveThreadsConversationPage(db, input) {
          ON post.id = job.threads_post_id
        WHERE job.threads_post_id = ? AND job.generation = ?
          AND job.capture_lease = ? AND job.conversation_cursor IS ?
+         AND job.conversation_page_count + 1 < ${MAX_CAPTURE_PAGES}
          AND post.sync_generation = job.generation AND post.status <> 'deleting'
        ON CONFLICT DO NOTHING`,
     ).bind(nextCursor, now, postId, generation, captureLease, expectedCursor));
     statements.push(db.prepare(
       `UPDATE threads_sync_jobs SET status = 'collecting', conversation_started = 1,
-         conversation_completed = ?, conversation_cursor = ?,
+         conversation_completed = ?, conversation_cursor = CASE
+           WHEN conversation_page_count + 1 >= ? AND ? IS NOT NULL
+             THEN conversation_cursor ELSE ? END,
          conversation_page_count = conversation_page_count + 1, capture_lease = NULL,
          updated_at = ?
        WHERE threads_post_id = ? AND generation = ? AND capture_lease = ?
@@ -821,7 +824,8 @@ export async function saveThreadsConversationPage(db, input) {
            SELECT 1 FROM threads_posts
            WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
          )`,
-    ).bind(nextCursor === null ? 1 : 0, nextCursor, now, postId, generation,
+    ).bind(nextCursor === null ? 1 : 0, MAX_CAPTURE_PAGES, nextCursor,
+      nextCursor, now, postId, generation,
       captureLease, postId, generation));
     const changes = mutationBatch(await db.batch(statements), statements.length);
     if (changes.some((count) => count > 1)) invalidStorage();
@@ -855,6 +859,8 @@ export async function saveThreadsConversationPage(db, input) {
       return { applied: false, accepted: 0, nextCursor, quoteWork: [] };
     }
     if (changes.at(-1) !== 1) invalidStorage();
+    if (nextCursor !== null && changes.at(-2) === 0)
+      throw new AppError("threads_provider_protocol_error", 502);
     if (nextCursor !== null && changes.at(-2) !== 1) invalidStorage();
     for (const start of rearmStarts)
       if (changes[start] !== changes[start + 1]) invalidStorage();

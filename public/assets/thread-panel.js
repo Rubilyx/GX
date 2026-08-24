@@ -59,13 +59,14 @@ function externalUrl(value) {
 /** @param {unknown} value @param {string} postId */
 function validateProfile(value, postId) {
   const keys = ["status", "contentType", "etag", "bytes", "errorCode",
-    "available", "url", "retryUrl"];
+    "available", "retryable", "url", "retryUrl"];
   if (!exact(value, keys)) throw new Error("invalid_profile");
   const profile = /** @type {Record<string, unknown>} */ (value);
   if (!["pending", "ready", "error"].includes(String(profile.status)) ||
     !nullableString(profile.contentType) || !nullableString(profile.etag) ||
     !(profile.bytes === null || nonnegative(profile.bytes)) ||
     !nullableString(profile.errorCode) || typeof profile.available !== "boolean" ||
+    typeof profile.retryable !== "boolean" ||
     !nullableString(profile.url) || !nullableString(profile.retryUrl))
     throw new Error("invalid_profile");
   const available = localUrl(profile.url,
@@ -73,7 +74,8 @@ function validateProfile(value, postId) {
   const retry = localUrl(profile.retryUrl,
     new RegExp(`^/threads/${postId}/media/[0-9A-Za-z_-]+/retry$`));
   if ((profile.available ? !available : profile.url !== null) ||
-    (profile.status === "error" ? !retry : profile.retryUrl !== null))
+    (profile.status === "error" && profile.retryable === true
+      ? !retry : profile.retryUrl !== null))
     throw new Error("invalid_profile");
   return profile;
 }
@@ -176,6 +178,8 @@ function validateArchive(value, postId) {
     if (!nonnegative(progress[key])) throw new Error("invalid_archive");
   if (Number(progress.expected) !== Number(progress.ready) + Number(progress.failed) +
     Number(progress.pending)) throw new Error("invalid_archive");
+  if (!pollingStatus(archive.status) && Number(progress.pending) !== 0)
+    throw new Error("invalid_archive");
   return archive;
 }
 
@@ -272,7 +276,7 @@ function authorNode(author, postId) {
   username.textContent = `@${author.username}`;
   header.appendChild(name);
   header.appendChild(username);
-  if (profile.status === "error") {
+  if (profile.status === "error" && profile.retryable === true) {
     const form = retryForm(/** @type {string} */ (profile.retryUrl),
       "프로필 이미지 재시도");
     if (form) header.appendChild(form);
@@ -391,11 +395,19 @@ const replyNode = (entry, postId) => entryNode(entry, postId, { reply: true });
 
 /** @param {HTMLElement} node @param {string} text @param {Record<string, unknown>[]} links */
 function appendLinkedText(node, text, links) {
-  const matches = links.map((link) => {
+  const matches = [];
+  for (const link of links) {
     const label = /** @type {string} */ (link.url);
-    return { start: text.indexOf(label), label };
-  }).filter((match) => match.start >= 0)
-    .sort((left, right) => left.start - right.start || right.label.length - left.label.length);
+    let searchFrom = 0;
+    while (searchFrom <= text.length - label.length) {
+      const start = text.indexOf(label, searchFrom);
+      if (start < 0) break;
+      matches.push({ start, label });
+      searchFrom = start + label.length;
+    }
+  }
+  matches.sort((left, right) =>
+    left.start - right.start || right.label.length - left.label.length);
   let offset = 0;
   for (const match of matches) {
     if (match.start < offset) continue;
@@ -447,6 +459,18 @@ function mediaNode(entry, postId) {
       }
     }
     container.appendChild(gallery);
+  }
+  if (media.some((item) => item.status === "pending")) {
+    const pending = document.createElement("p");
+    pending.dataset.threadMediaState = "";
+    pending.textContent = "미디어 보관 중";
+    container.appendChild(pending);
+  }
+  if (media.some((item) => item.status === "error")) {
+    const failed = document.createElement("p");
+    failed.dataset.threadMediaState = "";
+    failed.textContent = "일부 미디어를 보관하지 못했습니다.";
+    container.appendChild(failed);
   }
   const token = document.querySelector('[data-thread-sync-form] input[name="csrf"]');
   for (const item of media.filter((candidate) => candidate.status === "error")) {
@@ -630,6 +654,7 @@ class ThreadPanel extends HTMLElement {
    * @param {Record<string, unknown>[]} replies */
   applyCompleteArchive(state, archive, replies) {
     const wasExpanded = state.expanded;
+    const previousStatus = state.card.dataset.threadStatus ?? "";
     this.applyPolling(state.card, archive);
     state.expansionEpoch += 1;
     state.expansionController?.abort();
@@ -685,6 +710,13 @@ class ThreadPanel extends HTMLElement {
       link.textContent = `작성자 답글 ${archive.replyCount}개 ${wasExpanded ? "접기" : "모두 보기"}`;
       link.removeAttribute("aria-busy");
     } else if (link instanceof HTMLAnchorElement) link.remove();
+    if (previousStatus === "deleting" &&
+      ["ready", "partial", "error"].includes(String(archive.status))) {
+      for (const button of state.card.querySelectorAll("button"))
+        if (button instanceof HTMLButtonElement) button.disabled = false;
+      for (const action of state.card.querySelectorAll("[data-thread-all-replies]"))
+        if (action instanceof HTMLAnchorElement) action.removeAttribute("aria-disabled");
+    }
   }
 
   /** @param {any} state */

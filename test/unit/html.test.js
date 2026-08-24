@@ -26,7 +26,7 @@ const threadEntry = {
   author: {
     id: "author-1", username: "author<script>", displayName: "작성자 <script>",
     profileMedia: { status: "ready", contentType: "image/jpeg", etag: "etag", bytes: 12,
-      errorCode: null, available: true },
+      errorCode: null, available: true, retryable: false },
   },
   text: "본문 <script> https://safe.example/path", permalink: "https://www.threads.net/@author/post/post-1",
   publishedAt: "2026-08-23T15:30:00.000Z", mediaType: "CAROUSEL_ALBUM", altText: null,
@@ -41,6 +41,7 @@ const threadEntry = {
     { id: "thumbnail-1", sourceMediaId: "video-source", kind: "video_thumbnail", ordinal: 2, altText: null, status: "ready" },
     { id: "failed-1", sourceMediaId: "failed-source", kind: "image", ordinal: 3, altText: null, status: "error" },
     { id: "video-fallback", sourceMediaId: "fallback-source", kind: "video", ordinal: 4, altText: null, status: "ready" },
+    { id: "pending-1", sourceMediaId: "pending-source", kind: "image", ordinal: 5, altText: null, status: "pending" },
   ],
   quote: null,
 };
@@ -566,6 +567,8 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /href="\/threads\/post-1#author-replies">작성자 답글 12개 모두 보기<\/a>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/sync" data-thread-sync-form>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry" data-thread-retry-form>/);
+  assert.match(html, /data-thread-media-state>미디어 보관 중<\/p>/);
+  assert.match(html, /data-thread-media-state>일부 미디어를 보관하지 못했습니다\.<\/p>/);
   const retry = html.match(/<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry"[\s\S]*?<\/form>/)?.[0] ?? "";
   assert.match(retry, /<input type="hidden" name="csrf" value="csrf&quot;x">/);
   assert.match(html, /<details data-thread-delete>[\s\S]*action="\/threads\/post-1\/delete"[\s\S]*name="confirm" value="yes"/);
@@ -595,6 +598,43 @@ test("Threads detail paginates twenty chronological replies and retains shared R
   assert.match(html, /Threads 연결을 해제했습니다/);
   assert.doesNotMatch(html, /<script[^>]+src="https:|threads\.net\/embed|cdninstagram\.com/);
   assert.match(html, /<thread-panel>[\s\S]*<dialog data-thread-delete-dialog>/);
+});
+
+test("Threads profile retry renders only after capture work is terminal", () => {
+  const profileError = {
+    status: "error", contentType: "image/jpeg", etag: '"old"', bytes: 3,
+    errorCode: "threads_profile_unavailable", available: true, retryable: false,
+  };
+  const active = {
+    ...threadArchive, status: "collecting",
+    author: { ...threadArchive.author, profileMedia: profileError },
+    root: {
+      ...threadArchive.root,
+      author: { ...threadArchive.root.author, profileMedia: profileError },
+    },
+  };
+  const activeHtml = renderThreadsIndexPage({
+    releaseId: "abc123", csrfToken: "csrf", connected: true,
+    archives: [active], page: 1, totalPages: 1, flash: "",
+  });
+  assert.doesNotMatch(activeHtml,
+    /action="\/threads\/post-1\/media\/author-1\/retry"/);
+
+  const terminalProfile = { ...profileError, retryable: true };
+  const terminal = {
+    ...active, status: "partial",
+    author: { ...active.author, profileMedia: terminalProfile },
+    root: {
+      ...active.root,
+      author: { ...active.root.author, profileMedia: terminalProfile },
+    },
+  };
+  const terminalHtml = renderThreadsIndexPage({
+    releaseId: "abc123", csrfToken: "csrf", connected: true,
+    archives: [terminal], page: 1, totalPages: 1, flash: "",
+  });
+  assert.match(terminalHtml,
+    /action="\/threads\/post-1\/media\/author-1\/retry"/);
 });
 
 test("Threads empty state exposes the progressive capture and deletion focus targets", () => {

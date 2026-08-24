@@ -407,7 +407,7 @@ function threadAuthor(postId, author, csrfToken) {
   const profile = author?.profileMedia;
   const image = (profile?.available === true || profile?.status === "ready") && author?.id
     ? `<img data-thread-author-image src="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(author.id)}" alt="" width="44" height="44" loading="lazy" decoding="async">` : "";
-  const retry = profile?.status === "error" && author?.id
+  const retry = profile?.status === "error" && profile?.retryable === true && author?.id
     ? `<form method="post" action="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(author.id)}/retry" data-thread-retry-form>${csrf(csrfToken)}<button type="submit">프로필 이미지 재시도</button></form>` : "";
   return `<header class="thread-author">${image}<strong data-thread-author-name>${htmlText(author?.displayName ?? "알 수 없는 작성자")}</strong><span data-thread-author-username>@${htmlText(author?.username ?? "unknown")}</span>${retry}</header>`;
 }

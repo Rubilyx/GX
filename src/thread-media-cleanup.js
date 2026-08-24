@@ -94,30 +94,64 @@ async function deletionRows(db, postId) {
   return { media, authors: authors.map((row) => /** @type {string} */ (row.author_id)) };
 }
 
-/** @param {any} db @param {string} postId @param {string[]} authors */
-async function cascadeArchive(db, postId, authors) {
+/** The post-delete statements are also a concurrency fallback: if two shared
+ * archives disappear together, the transaction that removes the final reference
+ * durably owns the profile keys before clearing them from the author row.
+ * @param {any} db @param {string} postId @param {string[]} authors @param {number} now */
+async function cascadeArchive(db, postId, authors, now) {
   const statements = [db.prepare(
     "DELETE FROM threads_posts WHERE id = ? AND status = 'deleting'",
   ).bind(postId)];
   if (authors.length > 0) {
     const placeholders = authors.map(() => "?").join(",");
+    const unreferenced = `threads_user_id IN (${placeholders}) AND NOT EXISTS (
+      SELECT 1 FROM threads_entries
+      WHERE author_id = threads_authors.threads_user_id
+    )`;
+    statements.push(db.prepare(
+      `INSERT INTO threads_profile_cleanup_keys (threads_user_id, r2_key, created_at)
+       SELECT threads_user_id, profile_r2_key, ? FROM threads_authors
+       WHERE ${unreferenced} AND profile_r2_key IS NOT NULL
+       ON CONFLICT(r2_key) DO NOTHING`,
+    ).bind(now, ...authors));
+    statements.push(db.prepare(
+      `INSERT INTO threads_profile_cleanup_keys (threads_user_id, r2_key, created_at)
+       SELECT threads_user_id, profile_pending_r2_key, ? FROM threads_authors
+       WHERE ${unreferenced} AND profile_pending_r2_key IS NOT NULL
+       ON CONFLICT(r2_key) DO NOTHING`,
+    ).bind(now, ...authors));
     statements.push(db.prepare(
       `UPDATE threads_authors SET profile_media_status = 'deleting',
-         profile_r2_key = COALESCE(profile_pending_r2_key, profile_r2_key),
          profile_upload_lease = NULL, profile_upload_started_at = NULL,
-         profile_pending_r2_key = NULL, profile_upload_recovering = 0,
+         profile_pending_r2_key = NULL,
+         profile_upload_recovering = 0,
          profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
-       WHERE threads_user_id IN (${placeholders})
-         AND (profile_r2_key IS NOT NULL OR profile_pending_r2_key IS NOT NULL)
-         AND NOT EXISTS (
-           SELECT 1 FROM threads_entries
-           WHERE author_id = threads_authors.threads_user_id
-         )`,
+       WHERE ${unreferenced} AND profile_cleanup_lease IS NULL
+         AND (profile_r2_key IS NOT NULL OR profile_pending_r2_key IS NOT NULL
+           OR EXISTS (
+             SELECT 1 FROM threads_profile_cleanup_keys owned
+             WHERE owned.threads_user_id = threads_authors.threads_user_id
+           ))
+         AND (profile_r2_key IS NULL OR EXISTS (
+           SELECT 1 FROM threads_profile_cleanup_keys active_owned
+           WHERE active_owned.threads_user_id = threads_authors.threads_user_id
+             AND active_owned.r2_key = threads_authors.profile_r2_key
+         ))
+         AND (profile_pending_r2_key IS NULL OR EXISTS (
+           SELECT 1 FROM threads_profile_cleanup_keys pending_owned
+           WHERE pending_owned.threads_user_id = threads_authors.threads_user_id
+             AND pending_owned.r2_key = threads_authors.profile_pending_r2_key
+         ))`,
     ).bind(...authors));
     statements.push(db.prepare(
       `DELETE FROM threads_authors
        WHERE threads_user_id IN (${placeholders}) AND profile_r2_key IS NULL
          AND profile_pending_r2_key IS NULL
+         AND profile_cleanup_lease IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM threads_profile_cleanup_keys owned
+           WHERE owned.threads_user_id = threads_authors.threads_user_id
+         )
          AND NOT EXISTS (
            SELECT 1 FROM threads_entries
            WHERE author_id = threads_authors.threads_user_id
@@ -161,6 +195,28 @@ async function releaseProfileCleanup(db, authorId, lease, started) {
   if (changes > 1) throw new AppError("storage_unavailable", 503);
 }
 
+/** Delete superseded immutable profile objects, retaining each durable owner until
+ * its R2 deletion has succeeded. Replaying a deletion after a D1 failure is safe.
+ * @param {any} db @param {any} bucket @param {string} authorId */
+export async function cleanupSupersededProfileKeys(db, bucket, authorId) {
+  requiredString(authorId);
+  const rows = selectRows(await db.prepare(
+    `SELECT r2_key FROM threads_profile_cleanup_keys
+     WHERE threads_user_id = ? ORDER BY r2_key`,
+  ).bind(authorId).all(), ["r2_key"]);
+  for (const row of rows) {
+    if (!validProfileKey(row.r2_key, authorId))
+      throw new AppError("storage_unavailable", 503);
+    try { await bucket.delete(row.r2_key); }
+    catch { throw new AppError("media_storage_unavailable", 503); }
+    const changes = mutationChanges(await db.prepare(
+      `DELETE FROM threads_profile_cleanup_keys
+       WHERE threads_user_id = ? AND r2_key = ?`,
+    ).bind(authorId, row.r2_key).run());
+    if (changes !== 1) throw new AppError("storage_unavailable", 503);
+  }
+}
+
 /** @param {any} db @param {any} bucket @param {{ author_id: string,
  * r2_key: string | null, cleanup_lease?: string | null,
  * cleanup_started_at?: number | null }} row @param {number} now
@@ -181,15 +237,39 @@ export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = t
     return "busy";
   }
   try {
-    if (row.r2_key !== null) {
-      try { await bucket.delete(row.r2_key); }
+    const owned = selectRows(await db.prepare(
+      `SELECT r2_key FROM threads_profile_cleanup_keys
+       WHERE threads_user_id = ? ORDER BY r2_key`,
+    ).bind(row.author_id).all(), ["r2_key"]);
+    const ownedKeys = new Set();
+    for (const item of owned) {
+      if (!validProfileKey(item.r2_key, row.author_id))
+        throw new AppError("storage_unavailable", 503);
+      ownedKeys.add(item.r2_key);
+    }
+    const keys = [...new Set([
+      ...(row.r2_key === null ? [] : [row.r2_key]), ...ownedKeys,
+    ])].sort();
+    for (const key of keys) {
+      try { await bucket.delete(key); }
       catch { throw new AppError("media_storage_unavailable", 503); }
+      if (ownedKeys.has(key)) {
+        const removed = mutationChanges(await db.prepare(
+          `DELETE FROM threads_profile_cleanup_keys
+           WHERE threads_user_id = ? AND r2_key = ?`,
+        ).bind(row.author_id, key).run());
+        if (removed !== 1) throw new AppError("storage_unavailable", 503);
+      }
     }
     const changes = mutationBatch(await db.batch([
       db.prepare(
         `DELETE FROM threads_authors
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
            AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM threads_profile_cleanup_keys owned
+             WHERE owned.threads_user_id = threads_authors.threads_user_id
+           )
            AND NOT EXISTS (
              SELECT 1 FROM threads_entries
              WHERE author_id = threads_authors.threads_user_id
@@ -204,15 +284,49 @@ export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = t
            profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
            AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM threads_profile_cleanup_keys owned
+             WHERE owned.threads_user_id = threads_authors.threads_user_id
+           )
            AND EXISTS (
-             SELECT 1 FROM threads_entries
-             WHERE author_id = threads_authors.threads_user_id
+             SELECT 1 FROM threads_entries retained
+             JOIN threads_posts retained_post
+               ON retained_post.id = retained.threads_post_id
+             WHERE retained.author_id = threads_authors.threads_user_id
+               AND retained_post.status <> 'deleting'
            )`,
       ).bind(row.author_id, lease, now),
-    ]), 2);
-    if (changes[0] + changes[1] !== 1 || changes.some((count) => count > 1))
+      db.prepare(
+        `UPDATE threads_authors SET profile_r2_key = NULL,
+           profile_content_type = NULL, profile_bytes = NULL, profile_etag = NULL,
+           profile_error_code = NULL, profile_refreshed_at = NULL,
+           profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
+         WHERE threads_user_id = ? AND profile_media_status = 'deleting'
+           AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM threads_profile_cleanup_keys owned
+             WHERE owned.threads_user_id = threads_authors.threads_user_id
+           )
+           AND EXISTS (
+             SELECT 1 FROM threads_entries deleting_entry
+             JOIN threads_posts deleting_post
+               ON deleting_post.id = deleting_entry.threads_post_id
+             WHERE deleting_entry.author_id = threads_authors.threads_user_id
+               AND deleting_post.status = 'deleting'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM threads_entries retained
+             JOIN threads_posts retained_post
+               ON retained_post.id = retained.threads_post_id
+             WHERE retained.author_id = threads_authors.threads_user_id
+               AND retained_post.status <> 'deleting'
+           )`,
+      ).bind(row.author_id, lease, now),
+    ]), 3);
+    if (changes.reduce((sum, count) => sum + count, 0) !== 1 ||
+      changes.some((count) => count > 1))
       throw new AppError("storage_unavailable", 503);
-    return changes[1] === 1 ? "pending" : "deleted";
+    return changes[1] === 1 ? "pending" : changes[2] === 1 ? "deleting" : "deleted";
   } catch (error) {
     try { await releaseProfileCleanup(db, row.author_id, lease, now); } catch {}
     throw error;
@@ -259,7 +373,7 @@ export async function deleteThreadsArchive(rawMessage, dependencies) {
         try { await dependencies.bucket.delete(row.r2_key); }
         catch { throw new AppError("media_storage_unavailable", 503); }
       }
-      await cascadeArchive(dependencies.db, postId, rows.authors);
+      await cascadeArchive(dependencies.db, postId, rows.authors, now);
     }
     await sweepDeletingProfiles(dependencies.db, dependencies.bucket, now);
     return MEDIA_ACK;

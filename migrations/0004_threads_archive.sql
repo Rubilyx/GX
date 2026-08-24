@@ -34,6 +34,15 @@ CREATE TABLE threads_authors (
   CHECK (profile_media_status <> 'deleting' OR profile_upload_lease IS NULL)
 );
 
+CREATE TABLE threads_profile_cleanup_keys (
+  threads_user_id TEXT NOT NULL
+    REFERENCES threads_authors(threads_user_id) ON DELETE CASCADE,
+  r2_key TEXT PRIMARY KEY NOT NULL,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
+CREATE INDEX threads_profile_cleanup_keys_author_idx
+ON threads_profile_cleanup_keys(threads_user_id, created_at, r2_key);
+
 CREATE TABLE threads_posts (
   id TEXT PRIMARY KEY NOT NULL,
   shortcode TEXT NOT NULL UNIQUE,

@@ -1,5 +1,7 @@
 import { AppError } from "./domain.js";
-import { cleanupDeletingProfile, deleteReferencedObject } from "./thread-media-cleanup.js";
+import {
+  cleanupDeletingProfile, cleanupSupersededProfileKeys, deleteReferencedObject,
+} from "./thread-media-cleanup.js";
 import {
   IMAGE_TYPES, VIDEO_TYPES, ThreadsMediaPutUncertainError, ThreadsMediaWriteError,
   downloadThreadsMedia, mediaMaximumBytes,
@@ -57,15 +59,23 @@ async function reconcileProfilePut(message, dependencies, key) {
   const current = await readGlobalProfileMedia(dependencies.db, message.authorId);
   const ready = current?.status === "ready";
   if (ready && current.r2_key === key) {
-    if (await readProfileMedia(dependencies.db, message))
+    if (await readProfileMedia(dependencies.db, message)) {
+      await cleanupSupersededProfileKeys(
+        dependencies.db, dependencies.bucket, message.authorId,
+      );
       await recalculateMediaStatus(dependencies, message);
+    }
     return true;
   }
   if (current?.pending_r2_key === key) return false;
   if (current?.r2_key === key) return true;
   await deleteUncommittedUpload(dependencies.bucket, key);
-  if (ready && await readProfileMedia(dependencies.db, message))
+  if (ready && await readProfileMedia(dependencies.db, message)) {
+    await cleanupSupersededProfileKeys(
+      dependencies.db, dependencies.bucket, message.authorId,
+    );
     await recalculateMediaStatus(dependencies, message);
+  }
   return true;
 }
 
@@ -102,6 +112,9 @@ async function persistProfileReady(message, dependencies, row, object, now) {
     throw error;
   }
   if (committed) {
+    await cleanupSupersededProfileKeys(
+      dependencies.db, dependencies.bucket, message.authorId,
+    );
     await recalculateMediaStatus(dependencies, message);
     return;
   }
@@ -201,6 +214,9 @@ async function archiveProfile(message, dependencies) {
   let row = await readProfileMedia(dependencies.db, message);
   if (!row) return;
   if (row.status === "ready") {
+    await cleanupSupersededProfileKeys(
+      dependencies.db, dependencies.bucket, message.authorId,
+    );
     await recalculateMediaStatus(dependencies, message); return;
   }
   if (row.status === "deleting") {
@@ -211,6 +227,9 @@ async function archiveProfile(message, dependencies) {
     row = await readProfileMedia(dependencies.db, message);
     if (!row) return;
     if (row.status === "ready") {
+      await cleanupSupersededProfileKeys(
+        dependencies.db, dependencies.bucket, message.authorId,
+      );
       await recalculateMediaStatus(dependencies, message); return;
     }
     if (row.status === "deleting")
@@ -225,6 +244,9 @@ async function archiveProfile(message, dependencies) {
     row = await readProfileMedia(dependencies.db, message);
     if (!row) return;
     if (row.status === "ready") {
+      await cleanupSupersededProfileKeys(
+        dependencies.db, dependencies.bucket, message.authorId,
+      );
       await recalculateMediaStatus(dependencies, message); return;
     }
   }

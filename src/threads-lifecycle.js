@@ -254,7 +254,10 @@ export async function advanceThreadsProfileCursor(db, input) {
   try {
     const statements = [db.prepare(
       `UPDATE threads_sync_jobs AS j SET
-         profile_cursor = ?, profile_page_count = profile_page_count + 1,
+         profile_cursor = CASE
+           WHEN profile_page_count + 1 >= ? AND ? IS NOT NULL THEN profile_cursor
+           ELSE ? END,
+         profile_page_count = profile_page_count + 1,
          status = 'resolving', updated_at = ?
        WHERE threads_post_id = ? AND generation = ? AND status = 'resolving'
          AND profile_completed = 0 AND capture_lease IS NULL AND profile_cursor IS ?
@@ -270,7 +273,8 @@ export async function advanceThreadsProfileCursor(db, input) {
            WHERE p.id = j.threads_post_id AND p.sync_generation = j.generation
              AND p.status <> 'deleting'
          )`,
-    ).bind(nextCursor, now, postId, generation, expectedCursor,
+    ).bind(MAX_CAPTURE_PAGES, nextCursor, nextCursor, now,
+      postId, generation, expectedCursor,
       MAX_CAPTURE_PAGES, nextCursor, nextCursor)];
     if (nextCursor !== null) statements.push(db.prepare(
       `INSERT INTO threads_sync_cursors
@@ -281,12 +285,15 @@ export async function advanceThreadsProfileCursor(db, input) {
        WHERE j.threads_post_id = ? AND j.generation = ?
          AND j.status = 'resolving' AND j.profile_completed = 0
          AND j.capture_lease IS NULL AND j.profile_cursor = ?
+         AND j.profile_page_count < ?
          AND p.sync_generation = j.generation AND p.status <> 'deleting'
        ON CONFLICT DO NOTHING`,
-    ).bind(nextCursor, now, postId, generation, nextCursor));
+    ).bind(nextCursor, now, postId, generation, nextCursor, MAX_CAPTURE_PAGES));
     const changes = mutationBatch(await db.batch(statements), statements.length);
     if (changes.some((count) => count > 1)) invalidStorage();
     if (changes[0] === 1) {
+      if (nextCursor !== null && changes[1] === 0)
+        throw new AppError("threads_provider_protocol_error", 502);
       if (changes.some((count) => count !== 1)) invalidStorage();
       return true;
     }
@@ -441,11 +448,13 @@ async function aggregateRow(db, postId, generation) {
         JOIN threads_authors a ON a.threads_user_id = e.author_id
         WHERE e.threads_post_id = p.id AND a.profile_media_status = 'error') AS failed_count,
        (SELECT COUNT(*) FROM threads_media m JOIN threads_entries e ON e.id = m.entry_id
-        WHERE e.threads_post_id = p.id AND m.status = 'pending') +
+        WHERE e.threads_post_id = p.id
+          AND (m.status = 'pending' OR m.upload_lease IS NOT NULL)) +
        (SELECT COUNT(DISTINCT e.author_id) FROM threads_entries e
         JOIN threads_authors a ON a.threads_user_id = e.author_id
         WHERE e.threads_post_id = p.id
-          AND a.profile_media_status IN ('pending','deleting')) AS pending_count
+          AND (a.profile_media_status IN ('pending','deleting')
+            OR a.profile_upload_lease IS NOT NULL)) AS pending_count
      FROM threads_posts p JOIN threads_sync_jobs j
        ON j.threads_post_id = p.id AND j.generation = ?
      WHERE p.id = ? AND p.sync_generation = ? AND p.status <> 'deleting'
@@ -480,10 +489,10 @@ export async function recalculateThreadsStatus(db, input) {
         { status: "stale", ready: 0, failed: 0, expected: 0 };
     }
     let status;
-    if (aggregate.root_count === 0) status = "error";
+    if (aggregate.pending_count > 0) status = "media_pending";
+    else if (aggregate.root_count === 0) status = "error";
     else if (aggregate.failed_count > 0 || aggregate.error_code !== null ||
       aggregate.quote_error_count > 0) status = "partial";
-    else if (aggregate.pending_count > 0) status = "media_pending";
     else status = "ready";
     const postStatus = status === "media_pending" ? "collecting" : status;
     const completed = status === "ready" || status === "partial" || status === "error" ? now : null;
@@ -729,6 +738,10 @@ export async function startThreadsMediaRetry(
            AND author.profile_media_status = 'error'
            AND author.profile_upload_lease IS NULL
            AND author.profile_cleanup_lease IS NULL AND post.status <> 'deleting'
+           AND job.status IN ('ready','partial','error')
+           AND job.profile_completed = 1 AND job.conversation_completed = 1
+           AND job.capture_lease IS NULL AND job.pending_quote_count = 0
+           AND job.content_completed_at IS NOT NULL AND job.completed_at IS NOT NULL
        )
        SELECT target_type, target_id, generation, item_status, item_error_code,
          post_status, post_error_code, job_status, job_error_code, completed_at
@@ -761,11 +774,18 @@ export async function startThreadsMediaRetry(
        WHERE threads_user_id = ? AND profile_media_status = 'error'
          AND profile_upload_lease IS NULL AND profile_cleanup_lease IS NULL
          AND EXISTS (
-           SELECT 1 FROM threads_entries entry JOIN threads_posts post
-             ON post.id = entry.threads_post_id
+           SELECT 1 FROM threads_entries entry
+           JOIN threads_posts post ON post.id = entry.threads_post_id
+           JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+             AND job.generation = post.sync_generation
            WHERE entry.author_id = threads_authors.threads_user_id
              AND entry.threads_post_id = ? AND post.sync_generation = ?
              AND post.status <> 'deleting'
+             AND job.status IN ('ready','partial','error')
+             AND job.profile_completed = 1 AND job.conversation_completed = 1
+             AND job.capture_lease IS NULL AND job.pending_quote_count = 0
+             AND job.content_completed_at IS NOT NULL
+             AND job.completed_at IS NOT NULL
          )`,
     ).bind(now, targetId, postId, row.generation);
     const pendingPredicate = row.target_type === "entry"

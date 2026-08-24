@@ -549,7 +549,7 @@ function threadsAuthorJson(postId, author) {
   if (profile?.available === true)
     profile.url = `/threads/${postId}/media/${author.id}`;
   else if (profile) profile.url = null;
-  if (profile) profile.retryUrl = profile.status === "error"
+  if (profile) profile.retryUrl = profile.status === "error" && profile.retryable === true
     ? `/threads/${postId}/media/${author.id}/retry` : null;
   return { ...author, profileMedia: profile };
 }

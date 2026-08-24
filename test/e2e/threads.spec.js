@@ -110,7 +110,7 @@ function author() {
     id: "author-1", username: "meta", displayName: "Meta",
     profileMedia: {
       status: "pending", contentType: null, etag: null, bytes: null, errorCode: null,
-      available: false, url: null, retryUrl: null,
+      available: false, retryable: false, url: null, retryUrl: null,
     },
   };
 }
@@ -462,6 +462,120 @@ test("capture renders pending state, progresses through polling, and stops at re
   const stoppedAt = polls;
   await page.waitForTimeout(1_500);
   expect(polls).toBe(stoppedAt);
+});
+
+test("terminal response with pending media cannot stop polling before late ready reconciliation", async ({ page, harness }) => {
+  await seedArchive(harness, { status: "collecting", replies: 0 });
+  await login(page);
+  let polls = 0;
+  await page.route(new RegExp(`/threads/${POST_ID}$`), async (route, request) => {
+    if (!request.headers().accept?.includes("application/json")) return route.fallback();
+    polls += 1;
+    const body = /** @type {any} */ (detail(POST_ID, "partial", 0));
+    const failed = {
+      id: MEDIA_ID, sourceMediaId: "failed-source", kind: "image", ordinal: 0,
+      altText: null, status: "error", contentType: null, bytes: null, etag: null,
+      errorCode: "threads_media_unavailable", url: null,
+      retryUrl: `/threads/${POST_ID}/media/${MEDIA_ID}/retry`,
+    };
+    const late = {
+      id: "66666666-6666-4666-8666-666666666666",
+      sourceMediaId: "late-source", kind: "image", ordinal: 1,
+      altText: "늦게 준비된 이미지", status: polls === 1 ? "pending" : "ready",
+      contentType: polls === 1 ? null : "image/jpeg", bytes: polls === 1 ? null : 4,
+      etag: polls === 1 ? null : '"late"', errorCode: null,
+      url: polls === 1 ? null :
+        `/threads/${POST_ID}/media/66666666-6666-4666-8666-666666666666`,
+      retryUrl: null,
+    };
+    body.archive.root.media = [failed, late];
+    body.archive.mediaProgress = polls === 1
+      ? { expected: 2, ready: 0, failed: 1, pending: 1 }
+      : { expected: 2, ready: 1, failed: 1, pending: 0 };
+    body.archive.updatedAt = polls;
+    await route.fulfill({
+      status: 200, contentType: "application/json",
+      headers: { ETag: `"pending-precedence-${polls}"` },
+      body: JSON.stringify(body),
+    });
+  });
+  await page.goto("/threads");
+  const card = page.locator("[data-thread-archive]");
+  await expect(card).toHaveAttribute("data-thread-status", "partial", { timeout: 8_000 });
+  expect(polls).toBe(2);
+  await expect(card.getByRole("img", { name: "늦게 준비된 이미지" })).toBeVisible();
+  await expect(card.locator("[data-thread-progress]")).toHaveText(
+    "미디어 1/2 준비 · 실패 1",
+  );
+});
+
+test("dynamic reply media mirrors SSR state copy and linkifies every URL occurrence", async ({ page, harness }) => {
+  await seedArchive(harness, { replies: 4 });
+  await login(page);
+  await page.route(new RegExp(`/threads/${POST_ID}\\?repliesPage=1$`), async (route) => {
+    const body = /** @type {any} */ (detail(POST_ID, "collecting", 4));
+    const repeated = "https://repeat.example/item";
+    body.replies[3].text = `${repeated} 그리고 ${repeated}`;
+    body.replies[3].links = [{ url: repeated, source: "body", ordinal: 0 }];
+    body.replies[3].media = [{
+      id: "77777777-7777-4777-8777-777777777777",
+      sourceMediaId: "pending-dynamic", kind: "image", ordinal: 0,
+      altText: null, status: "pending", contentType: null, bytes: null,
+      etag: null, errorCode: null, url: null, retryUrl: null,
+    }, {
+      id: "88888888-8888-4888-8888-888888888888",
+      sourceMediaId: "failed-dynamic", kind: "image", ordinal: 1,
+      altText: null, status: "error", contentType: null, bytes: null,
+      etag: null, errorCode: "threads_media_unavailable", url: null,
+      retryUrl: `/threads/${POST_ID}/media/88888888-8888-4888-8888-888888888888/retry`,
+    }];
+    body.archive.mediaProgress = { expected: 2, ready: 0, failed: 1, pending: 1 };
+    await route.fulfill({
+      status: 200, contentType: "application/json", body: JSON.stringify(body),
+    });
+  });
+  await page.goto("/threads");
+  await page.locator("[data-thread-all-replies]").click();
+  const last = page.locator("[data-thread-author-reply]").last();
+  await expect(last.getByRole("link", { name: "https://repeat.example/item" }))
+    .toHaveCount(2);
+  await expect(last.getByText("미디어 보관 중", { exact: true })).toBeVisible();
+  await expect(last.getByText("일부 미디어를 보관하지 못했습니다.", { exact: true }))
+    .toBeVisible();
+});
+
+test("delete DLQ terminal reconciliation restores every eligible card control", async ({ page, harness }) => {
+  await seedArchive(harness, { status: "ready", replies: 12 });
+  await login(page);
+  await page.route(`**/threads/${POST_ID}/delete`, (route) => route.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ threadsPostId: POST_ID, status: "deleting", duplicate: false }),
+  }));
+  await page.route(new RegExp(`/threads/${POST_ID}$`), async (route, request) => {
+    if (!request.headers().accept?.includes("application/json")) return route.fallback();
+    const restored = /** @type {any} */ (detail(POST_ID, "partial", 12));
+    restored.archive.errorCode = "queue_retries_exhausted";
+    await route.fulfill({
+      status: 200, contentType: "application/json", headers: { ETag: '"restored"' },
+      body: JSON.stringify(restored),
+    });
+  });
+  await page.goto("/threads");
+  const card = page.locator("[data-thread-archive]");
+  await card.locator("[data-thread-delete] > summary").click();
+  await page.locator("[data-thread-delete-dialog]").getByRole(
+    "button", { name: "보관 삭제", exact: true },
+  ).click();
+  await expect(card).toHaveAttribute("data-thread-status", "partial", { timeout: 8_000 });
+  await expect(card.getByRole("button", { name: "동기화" })).toBeEnabled();
+  const replies = card.locator("[data-thread-all-replies]");
+  await expect(replies).not.toHaveAttribute("aria-disabled", "true");
+  await replies.click();
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(12);
+  await card.locator("[data-thread-delete] > summary").click();
+  await expect(page.locator("[data-thread-delete-dialog]").getByRole(
+    "button", { name: "보관 삭제", exact: true },
+  )).toBeEnabled();
 });
 
 test("plain reply expansion loads complete quoted provenance while modified click stays native", async ({ page, harness }) => {

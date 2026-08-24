@@ -6,7 +6,8 @@ import {
 const POST_READ_KEYS = [
   "id", "canonical_url", "status", "error_code", "root_author_id", "author_username",
   "author_display_name", "profile_media_status", "profile_r2_key", "profile_content_type",
-  "profile_etag", "profile_bytes", "profile_error_code", "reply_count", "sync_generation",
+  "profile_etag", "profile_bytes", "profile_error_code", "profile_retryable",
+  "reply_count", "sync_generation",
   "expected_entry_count", "expected_media_count", "ready_media_count", "failed_media_count",
   "created_at", "updated_at",
 ];
@@ -19,12 +20,14 @@ function validatePostRead(row) {
     !(row.root_author_id === null || typeof row.root_author_id === "string") ||
     !(row.author_username === null || typeof row.author_username === "string") ||
     !(row.author_display_name === null || typeof row.author_display_name === "string") ||
-    !(row.profile_media_status === null || ["pending", "ready", "error"].includes(row.profile_media_status)) ||
+    !(row.profile_media_status === null ||
+      ["pending", "ready", "error", "deleting"].includes(row.profile_media_status)) ||
     !(row.profile_r2_key === null || typeof row.profile_r2_key === "string") ||
     !(row.profile_content_type === null || typeof row.profile_content_type === "string") ||
     !(row.profile_etag === null || typeof row.profile_etag === "string") ||
     !(row.profile_bytes === null || Number.isSafeInteger(row.profile_bytes) && row.profile_bytes >= 0) ||
-    !(row.profile_error_code === null || typeof row.profile_error_code === "string")) invalidStorage();
+    !(row.profile_error_code === null || typeof row.profile_error_code === "string") ||
+    ![0, 1].includes(row.profile_retryable)) invalidStorage();
   for (const key of ["reply_count", "sync_generation", "expected_entry_count",
     "expected_media_count", "ready_media_count", "failed_media_count", "created_at", "updated_at"])
     d1NonnegativeInteger(row[key]);
@@ -36,6 +39,12 @@ const POST_SELECT = `
   a.username AS author_username, a.display_name AS author_display_name,
   a.profile_media_status, a.profile_r2_key, a.profile_content_type,
   a.profile_etag, a.profile_bytes, a.profile_error_code,
+  CASE WHEN p.status IN ('ready', 'partial', 'error')
+      AND j.status IN ('ready', 'partial', 'error')
+      AND j.profile_completed = 1 AND j.conversation_completed = 1
+      AND j.capture_lease IS NULL AND j.pending_quote_count = 0
+      AND j.content_completed_at IS NOT NULL AND j.completed_at IS NOT NULL
+    THEN 1 ELSE 0 END AS profile_retryable,
   (SELECT COUNT(*) FROM threads_entries replies
    WHERE replies.threads_post_id = p.id AND replies.kind = 'author_reply') AS reply_count,
   p.sync_generation,
@@ -49,14 +58,29 @@ const ENTRY_KEYS = [
   "text", "permalink", "published_at", "media_type", "alt_text",
   "nested_quote_permalink", "username", "display_name", "profile_media_status",
   "profile_r2_key", "profile_content_type", "profile_etag", "profile_bytes",
-  "profile_error_code",
+  "profile_error_code", "profile_retryable",
 ];
 const ENTRY_SELECT = `
   e.id, e.threads_post_id, e.source_media_id, e.kind, e.parent_entry_id, e.author_id,
   e.text, e.permalink, e.published_at, e.media_type, e.alt_text,
   e.nested_quote_permalink, a.username, a.display_name, a.profile_media_status,
   a.profile_r2_key, a.profile_content_type, a.profile_etag, a.profile_bytes,
-  a.profile_error_code`;
+  a.profile_error_code,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM threads_posts retry_post
+    JOIN threads_sync_jobs retry_job
+      ON retry_job.threads_post_id = retry_post.id
+     AND retry_job.generation = retry_post.sync_generation
+    WHERE retry_post.id = e.threads_post_id
+      AND retry_post.status IN ('ready', 'partial', 'error')
+      AND retry_job.status IN ('ready', 'partial', 'error')
+      AND retry_job.profile_completed = 1
+      AND retry_job.conversation_completed = 1
+      AND retry_job.capture_lease IS NULL
+      AND retry_job.pending_quote_count = 0
+      AND retry_job.content_completed_at IS NOT NULL
+      AND retry_job.completed_at IS NOT NULL
+  ) THEN 1 ELSE 0 END AS profile_retryable`;
 
 /** @param {any} db @param {any[]} rows */
 async function mapEntryRows(db, rows) {
@@ -119,19 +143,21 @@ async function mapEntryRows(db, rows) {
       !(row.alt_text === null || typeof row.alt_text === "string") ||
       !(row.nested_quote_permalink === null || typeof row.nested_quote_permalink === "string") ||
       typeof row.username !== "string" || typeof row.display_name !== "string" ||
-      !["pending", "ready", "error"].includes(row.profile_media_status) ||
+      !["pending", "ready", "error", "deleting"].includes(row.profile_media_status) ||
       !(row.profile_r2_key === null || typeof row.profile_r2_key === "string") ||
       !(row.profile_content_type === null || typeof row.profile_content_type === "string") ||
       !(row.profile_etag === null || typeof row.profile_etag === "string") ||
       !(row.profile_bytes === null || Number.isSafeInteger(row.profile_bytes) && row.profile_bytes >= 0) ||
       !(row.profile_error_code === null || typeof row.profile_error_code === "string") ||
+      ![0, 1].includes(row.profile_retryable) ||
       Number.isNaN(Date.parse(row.published_at))) invalidStorage();
     const author = {
       id: row.author_id, username: row.username, displayName: row.display_name,
       profileMedia: {
-        status: row.profile_media_status, contentType: row.profile_content_type,
+        status: row.profile_media_status === "deleting" ? "pending" : row.profile_media_status,
+        contentType: row.profile_content_type,
         etag: row.profile_etag, bytes: row.profile_bytes, errorCode: row.profile_error_code,
-        available: row.profile_r2_key !== null,
+        available: row.profile_r2_key !== null, retryable: row.profile_retryable === 1,
       },
     };
     mapped.set(row.id, {
@@ -160,9 +186,10 @@ function mapArchive(post, entries) {
     id: post.root_author_id, username: post.author_username,
     displayName: post.author_display_name,
     profileMedia: {
-      status: post.profile_media_status, contentType: post.profile_content_type,
+      status: post.profile_media_status === "deleting" ? "pending" : post.profile_media_status,
+      contentType: post.profile_content_type,
       etag: post.profile_etag, bytes: post.profile_bytes, errorCode: post.profile_error_code,
-      available: post.profile_r2_key !== null,
+      available: post.profile_r2_key !== null, retryable: post.profile_retryable === 1,
     },
   } : null);
   return {

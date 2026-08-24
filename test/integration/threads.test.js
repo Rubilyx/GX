@@ -385,7 +385,7 @@ test("credential refresh rejects debugger mismatches without rotating stored byt
   }), { refreshed: false, reconnectRequired: true });
   assert.deepEqual(
     await db.prepare("SELECT * FROM threads_oauth_credentials WHERE singleton_id = 1").first(),
-    before,
+    { ...before, reconnect_required: 1 },
   );
 });
 
@@ -414,7 +414,7 @@ test("credential refresh rejects an oversized UTF-8 token before debugger and D1
   assert.equal(debugCalls, 0);
   assert.deepEqual(
     await db.prepare("SELECT * FROM threads_oauth_credentials WHERE singleton_id = 1").first(),
-    before,
+    { ...before, reconnect_required: 1 },
   );
 });
 
@@ -487,6 +487,11 @@ const testProfileVersionKey = (authorId, lease) =>
   `threads/authors/${authorId}/profile/${lease}`;
 const SAVED_NO_QUOTES = Object.freeze({ applied: true, quoteWork: [] });
 const NOT_SAVED = Object.freeze({ applied: false, quoteWork: [] });
+/** @param {string} body @param {string} type */
+function fixedBlobResponse(body, type) {
+  const blob = new Blob([body], { type });
+  return new Response(blob, { headers: { "Content-Length": String(blob.size) } });
+}
 
 test("Threads sync creates one active generation, advances completed captures, and records enqueue failure", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
@@ -527,14 +532,17 @@ test("Threads sync creates one active generation, advances completed captures, a
     job_status: "error", job_error: "queue_unavailable" });
 });
 
-test("Threads interface facade exposes exactly fourteen capture-store operations", async () => {
+test("Threads interface facade exposes the reviewed capture-store operations", async () => {
   const facade = await import("../../src/threads.js");
   assert.deepEqual(Object.keys(facade).sort(), [
-    "advanceThreadsProfileCursor", "claimThreadsJob", "createThreadsSync", "failThreadsQuote",
+    "advanceThreadsProfileCursor", "claimThreadsJob", "createThreadsSync",
+    "failThreadsAuthorProfile", "failThreadsDeletion", "failThreadsQuote",
     "finalizeThreadsContent", "getThreadsArchive", "listThreadsArchives",
-    "listThreadsPendingQuoteWork", "markThreadsJobError", "recalculateThreadsStatus",
-    "saveResolvedThreadsRoot", "saveThreadsConversationPage", "saveThreadsQuote",
-    "startThreadsDeletion",
+    "listThreadsPendingQuoteWork", "markThreadsEnrichmentFailure", "markThreadsJobError",
+    "recalculateThreadsStatus", "saveResolvedThreadsRoot", "saveThreadsAuthorProfile",
+    "saveThreadsConversationPage", "saveThreadsMediaDescriptors",
+    "saveThreadsNestedQuotePermalink", "saveThreadsQuote", "startThreadsDeletion",
+    "startThreadsMediaRetry",
   ]);
 });
 
@@ -551,7 +559,8 @@ test("Threads interface claim exposes capture identity and profile cursor CAS re
     failedMediaCount: 0, errorCode: null, rootAuthorId: null, threadsMediaId: null,
     canonicalUrl: null, submittedUrl: "https://threads.net/t/CursorShort",
     shortcode: "CursorShort", profileCompleted: false, conversationStarted: false,
-    conversationCompleted: false, captureLease: null,
+    conversationCompleted: false, captureLease: null, profilePageCount: 0,
+    conversationPageCount: 0,
   });
   assert.equal(await advanceThreadsProfileCursor(db, {
     postId: sync.threadsPostId, generation: 1, expectedCursor: null,
@@ -587,6 +596,7 @@ test("Threads interface claim exposes capture identity and profile cursor CAS re
     error_code: null, root_author_id: null, threads_media_id: null, canonical_url: null,
     submitted_url: "", shortcode: "Short", profile_completed: 0,
     conversation_started: 0, conversation_completed: 0, capture_lease: null,
+    profile_page_count: 0, conversation_page_count: 0,
   }) }; } }; } };
   await assert.rejects(claimThreadsJob(malformedDb, "p", 1, "resolving"),
     (error) => error instanceof AppError && error.code === "storage_unavailable");
@@ -1117,6 +1127,10 @@ test("Threads current-generation quote errors force partial without inflating me
     postId: next.threadsPostId, generation: 2, expectedCursor: null,
     entries: [], nextCursor: null, nowSeconds: 2_152,
   });
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready'
+     WHERE threads_user_id = 'author-1'`,
+  ).run();
   const old = await finalizeThreadsContent(db, harness.mediaQueue, {
     postId: next.threadsPostId, generation: 2, nowSeconds: 2_153,
   });
@@ -1351,7 +1365,7 @@ test("capture phase recovery does not refetch a persisted root or completed conv
   }]);
 });
 
-test("capture rejects a mismatched nested quote identity without persisting a permalink", async () => {
+test("capture preserves quote content but rejects a mismatched nested permalink identity", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const sync = await createThreadsSync(
     db, harness.captureQueue, "https://www.threads.com/@meta/post/NestedMismatch", 3_940,
@@ -1385,15 +1399,17 @@ test("capture rejects a mismatched nested quote identity without persisting a pe
     } }), getAccessToken: async () => ({ accessToken: "token" }),
     nowSeconds: 3_943, deleteArchive: async () => ({ action: "ack" }),
   }), { action: "ack" });
-  assert.equal(await db.prepare(
-    `SELECT COUNT(*) AS count FROM threads_entries
+  assert.deepEqual(await db.prepare(
+    `SELECT source_media_id, nested_quote_permalink FROM threads_entries
      WHERE threads_post_id = ? AND kind = 'quote'`,
-  ).bind(sync.threadsPostId).first("count"), 0);
+  ).bind(sync.threadsPostId).first(), {
+    source_media_id: "outer-mismatch-quote", nested_quote_permalink: null,
+  });
   assert.deepEqual(await db.prepare(
     `SELECT status, error_code FROM threads_sync_jobs
      WHERE threads_post_id = ? AND generation = 1`,
   ).bind(sync.threadsPostId).first(), {
-    status: "error", error_code: "threads_provider_protocol_error",
+    status: "collecting", error_code: "threads_nested_quote_unavailable",
   });
 });
 
@@ -1544,7 +1560,7 @@ test("conversation cursor loops terminate while stale generations and bounded 42
   if (!stale) throw new Error("test_current_capture_message_missing");
   const limited = await handleThreadsCaptureMessage(stale, {
     db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
-    fetcher: providerFixture({ threadsStatus: { profile_lookup: 429 },
+    fetcher: providerFixture({ threadsStatus: { profile_posts: 429 },
       threadsRetryAfter: "9999" }),
     getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_104,
     deleteArchive: async () => ({ action: "ack" }),
@@ -3140,7 +3156,7 @@ test("concurrent duplicate entry delivery has one upload owner and one R2 result
       ));
     }
     cdnCalls += 1;
-    return new Response(new Blob(["lease-entry"], { type: "image/jpeg" }));
+    return fixedBlobResponse("lease-entry", "image/jpeg");
   };
   const message = {
     version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
@@ -3192,7 +3208,7 @@ test("concurrent shared-profile delivery has one upload owner and recalculates b
         threads_profile_picture_url: "https://scontent.cdninstagram.com/lease-profile" });
     }
     cdnCalls += 1;
-    return new Response(new Blob(["lease-profile"], { type: "image/png" }));
+    return fixedBlobResponse("lease-profile", "image/png");
   };
   const first = handleThreadsMediaMessage({
     version: 1, type: "archive-profile", postId: firstPost.postId, generation: 1,
@@ -3293,7 +3309,7 @@ test("a shared profile ready-commit exception reconciles globally after its orig
           "https://scontent.cdninstagram.com/ambiguous-shared-profile" });
     }
     cdnCalls += 1;
-    return new Response(new Blob(["shared-profile"], { type: "image/png" }));
+    return fixedBlobResponse("shared-profile", "image/png");
   };
   let puts = 0;
   let deletes = 0;
@@ -3383,9 +3399,10 @@ test("an entry R2 put that completes before throwing keeps its pending key for r
         },
       ));
     }
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname.endsWith("-1") ? "uncertain-bytes" : "winner-bytes",
-    ], { type: "image/jpeg" }));
+      "image/jpeg",
+    );
   };
   let puts = 0;
   const bucket = {
@@ -3441,9 +3458,10 @@ test("a profile ready ownership miss retains its exact pending version until sta
         threads_profile_picture_url:
           `https://scontent.cdninstagram.com/ambiguous-profile-${profileCalls}` });
     }
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname.endsWith("-1") ? "uncommitted-profile" : "winning-profile",
-    ], { type: "image/png" }));
+      "image/png",
+    );
   };
   let faulted = false;
   const faultDb = readyFaultDatabase(db,
@@ -3502,9 +3520,10 @@ test("delayed stale profile upload cannot affect the post-DLQ winner version", a
           "https://scontent.cdninstagram.com/winner-profile-upload" });
     }
     cdnCalls += 1;
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname === "/stale-profile-upload" ? "stale-profile" : "winner-profile",
-    ], { type: "image/png" }));
+      "image/png",
+    );
   };
   const staleWritten = deferred();
   const releaseStale = deferred();
@@ -3600,9 +3619,10 @@ test("a delayed stale upload owner cannot overwrite the manual-retry winner", as
         },
       ));
     }
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname === "/stale-owner" ? "stale-bytes" : "winner-bytes",
-    ], { type: "image/jpeg" }));
+      "image/jpeg",
+    );
   };
   const stalePutStarted = deferred();
   const releaseStalePut = deferred();
@@ -3701,7 +3721,7 @@ test("a stale mismatched upload cannot delete the manual-retry winner", async ()
       new Blob(["stale"], { type: "image/jpeg" }),
       { headers: { "Content-Type": "image/jpeg", "Content-Length": "99" } },
     );
-    return new Response(new Blob(["delete-winner"], { type: "image/jpeg" }));
+    return fixedBlobResponse("delete-winner", "image/jpeg");
   };
   const staleWritten = deferred();
   const releaseStaleResult = deferred();
@@ -3767,7 +3787,7 @@ test("a winner replacing after a stale write observation remains intact without 
       new Blob(["stale"], { type: "image/jpeg" }),
       { headers: { "Content-Type": "image/jpeg", "Content-Length": "99" } },
     );
-    return new Response(new Blob(["observed-winner"], { type: "image/jpeg" }));
+    return fixedBlobResponse("observed-winner", "image/jpeg");
   };
   const staleWritten = deferred();
   const releaseStaleResult = deferred();
@@ -3926,9 +3946,10 @@ test("entry recovery stays fenced when delete removes the object before throwing
       ));
     }
     cdnCalls += 1;
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname.endsWith("-stale") ? "deleted-stale-entry" : "winner-entry",
-    ], { type: "image/jpeg" }));
+      "image/jpeg",
+    );
   };
   const staleWritten = deferred();
   const releaseStale = deferred();
@@ -4019,9 +4040,10 @@ test("profile DLQ recovery stays fenced when delete removes the object before th
           "https://scontent.cdninstagram.com/delete-then-throw-profile-winner" });
     }
     cdnCalls += 1;
-    return new Response(new Blob([
+    return fixedBlobResponse(
       url.pathname.endsWith("-stale") ? "deleted-stale-profile" : "winner-profile",
-    ], { type: "image/png" }));
+      "image/png",
+    );
   };
   const staleWritten = deferred();
   const releaseStale = deferred();
@@ -4354,7 +4376,7 @@ test("Threads media retry reacquires a fresh provider URL and terminal corruptio
     }
     cdnCalls.push(url.pathname);
     if (url.pathname === "/expired") return new Response(null, { status: 503 });
-    return new Response(new Blob(["fresh"], { type: "image/jpeg" }));
+    return fixedBlobResponse("fresh", "image/jpeg");
   };
   const message = {
     version: 1, type: "retry-media", postId: seeded.postId, generation: 1,
@@ -4756,7 +4778,7 @@ test("failed profile cleanup reactivates safely when a new archive references th
       id: "shared-delete-author", username: "shared", name: "Shared",
       threads_profile_picture_url: "https://scontent.cdninstagram.com/cleanup-new-profile",
     });
-    return new Response(new Blob(["new-profile"], { type: "image/png" }));
+    return fixedBlobResponse("new-profile", "image/png");
   };
   assert.deepEqual(await handleThreadsMediaMessage({
     version: 1, type: "archive-profile", postId: "cleanup-reuse-new", generation: 1,
@@ -4854,7 +4876,7 @@ test("one cleanup lease fences a delayed sweep before profile reactivation and u
       id: "cleanup-fence-author", username: "cleanup", name: "Cleanup",
       threads_profile_picture_url: "https://scontent.cdninstagram.com/cleanup-fenced-new",
     });
-    return new Response(new Blob(["fenced-new"], { type: "image/png" }));
+    return fixedBlobResponse("fenced-new", "image/png");
   };
   assert.deepEqual(await handleThreadsMediaMessage({
     version: 1, type: "archive-profile", postId: "cleanup-fence-post", generation: 1,
@@ -4914,7 +4936,7 @@ test("profile delivery reclaims dead cleanup at 960 seconds and cannot remain de
       id: "cleanup-death-author", username: "cleanupdeath", name: "Cleanup Death",
       threads_profile_picture_url: "https://scontent.cdninstagram.com/cleanup-death-new",
     });
-    return new Response(new Blob(["cleanup-death-new"], { type: "image/png" }));
+    return fixedBlobResponse("cleanup-death-new", "image/png");
   };
   const message = {
     version: 1, type: "archive-profile", postId: "cleanup-death-post", generation: 1,

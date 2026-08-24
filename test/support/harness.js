@@ -379,7 +379,14 @@ export function providerFixture(options = {}) {
         const spec = /** @type {{ body: BodyInit, status?: number, headers?: HeadersInit }} */ (value);
         return new Response(spec.body, { status: spec.status, headers: spec.headers });
       }
-      return new Response(/** @type {BodyInit} */ (value));
+      const response = new Response(/** @type {BodyInit} */ (value));
+      let length = null;
+      if (value instanceof Blob) length = value.size;
+      else if (typeof value === "string") length = new TextEncoder().encode(value).byteLength;
+      else if (value instanceof ArrayBuffer) length = value.byteLength;
+      else if (ArrayBuffer.isView(value)) length = value.byteLength;
+      if (length !== null) response.headers.set("Content-Length", String(length));
+      return response;
     }
     return unexpected();
   };

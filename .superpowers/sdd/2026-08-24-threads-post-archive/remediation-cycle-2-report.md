@@ -233,3 +233,122 @@ D1 migration or backup ran; no Worker was uploaded, promoted, rolled back, or
 allocated traffic; no repository push occurred; and no live Meta request was
 made. All Queue, R2, D1, provider, and browser evidence used the isolated local
 test environment.
+
+## Scoped review fix round 1
+
+### Scope and commit
+
+- Review baseline: clean `8e8bc8e`.
+- Implementation/test commit: `3d4d610` (`fix: guarantee durable profile cleanup recovery`).
+- The round changed only the four ruled profile retry/cleanup executor gaps. The
+  approved page ceiling, pending-first aggregation, client rendering/control
+  reconciliation, security boundaries, and release configuration were not
+  changed.
+
+### Root causes and fixes
+
+1. **Post terminality was missing from retry authorization.** The profile retry
+   CTE and its target-update CAS both admitted every non-deleting post. A
+   schema-valid collecting post could therefore be mutated when its job fields
+   looked terminal. Both predicates now require the post itself to be exactly
+   `ready`, `partial`, or `error`. The test snapshots the complete post/job/author
+   rows and Queue before rejection, then proves the same profile retries after
+   only the post becomes terminal.
+2. **Durable cleanup was evaluated after an origin-scoped read.** An
+   `archive-profile` message for a gone/stale origin returned before consulting
+   the author-global cleanup ledger. `cleanupAuthorProfileState` now reads by
+   author identity first and owns both superseded ready-author keys and deleting
+   author tombstones. Primary and DLQ profile paths invoke it before any origin
+   post/generation early return. A gone origin with a shared survivor deletes the
+   old immutable key and its D1 owner without provider work or a survivor message.
+3. **Cleanup preceded lifecycle reconciliation.** A winning CAS could become
+   globally ready, fail deletion of its old immutable object, and leave the
+   addressed archive/job in `media_pending` across every primary retry. All
+   winning/ambiguous ready paths now recalculate first, then attempt author-global
+   cleanup. Four consecutive cleanup failures leave the durable owner intact but
+   expose `ready` post/job state with a completed timestamp; provider/download
+   work occurs only on the winning attempt.
+4. **Configured DLQs had no executor after ACK.** Both DLQ consumers are
+   configured with `max_retries: 0`; calling `retry()` from them cannot guarantee
+   another delivery. Media DLQ now attempts author-global cleanup directly.
+   Delete DLQ invokes the real deletion executor before applying the existing
+   visible restoration fallback. If R2 is still unavailable, the existing D1
+   cleanup-key row or deleting-author tombstone remains owned and the DLQ ACK is
+   safe.
+5. **The daily scheduled event refreshed only OAuth.** It now runs cleanup before
+   credential refresh and selects a deterministic maximum of 25 author owners or
+   deleting tombstones. Each owner is isolated: a failing R2 delete retains that
+   owner and does not block later rows in the selected page. No Queue re-enqueue
+   or producer send is used, so producer failure cannot remove the guaranteed
+   executor. In the bounded test, 26 owners plus a rejection at owner 00 leave
+   exactly owners 00 and 25 after the first run; the second run clears both.
+
+### Strict RED/GREEN evidence
+
+All Node/NPM/NPX commands again prepended the exact Node 24.18.0 directory to
+`PATH`.
+
+RED command:
+
+`node --test --test-name-pattern="profile retry rejects a collecting post|superseded profile cleanup runs when its origin is gone|winning profile recalculates terminal status|profile and deletion DLQs retain scheduled cleanup|scheduled profile cleanup processes" test/integration/threads.test.js`
+
+- 0/5 passed.
+- Collecting post retry did not reject.
+- Origin-gone cleanup left the old R2 object and D1 owner.
+- Cleanup failure left post/job `collecting`/`media_pending` with null completion.
+- Origin-gone primary delivery ACKed instead of retrying durable cleanup.
+- Scheduled execution left all 26 owners instead of processing a bounded page.
+
+GREEN command (final test name includes failure isolation):
+
+`node --test --test-name-pattern="profile retry rejects a collecting post|superseded profile cleanup runs when its origin is gone|winning profile recalculates terminal status|profile and deletion DLQs retain scheduled cleanup|scheduled profile cleanup isolates" test/integration/threads.test.js`
+
+- 5/5 passed, 0 failed, 0 skipped.
+- The Queue-exhaustion test drives four primary deliveries and both zero-retry
+  DLQ consumers through the actual worker Queue dispatcher before scheduled
+  recovery.
+- Nearby pre-existing additive replacement, ambiguous ready-CAS, upload-DLQ,
+  deletion tombstone, and shared-author recovery focus passed 8/8 during
+  development. Existing scheduled integration passed 1/1 and scheduled unit
+  dispatch/wiring passed 2/2.
+
+### Reduced final verification
+
+- Fresh committed-state `npm run check` — PASS: types, CSS, source policy, and
+  332 unit cases; 331 passed, 0 failed, 1 intentional Windows symlink skip.
+- New fix-round focused integration — 5/5 passed.
+- Existing cycle-2 integration command — 7/7 passed: both page ceilings,
+  pending-first aggregation, terminal profile retry/replacement cleanup, and
+  last/shared-author deletion ownership.
+- Focused Chromium cycle-2 regressions — 3/3 passed.
+- Focused SSR/profile unit regressions — 2/2 passed.
+- `npx wrangler types worker-configuration.d.ts --env test --check` — PASS with
+  Wrangler 4.114.0; checked-in types are current.
+- `git diff --check` — PASS.
+- Final `git status --short` — empty after the report commit.
+
+Per the user's standing minimal-verification instruction, full `npm test`, the
+full 403-case E2E matrix, and Task 12 audits were not rerun. The prior clean
+`e6ad184` baseline remains the most recent full-suite evidence (integration
+185/185; E2E 342 passed / 61 intentional skips).
+
+### Self-review and residual concerns
+
+- Scheduled recovery is deliberately bounded to 25 author owners per daily run.
+  A large backlog or persistent R2 outage can delay cleanup, but cannot orphan it:
+  D1 ownership/tombstones remain until a successful delete, failed rows are
+  isolated, and subsequent cron runs resume deterministically.
+- DLQ handlers ACK after their direct attempt because the deployed DLQ consumers
+  have zero retries. Safety comes from durable D1 ownership plus the independent
+  scheduled executor, not from unsupported DLQ retry semantics.
+- No migration change was required in this round. Cleanup keys remain
+  author-scoped and validated; R2 deletion still precedes owner removal; shared
+  active profile objects remain untouched.
+- No load-bearing scoped finding remains open.
+
+### No-production confirmation for fix round 1
+
+No production/live Meta request, Cloudflare API/resource action, secret access,
+remote D1 operation, release action, deployment, traffic change, or repository
+push occurred. All new Queue exhaustion, DLQ, scheduled, D1, and R2 evidence came
+from the isolated local harness.

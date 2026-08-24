@@ -362,7 +362,6 @@ jobs:
               JSON.stringify(config.r2_buckets) !== JSON.stringify(expectedR2) ||
               JSON.stringify(config.queues) !== JSON.stringify(expectedQueues) ||
               JSON.stringify(config.triggers) !== JSON.stringify({ crons: ["0 3 * * *"] }) ||
-              Object.hasOwn(config, "env") ||
               Object.hasOwn(config, "route") || Object.hasOwn(config, "routes"))
             throw new Error("generated_worker_subdomain_config_invalid");
           NODE

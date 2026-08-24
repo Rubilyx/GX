@@ -672,7 +672,6 @@ export async function createRelease(options) {
   config.preview_urls = false;
   delete config.route;
   delete config.routes;
-  delete config.env;
   const databases = Array.isArray(config.d1_databases)
     ? /** @type {any[]} */ (config.d1_databases) : [];
   const productionDatabase = databases.find((database) => database?.binding === "PROD_DB");

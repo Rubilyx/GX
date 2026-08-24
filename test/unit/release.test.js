@@ -714,7 +714,7 @@ test("createRelease rejects unsupported top-level production binding sections", 
   }
 });
 
-test("createRelease preserves only the exact production Threads resource graph", async (context) => {
+test("createRelease preserves the exact production graph and isolated compatibility environment", async (context) => {
   const repository = await releaseRepository(context);
   const nodeVersion = Object.getOwnPropertyDescriptor(process.versions, "node");
   if (!nodeVersion) throw new Error("missing_node_version_descriptor");
@@ -730,7 +730,17 @@ test("createRelease preserves only the exact production Threads resource graph",
   assert.deepEqual(config.r2_buckets, THREADS_R2);
   assert.deepEqual(config.queues, THREADS_QUEUES);
   assert.deepEqual(config.triggers, THREADS_TRIGGERS);
-  assert.equal(config.env, undefined);
+  assert.equal(config.env.test.name, "release-fixture-test");
+  assert.deepEqual(config.env.test.r2_buckets, [{
+    binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media",
+  }]);
+  assert.deepEqual(config.env.test.queues.consumers, [
+    { queue: "repo-atlas-test-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-capture-dlq" },
+    { queue: "repo-atlas-test-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-media-dlq" },
+    { queue: "repo-atlas-test-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+    { queue: "repo-atlas-test-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+  ]);
+  assert.deepEqual(config.env.test.triggers, THREADS_TRIGGERS);
   assert.deepEqual(config.secrets.required, THREADS_SECRETS);
   assert.deepEqual(config.vars, {
     ENVIRONMENT: "deployed",
@@ -1001,7 +1011,16 @@ test("createRelease allows default and outside-root outputs with repeatable arch
     ...THREADS_SECRETS,
   ] });
   assert.deepEqual(config.d1_databases, [{ binding: "PROD_DB", database_name: "production" }]);
-  assert.equal(config.env, undefined);
+  assert.equal(config.env.test.name, "release-fixture-test");
+  assert.deepEqual(config.env.test.r2_buckets, [{
+    binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media",
+  }]);
+  assert.deepEqual(config.env.test.queues.consumers, [
+    { queue: "repo-atlas-test-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-capture-dlq" },
+    { queue: "repo-atlas-test-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-media-dlq" },
+    { queue: "repo-atlas-test-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+    { queue: "repo-atlas-test-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+  ]);
   assert.deepEqual(config.r2_buckets, THREADS_R2);
   assert.deepEqual(config.queues, THREADS_QUEUES);
   assert.deepEqual(config.triggers, THREADS_TRIGGERS);

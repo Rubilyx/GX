@@ -380,9 +380,12 @@ class ThreadPanel extends HTMLElement {
     for (const card of this.querySelectorAll("[data-thread-archive]")) {
       if (!(card instanceof HTMLElement) || !POST_ID.test(card.dataset.threadId ?? "")) continue;
       const id = /** @type {string} */ (card.dataset.threadId);
+      const generation = Number(card.dataset.threadGeneration);
+      if (!Number.isSafeInteger(generation) || generation < 1) continue;
       const state = {
         card, id, detailUrl: `/threads/${id}`, timer: null, controller: null,
         etag: "", delayIndex: 0, expansionController: null, expanded: false,
+        loading: false, expansionEpoch: 0, pollEpoch: 0, generation,
       };
       this.states.set(card, state);
       if (card.dataset.threadStatus === "pending" || card.dataset.threadStatus === "collecting")
@@ -450,6 +453,7 @@ class ThreadPanel extends HTMLElement {
     if (!this.isConnected || document.visibilityState !== "visible") return;
     const controller = new AbortController();
     state.controller = controller;
+    const epoch = state.pollEpoch;
     /** @type {Record<string, string>} */
     const headers = { Accept: "application/json" };
     if (state.etag) headers["If-None-Match"] = state.etag;
@@ -457,11 +461,13 @@ class ThreadPanel extends HTMLElement {
       const response = await fetch(state.detailUrl, {
         headers, credentials: "same-origin", signal: controller.signal,
       });
+      if (state.pollEpoch !== epoch) return;
       if (response.status === 304) {
         state.delayIndex = Math.min(state.delayIndex + 1, POLL_DELAYS.length - 1);
         return;
       }
       const body = await responseJson(response);
+      if (state.pollEpoch !== epoch) return;
       if (!response.ok) {
         if (response.status === 401 && errorCode(body) === "session_expired") {
           panelMessage(this, SESSION);
@@ -471,6 +477,10 @@ class ThreadPanel extends HTMLElement {
         return;
       }
       const result = validateDetail(body, state.id);
+      if (state.pollEpoch !== epoch || Number(result.archive.syncGeneration) < state.generation)
+        return;
+      state.generation = Number(result.archive.syncGeneration);
+      state.card.dataset.threadGeneration = String(state.generation);
       const etag = response.headers.get("ETag");
       state.etag = typeof etag === "string" ? etag : "";
       this.applyPolling(state.card, result.archive);
@@ -478,7 +488,8 @@ class ThreadPanel extends HTMLElement {
       if (!["pending", "collecting"].includes(String(result.archive.status)) && state.expanded)
         await this.loadReplies(state, true);
     } catch {
-      if (!controller.signal.aborted) panelMessage(this, REQUEST_ERROR);
+      if (!controller.signal.aborted && state.pollEpoch === epoch)
+        panelMessage(this, REQUEST_ERROR);
     } finally {
       if (state.controller === controller) state.controller = null;
       if (!state.stopped && ["pending", "collecting"].includes(state.card.dataset.threadStatus ?? ""))
@@ -515,6 +526,15 @@ class ThreadPanel extends HTMLElement {
     const state = card instanceof HTMLElement ? this.states.get(card) : null;
     if (!state) return;
     event.preventDefault();
+    if (state.loading) {
+      state.expansionEpoch += 1;
+      state.expansionController?.abort();
+      state.expansionController = null;
+      state.loading = false;
+      link.removeAttribute("aria-busy");
+      link.textContent = `작성자 답글 ${link.dataset.threadTotal ?? ""}개 모두 보기`;
+      return;
+    }
     if (state.expanded) {
       state.expansionController?.abort();
       state.expansionController = null;
@@ -531,11 +551,25 @@ class ThreadPanel extends HTMLElement {
     state.expansionController?.abort();
     const controller = new AbortController();
     state.expansionController = controller;
+    state.expansionEpoch += 1;
+    const epoch = state.expansionEpoch;
+    state.loading = true;
     const link = state.card.querySelector("[data-thread-all-replies]");
     const container = state.card.querySelector("[data-thread-replies]");
-    if (!(link instanceof HTMLAnchorElement) || !(container instanceof HTMLElement)) return;
+    if (!(link instanceof HTMLAnchorElement) || !(container instanceof HTMLElement)) {
+      state.loading = false;
+      return;
+    }
+    if (!refresh) {
+      const total = link.dataset.threadTotal || (link.textContent.match(/[0-9]+/)?.[0] ?? "");
+      link.dataset.threadTotal = total;
+      link.setAttribute("aria-busy", "true");
+      link.textContent = `작성자 답글 ${total}개 불러오는 중`;
+    }
     const known = new Set([...container.querySelectorAll("[data-thread-entry-id]")]
       .map((node) => node instanceof HTMLElement ? node.dataset.threadEntryId : ""));
+    const staged = [];
+    const seen = new Set();
     let totalPages = 1;
     let totalReplies = 0;
     let last = null;
@@ -562,20 +596,34 @@ class ThreadPanel extends HTMLElement {
             String(last.sourceMediaId).localeCompare(String(reply.sourceMediaId)) > 0))
             throw new Error("reply_order");
           last = reply;
-          if (known.has(/** @type {string} */ (reply.id))) continue;
-          known.add(/** @type {string} */ (reply.id));
-          container.appendChild(replyNode(reply, state.id));
+          const id = /** @type {string} */ (reply.id);
+          if (seen.has(id)) throw new Error("reply_duplicate");
+          seen.add(id);
+          if (!known.has(id)) staged.push(reply);
         }
       }
-      if (known.size !== totalReplies) throw new Error("reply_count");
+      if (seen.size !== totalReplies || [...known].some((id) => !seen.has(id)) ||
+        state.expansionEpoch !== epoch || controller.signal.aborted) throw new Error("reply_count");
+      const fragment = document.createDocumentFragment();
+      for (const reply of staged) fragment.appendChild(replyNode(reply, state.id));
+      container.appendChild(fragment);
       state.expanded = true;
       link.dataset.threadTotal = String(totalReplies);
       link.textContent = `작성자 답글 ${totalReplies}개 접기`;
+      link.removeAttribute("aria-busy");
       if (!refresh) panelMessage(this, "");
     } catch {
-      if (!controller.signal.aborted) panelMessage(this, REPLIES_ERROR);
+      if (!controller.signal.aborted && state.expansionEpoch === epoch)
+        panelMessage(this, REPLIES_ERROR);
+      if (!refresh && !state.expanded && state.expansionEpoch === epoch) {
+        link.removeAttribute("aria-busy");
+        link.textContent = `작성자 답글 ${link.dataset.threadTotal ?? ""}개 모두 보기`;
+      }
     } finally {
-      if (state.expansionController === controller) state.expansionController = null;
+      if (state.expansionController === controller) {
+        state.expansionController = null;
+        state.loading = false;
+      }
     }
   }
 
@@ -589,6 +637,7 @@ class ThreadPanel extends HTMLElement {
     const button = form.querySelector('button[type="submit"]');
     if (button instanceof HTMLButtonElement) button.disabled = true;
     const controller = new AbortController();
+    let retryQueued = false;
     try {
       const response = await formJson(form, controller.signal);
       const body = await responseJson(response);
@@ -604,10 +653,18 @@ class ThreadPanel extends HTMLElement {
         if (result.threadsPostId !== state.id || !nonnegative(result.generation) ||
           Number(result.generation) < 1 || result.status !== "pending" ||
           typeof result.duplicate !== "boolean") throw new Error("invalid_sync");
-        state.card.dataset.threadStatus = "pending";
+        if (state.timer !== null) clearTimeout(state.timer);
+        state.timer = null;
+        state.pollEpoch += 1;
+        const previousController = state.controller;
+        state.controller = null;
+        previousController?.abort();
+        state.etag = "";
         state.stopped = false;
         state.delayIndex = 0;
-        state.etag = "";
+        state.generation = Number(result.generation);
+        state.card.dataset.threadGeneration = String(state.generation);
+        state.card.dataset.threadStatus = "pending";
         this.applyPolling(state.card, {
           status: "pending", mediaProgress: { expected: 0, ready: 0, failed: 0, pending: 0 },
         });
@@ -619,12 +676,15 @@ class ThreadPanel extends HTMLElement {
         if (result.threadsPostId !== state.id || typeof result.mediaId !== "string" ||
           !LOCAL_ID.test(result.mediaId) || result.status !== "queued")
           throw new Error("invalid_retry");
+        form.dataset.threadRetryStatus = "queued";
+        if (button instanceof HTMLButtonElement) button.textContent = "미디어 재시도 대기 중";
+        retryQueued = true;
       }
       panelMessage(this, "");
     } catch {
       panelMessage(this, REQUEST_ERROR);
     } finally {
-      if (button instanceof HTMLButtonElement) button.disabled = false;
+      if (button instanceof HTMLButtonElement && !retryQueued) button.disabled = false;
     }
   }
 
@@ -643,28 +703,23 @@ class ThreadPanel extends HTMLElement {
       !(dialog instanceof HTMLDialogElement) || typeof dialog.showModal !== "function" ||
       !(dialogForm instanceof HTMLFormElement) || !(confirm instanceof HTMLButtonElement) ||
       !(cancel instanceof HTMLButtonElement)) return false;
+    const id = card.dataset.threadId ?? "";
+    const action = localUrl(nativeForm.action, new RegExp(`^/threads/${id}/delete$`));
+    const authorTarget = dialog.querySelector("[data-thread-delete-author]");
+    const dateTarget = dialog.querySelector("[data-thread-delete-date]");
+    if (!POST_ID.test(id) || !action || !(authorTarget instanceof HTMLElement) ||
+      !(dateTarget instanceof HTMLElement)) return false;
     event.preventDefault();
-    try {
-      const id = card.dataset.threadId ?? "";
-      const action = localUrl(nativeForm.action, new RegExp(`^/threads/${id}/delete$`));
-      if (!POST_ID.test(id) || !action) throw new Error("invalid_delete_action");
-      const name = card.querySelector("[data-thread-author-name]")?.textContent ?? "";
-      const username = card.querySelector("[data-thread-author-username]")?.textContent ?? "";
-      const date = card.querySelector(":scope > [data-thread-published-at]")?.textContent ?? "";
-      const authorTarget = dialog.querySelector("[data-thread-delete-author]");
-      const dateTarget = dialog.querySelector("[data-thread-delete-date]");
-      if (!(authorTarget instanceof HTMLElement) || !(dateTarget instanceof HTMLElement))
-        throw new Error("missing_delete_target");
-      authorTarget.textContent = `${name} ${username}`.trim();
-      dateTarget.textContent = date;
-      dialogForm.action = action.href;
-      confirm.disabled = false;
-      this.deleteOpener = summary;
-      dialog.showModal();
-      cancel.focus();
-    } catch {
-      location.href = nativeForm.action;
-    }
+    const name = card.querySelector("[data-thread-author-name]")?.textContent ?? "";
+    const username = card.querySelector("[data-thread-author-username]")?.textContent ?? "";
+    const date = card.querySelector(":scope > [data-thread-published-at]")?.textContent ?? "";
+    authorTarget.textContent = `${name} ${username}`.trim();
+    dateTarget.textContent = date;
+    dialogForm.action = action.href;
+    confirm.disabled = false;
+    this.deleteOpener = summary;
+    dialog.showModal();
+    cancel.focus();
     return true;
   }
 

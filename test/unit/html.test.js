@@ -528,7 +528,7 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /<form method="post" action="\/threads">[\s\S]*name="url" type="url"/);
   assert.match(html, /<thread-capture class="thread-capture">[\s\S]*data-thread-capture-message/);
   assert.match(html, /<thread-panel>[\s\S]*data-thread-archive-list/);
-  assert.match(html, /<article data-thread-archive data-thread-id="post-1" data-thread-status="partial">/);
+  assert.match(html, /<article data-thread-archive data-thread-id="post-1" data-thread-generation="2" data-thread-status="partial">/);
   assert.match(html, /data-thread-progress>미디어 4\/5 준비 · 실패 1/);
   assert.match(html, /<img data-thread-author-image src="\/threads\/post-1\/media\/author-1" alt=""/);
   assert.match(html, /data-thread-author-name>작성자 &lt;script&gt;<\/strong>/);
@@ -543,6 +543,8 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /href="\/threads\/post-1#author-replies">작성자 답글 12개 모두 보기<\/a>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/sync" data-thread-sync-form>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry" data-thread-retry-form>/);
+  const retry = html.match(/<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry"[\s\S]*?<\/form>/)?.[0] ?? "";
+  assert.match(retry, /<input type="hidden" name="csrf" value="csrf&quot;x">/);
   assert.match(html, /<details data-thread-delete>[\s\S]*action="\/threads\/post-1\/delete"[\s\S]*name="confirm" value="yes"/);
   assert.equal((html.match(/data-thread-delete-dialog/g) ?? []).length, 1);
   assert.match(html, /<dialog data-thread-delete-dialog>[\s\S]*data-thread-delete-author[\s\S]*data-thread-delete-date/);

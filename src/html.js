@@ -410,8 +410,8 @@ function threadAuthor(postId, author) {
   return `<header class="thread-author">${image}<strong data-thread-author-name>${htmlText(author?.displayName ?? "알 수 없는 작성자")}</strong><span data-thread-author-username>@${htmlText(author?.username ?? "unknown")}</span></header>`;
 }
 
-/** @param {string} postId @param {any[]} media */
-function threadMedia(postId, media = []) {
+/** @param {string} postId @param {any[]} media @param {string} csrfToken */
+function threadMedia(postId, media = [], csrfToken) {
   const ready = media.filter((item) => item?.status === "ready");
   const items = ready.filter((item) => item.kind === "image" || item.kind === "video").map((item) => {
     const href = `/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}`;
@@ -425,22 +425,22 @@ function threadMedia(postId, media = []) {
     return `<video controls preload="metadata"${poster} aria-label="${htmlAttr(label)}"><source src="${htmlAttr(href)}">${htmlText(label)}</video>`;
   }).join("");
   const retries = media.filter((item) => item?.status === "error").map((item) =>
-    `<form method="post" action="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}/retry" data-thread-retry-form><button type="submit">미디어 재시도</button></form>`).join("");
+    `<form method="post" action="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}/retry" data-thread-retry-form>${csrf(csrfToken)}<button type="submit">미디어 재시도</button></form>`).join("");
   return `<div data-thread-media>${items ? `<div class="thread-media">${items}</div>` : ""}${retries}</div>`;
 }
 
-/** @param {string} postId @param {any} entry @param {boolean} reply */
-function threadEntry(postId, entry, reply = false) {
+/** @param {string} postId @param {any} entry @param {boolean} reply @param {string} csrfToken */
+function threadEntry(postId, entry, reply = false, csrfToken) {
   if (!entry) return "";
   const replyAttribute = reply
     ? ` data-thread-author-reply data-thread-entry-id="${htmlAttr(entry.id ?? "")}"` : "";
-  return `<article${replyAttribute}>${threadAuthor(postId, entry.author)}<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media)}</div></article>`;
+  return `<article${replyAttribute}>${threadAuthor(postId, entry.author)}<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media, csrfToken)}</div></article>`;
 }
 
-/** @param {string} postId @param {any} entry */
-function threadRoot(postId, entry) {
+/** @param {string} postId @param {any} entry @param {string} csrfToken */
+function threadRoot(postId, entry, csrfToken) {
   if (!entry) return '<div data-thread-root><p data-thread-text>보관할 본문이 없습니다.</p></div>';
-  return `<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media)}</div>`;
+  return `<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media, csrfToken)}</div>`;
 }
 
 /** @param {any} archive */
@@ -461,10 +461,10 @@ function threadArchive(archive, replies, detail, csrfToken) {
   const quote = archive.quote
     ? `<section data-thread-quote><p data-thread-text>${threadText(archive.quote.text, archive.quote.links)}</p></section>`
     : '<section data-thread-quote hidden></section>';
-  const replyMarkup = replies.map((reply) => threadEntry(postId, reply, true)).join("");
+  const replyMarkup = replies.map((reply) => threadEntry(postId, reply, true, csrfToken)).join("");
   const allReplies = archive.replyCount > replies.length && !detail
     ? `<a data-thread-all-replies href="${htmlAttr(`${postPath}#author-replies`)}">작성자 답글 ${htmlText(archive.replyCount)}개 모두 보기</a>` : "";
-  return `<article data-thread-archive data-thread-id="${htmlAttr(postId)}" data-thread-status="${status}">${threadAuthor(postId, archive.author)}<p data-thread-status-label>${threadsStatusText(archive.status)}</p>${threadProgress(archive)}${threadRoot(postId, archive.root)}${quote}<section${repliesId} data-thread-replies>${replyMarkup}</section><div class="thread-actions"><form method="post" action="${htmlAttr(`${postPath}/sync`)}" data-thread-sync-form>${csrf(csrfToken)}<button type="submit">동기화</button></form>${allReplies}</div><details data-thread-delete><summary>보관 삭제</summary><form method="post" action="${htmlAttr(`${postPath}/delete`)}">${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">보관 삭제</button></form></details></article>`;
+  return `<article data-thread-archive data-thread-id="${htmlAttr(postId)}" data-thread-generation="${htmlAttr(archive.syncGeneration ?? 1)}" data-thread-status="${status}">${threadAuthor(postId, archive.author)}<p data-thread-status-label>${threadsStatusText(archive.status)}</p>${threadProgress(archive)}${threadRoot(postId, archive.root, csrfToken)}${quote}<section${repliesId} data-thread-replies>${replyMarkup}</section><div class="thread-actions"><form method="post" action="${htmlAttr(`${postPath}/sync`)}" data-thread-sync-form>${csrf(csrfToken)}<button type="submit">동기화</button></form>${allReplies}</div><details data-thread-delete><summary>보관 삭제</summary><form method="post" action="${htmlAttr(`${postPath}/delete`)}">${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">보관 삭제</button></form></details></article>`;
 }
 
 /** @param {string} csrfToken */

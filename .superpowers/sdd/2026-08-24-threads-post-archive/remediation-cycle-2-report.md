@@ -352,3 +352,85 @@ No production/live Meta request, Cloudflare API/resource action, secret access,
 remote D1 operation, release action, deployment, traffic change, or repository
 push occurred. All new Queue exhaustion, DLQ, scheduled, D1, and R2 evidence came
 from the isolated local harness.
+
+## Scoped review fix round 2
+
+### Scope and commit
+
+- Review baseline: clean `47bf6c0`.
+- Implementation/test commit: `36f96e5` (`fix: reconcile persisted ready profile replay`).
+- Scope was limited to the crash window after the profile-ready CAS and durable
+  cleanup-owner commit but before archive/job recalculation.
+
+### Root cause and fix
+
+Fix round 1 made author-global cleanup the first profile-delivery action. That
+ordering was correct for origin independence, but a persisted ready winner with
+a failing superseded R2 delete threw before `readProfileMedia` and
+`recalculateMediaStatus`. Every primary replay could therefore return retry while
+the post/job remained `collecting`/`media_pending` indefinitely.
+
+`archiveProfile` now captures the cleanup outcome, always performs the
+origin-scoped read, and, when the durable profile is already ready, recalculates
+the addressed archive/job before propagating the cleanup error. A missing/stale
+origin still propagates cleanup failure for primary retry and scheduled recovery;
+non-ready origins still stop before provider work when cleanup failed.
+
+`deadProfile` likewise attempts author-global cleanup first, then reads the
+origin and recalculates a durable ready winner before its zero-retry DLQ ACK. R2
+failure leaves the cleanup row untouched for the bounded scheduled executor.
+R2-before-D1 owner removal, the terminal post retry gate, shared-author handling,
+and active-key preservation are unchanged.
+
+### RED/GREEN evidence
+
+RED command:
+
+`node --test --test-name-pattern="persisted ready profile replay reconciles" test/integration/threads.test.js`
+
+- 0/1 passed.
+- Primary returned the expected retry, but the post/job remained
+  `collecting`/`media_pending` with a null completion timestamp instead of
+  reconciling from the durable ready profile.
+
+The regression seeds the exact crash state: ready profile/new immutable key,
+superseded cleanup owner/old object, and collecting/media-pending origin. It
+forces three primary cleanup failures, resets the same durable crash window for
+media DLQ delivery, verifies the DLQ's fourth cleanup attempt and terminal
+recalculation before ACK, then lets the scheduled executor remove the old object
+and owner while retaining the active key. No provider call occurs.
+
+GREEN command:
+
+`node --test --test-name-pattern="persisted ready profile replay reconciles" test/integration/threads.test.js`
+
+- 1/1 passed, 0 failed, 0 skipped.
+- The prior fix-round five-test command also passed 5/5, including origin-gone
+  cleanup, terminal post authorization, status-before-cleanup protection for the
+  original winning path, configured primary/DLQ exhaustion, and bounded isolated
+  scheduled recovery.
+
+### Reduced final verification
+
+- Fresh committed-state `npm run check` — PASS: 332 unit cases, 331 passed,
+  0 failed, 1 intentional Windows symlink skip; type, CSS, and source gates passed.
+- New persisted-ready replay integration — 1/1 passed.
+- Prior fix-round integration — 5/5 passed.
+- `npx wrangler types worker-configuration.d.ts --env test --check` — PASS with
+  Wrangler 4.114.0; checked-in types are current.
+- `git diff --check` — PASS.
+- Final `git status --short` — empty after the report commit.
+
+Per the user's minimal-verification instruction, no full integration, full E2E,
+focused Chromium, or Task 12 audit rerun was performed in this round.
+
+### Self-review and no-production confirmation
+
+- Cleanup error ordering is explicit: ready-origin recalculation completes before
+  primary retry is returned; DLQ recalculates before ACK; origin-gone cleanup
+  remains globally retryable/scheduled.
+- Durable cleanup ownership remains the source of truth until R2 succeeds.
+  Scheduled recovery remains bounded to 25 isolated author owners per run.
+- No residual scoped finding remains open.
+- No production/live Meta request, Cloudflare action, secret access, remote D1
+  operation, release/deployment/traffic action, or repository push occurred.

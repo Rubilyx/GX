@@ -1269,11 +1269,24 @@ test("Threads interface finalization replays only pending URL-free stable IDs", 
   ).run();
   assert.equal((await finalizeThreadsContent(db, harness.mediaQueue, {
     ...input, nowSeconds: 2_304,
-  })).status, "partial");
+  })).status, "media_pending");
   assert.deepEqual(harness.mediaMessages.at(-1), expectedMediaMessages[2]);
   assert.equal(harness.mediaMessages.length, 9);
-  await finalizeThreadsContent(db, harness.mediaQueue, { ...input, nowSeconds: 2_305 });
-  assert.equal(harness.mediaMessages.length, 9);
+  assert.equal((await finalizeThreadsContent(db, harness.mediaQueue, {
+    ...input, nowSeconds: 2_305,
+  })).status, "media_pending");
+  assert.deepEqual(harness.mediaMessages.at(-1), expectedMediaMessages[2]);
+  assert.equal(harness.mediaMessages.length, 10);
+  await db.prepare(
+    `UPDATE threads_media SET status = 'error',
+       error_code = 'threads_media_unavailable'
+     WHERE entry_id = ? AND ordinal = 2`,
+  ).bind(rows[0].entry_id).run();
+  assert.equal((await finalizeThreadsContent(db, harness.mediaQueue, {
+    ...input, nowSeconds: 2_306,
+  })).status, "partial");
+  await finalizeThreadsContent(db, harness.mediaQueue, { ...input, nowSeconds: 2_307 });
+  assert.equal(harness.mediaMessages.length, 10);
   assert.doesNotMatch(JSON.stringify(harness.mediaMessages), /sourceUrl|scontent/);
 });
 

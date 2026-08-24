@@ -105,8 +105,8 @@ test("migration creates the complete table inventory and enforces five tags", as
   assert.deepEqual(rows.results.map((row) => row.name), [
     "auth_attempts", "repositories", "repository_notes", "repository_tags", "telemetry_daily",
     "threads_authors", "threads_entries", "threads_links", "threads_media",
-    "threads_oauth_credentials", "threads_posts", "threads_sync_cursors",
-    "threads_sync_jobs",
+    "threads_oauth_credentials", "threads_posts", "threads_profile_cleanup_keys",
+    "threads_sync_cursors", "threads_sync_jobs",
   ]);
   const columns = await env.PROD_DB.prepare("PRAGMA table_info(repositories)").all();
   assert.equal(columns.results.some((column) => column.name === "github_pushed_at"), true);

@@ -165,6 +165,12 @@ test("rejects CDN suffix lookalikes and custom ports before a media request", as
     "https://cdninstagram.com:443/object",
     "https://cdninstagram.com:0443/object",
     "https://cdninstagram.com:444/object",
+    "https:////cdninstagram.com/object",
+    "https:///cdninstagram.com/object",
+    "https:\\\\cdninstagram.com\\object",
+    "https://cdninstagram.com\\object",
+    "https://cdninstagram.com/path\\object",
+    "////cdninstagram.com/object",
   ]) {
     const archived = await archiveEntry({ url });
     assert.deepEqual(archived.result, ACK);
@@ -212,6 +218,29 @@ test("allows three HTTPS CDN redirects, cancels them, and rejects a downgrade or
       assert.equal(explicitPort.bucket.objects.size, 0, location);
     }
   }
+
+  for (const location of [
+    "https:////scontent.cdninstagram.com/object",
+    "https:///scontent.cdninstagram.com/object",
+    "https:\\\\scontent.cdninstagram.com\\object",
+    "https://scontent.cdninstagram.com\\object",
+    "//\\scontent.cdninstagram.com/object",
+    "///scontent.cdninstagram.com/object",
+    "////scontent.cdninstagram.com/object",
+  ]) {
+    const malformed = await archiveEntry({ cdn() { return redirect(location); } });
+    assert.equal(malformed.cdnCalls, 1, location);
+    assert.equal(malformed.bucket.objects.size, 0, location);
+  }
+
+  const relative = await archiveEntry({ cdn(url, call) {
+    if (call === 1) return redirect("/relative-object");
+    return streamingResponse(new Uint8Array([9]), {
+      headers: { "Content-Type": "image/png", "Content-Length": "1" },
+    });
+  } });
+  assert.equal(relative.cdnCalls, 2);
+  assert.equal(relative.bucket.objects.size, 1);
 });
 
 test("enforces declared and counted byte limits without retaining a partial object", async () => {

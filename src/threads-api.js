@@ -64,6 +64,8 @@ function safeHttpsUrl(value, rejectExplicitPort = false) {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || !value || value.length > 4_096) protocolError();
   if (rejectExplicitPort) {
+    if (value.includes("\\") || value.slice(0, 8).toLowerCase() !== "https://" ||
+      value.length <= 8 || value[8] === "/" || value[8] === "\\") protocolError();
     const authorityStart = value.slice(0, 8).toLowerCase() === "https://" ? 8 : -1;
     const separators = authorityStart >= 0 ? [value.indexOf("/", authorityStart),
       value.indexOf("?", authorityStart), value.indexOf("#", authorityStart)]

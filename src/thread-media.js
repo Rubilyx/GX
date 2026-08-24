@@ -1,10 +1,12 @@
 import { AppError } from "./domain.js";
 import { cleanupDeletingProfile, deleteReferencedObject } from "./thread-media-cleanup.js";
 import {
-  IMAGE_TYPES, VIDEO_TYPES, downloadThreadsMedia, mediaMaximumBytes,
+  IMAGE_TYPES, VIDEO_TYPES, ThreadsMediaWriteError, downloadThreadsMedia,
+  mediaMaximumBytes,
 } from "./thread-media-download.js";
 import {
-  MEDIA_ACK, claimEntryUpload, claimProfileUpload, clearEntryUploadForRetry,
+  MEDIA_ACK, canDeleteFailedEntryUpload, canDeleteFailedProfileUpload,
+  claimEntryUpload, claimProfileUpload, clearEntryUploadForRetry,
   deleteUncommittedUpload, entryKey, failEntryUpload, failProfileUpload,
   hasLiveAuthorReference, mediaRetryResult, ownsEntryUpload, ownsProfileUpload,
   profileKey, readEntryMedia, readProfileMedia, readyEntryUpload, readyProfileUpload,
@@ -25,6 +27,12 @@ function accessToken(value) {
   if (typeof token !== "string" || !token)
     throw new AppError("threads_reconnect_required", 401);
   return token;
+}
+
+/** @param {any} bucket @param {string} key */
+async function deleteFailedWrite(bucket, key) {
+  try { await bucket.delete(key); }
+  catch { throw new AppError("media_storage_unavailable", 503); }
 }
 
 /** @param {Record<string, any>} message @param {any} dependencies */
@@ -83,6 +91,9 @@ async function archiveEntry(message, dependencies) {
       await deleteUncommittedUpload(dependencies.bucket, object.key);
     }
   } catch (error) {
+    if (error instanceof ThreadsMediaWriteError &&
+      await canDeleteFailedEntryUpload(dependencies.db, message, row, now))
+      await deleteFailedWrite(dependencies.bucket, error.written.key);
     const retry = mediaRetryResult(error);
     if (retry) {
       await releaseEntryUpload(dependencies.db, message, row, now);
@@ -104,7 +115,8 @@ async function archiveProfile(message, dependencies) {
   if (row.status === "deleting") {
     await cleanupDeletingProfile(dependencies.db, dependencies.bucket, {
       author_id: row.author_id, r2_key: row.r2_key, cleanup_lease: row.cleanup_lease,
-    });
+      cleanup_started_at: row.cleanup_started_at,
+    }, now);
     row = await readProfileMedia(dependencies.db, message);
     if (!row) return;
     if (row.status === "ready") {
@@ -137,6 +149,9 @@ async function archiveProfile(message, dependencies) {
       await deleteUncommittedUpload(dependencies.bucket, object.key);
     }
   } catch (error) {
+    if (error instanceof ThreadsMediaWriteError &&
+      await canDeleteFailedProfileUpload(dependencies.db, message, row, now))
+      await deleteFailedWrite(dependencies.bucket, error.written.key);
     const retry = mediaRetryResult(error);
     if (retry) {
       await releaseProfileUpload(dependencies.db, message, row, now);

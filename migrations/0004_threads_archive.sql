@@ -16,11 +16,14 @@ CREATE TABLE threads_authors (
   profile_upload_lease TEXT,
   profile_upload_started_at INTEGER CHECK (profile_upload_started_at IS NULL OR profile_upload_started_at >= 0),
   profile_cleanup_lease TEXT,
+  profile_cleanup_started_at INTEGER CHECK (profile_cleanup_started_at IS NULL OR profile_cleanup_started_at >= 0),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
   CHECK ((profile_upload_lease IS NULL AND profile_upload_started_at IS NULL)
     OR (profile_upload_lease IS NOT NULL AND profile_upload_started_at IS NOT NULL)),
   CHECK (profile_cleanup_lease IS NULL OR profile_media_status = 'deleting'),
+  CHECK ((profile_cleanup_lease IS NULL AND profile_cleanup_started_at IS NULL)
+    OR (profile_cleanup_lease IS NOT NULL AND profile_cleanup_started_at IS NOT NULL)),
   CHECK (profile_media_status <> 'deleting' OR profile_upload_lease IS NULL)
 );
 

@@ -1,10 +1,11 @@
 import { AppError } from "./domain.js";
 import {
-  MEDIA_ACK, MEDIA_RETRY, entryKey, mediaRetryResult, profileKey,
+  MEDIA_ACK, MEDIA_RETRY, UPLOAD_STALE_SECONDS, entryKey, mediaRetryResult, profileKey,
 } from "./thread-media-store.js";
 import { validateCaptureMessage } from "./threads-domain.js";
 import {
-  exactRow, mutationBatch, mutationChanges, requiredString, selectRows, storageError,
+  exactRow, inputTimestamp, mutationBatch, mutationChanges, requiredString, selectRows,
+  storageError,
 } from "./threads-storage.js";
 
 /** @param {any} db @param {string} key */
@@ -100,7 +101,7 @@ async function cascadeArchive(db, postId, authors) {
     statements.push(db.prepare(
       `UPDATE threads_authors SET profile_media_status = 'deleting',
          profile_upload_lease = NULL, profile_upload_started_at = NULL,
-         profile_cleanup_lease = NULL
+         profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
        WHERE threads_user_id IN (${placeholders}) AND profile_r2_key IS NOT NULL
          AND NOT EXISTS (
            SELECT 1 FROM threads_entries
@@ -121,39 +122,53 @@ async function cascadeArchive(db, postId, authors) {
     throw new AppError("storage_unavailable", 503);
 }
 
-/** @param {any} db @param {string} authorId @param {string | null} key @param {string} lease */
-async function claimProfileCleanup(db, authorId, key, lease) {
+/** @param {any} db @param {string} authorId @param {string | null} key
+ * @param {string | null} priorLease @param {number | null} priorStarted
+ * @param {string} lease @param {number} now */
+async function claimProfileCleanup(db, authorId, key, priorLease, priorStarted, lease, now) {
+  const cutoff = now - UPLOAD_STALE_SECONDS;
   const changes = mutationChanges(await db.prepare(
-    `UPDATE threads_authors SET profile_cleanup_lease = ?
+    `UPDATE threads_authors SET profile_cleanup_lease = ?, profile_cleanup_started_at = ?
      WHERE threads_user_id = ? AND profile_media_status = 'deleting'
-       AND profile_cleanup_lease IS NULL AND profile_upload_lease IS NULL
+       AND profile_upload_lease IS NULL
+       AND ((? IS NULL AND profile_cleanup_lease IS NULL
+           AND profile_cleanup_started_at IS NULL)
+         OR (profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND profile_cleanup_started_at <= ?))
        AND ((? IS NULL AND profile_r2_key IS NULL) OR profile_r2_key = ?)`,
-  ).bind(lease, authorId, key, key).run());
+  ).bind(lease, now, authorId, priorLease, priorLease, priorStarted, cutoff,
+    key, key).run());
   if (changes > 1) throw new AppError("storage_unavailable", 503);
   return changes === 1;
 }
 
-/** @param {any} db @param {string} authorId @param {string} lease */
-async function releaseProfileCleanup(db, authorId, lease) {
+/** @param {any} db @param {string} authorId @param {string} lease @param {number} started */
+async function releaseProfileCleanup(db, authorId, lease, started) {
   const changes = mutationChanges(await db.prepare(
-    `UPDATE threads_authors SET profile_cleanup_lease = NULL
+    `UPDATE threads_authors SET profile_cleanup_lease = NULL,
+       profile_cleanup_started_at = NULL
      WHERE threads_user_id = ? AND profile_media_status = 'deleting'
-       AND profile_cleanup_lease = ?`,
-  ).bind(authorId, lease).run());
+       AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?`,
+  ).bind(authorId, lease, started).run());
   if (changes > 1) throw new AppError("storage_unavailable", 503);
 }
 
 /** @param {any} db @param {any} bucket @param {{ author_id: string,
- * r2_key: string | null, cleanup_lease?: string | null }} row @param {boolean} [retryBusy] */
-export async function cleanupDeletingProfile(db, bucket, row, retryBusy = true) {
-  if (row.cleanup_lease) {
+ * r2_key: string | null, cleanup_lease?: string | null,
+ * cleanup_started_at?: number | null }} row @param {number} now
+ * @param {boolean} [retryBusy] */
+export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = true) {
+  const cutoff = now - UPLOAD_STALE_SECONDS;
+  if (row.cleanup_lease && (!(Number.isSafeInteger(row.cleanup_started_at)) ||
+    /** @type {number} */ (row.cleanup_started_at) > cutoff)) {
     if (retryBusy) throw new AppError("media_upload_in_progress", 503);
     return "busy";
   }
   if (row.r2_key !== null && row.r2_key !== profileKey(row.author_id))
     throw new AppError("storage_unavailable", 503);
   const lease = crypto.randomUUID();
-  if (!await claimProfileCleanup(db, row.author_id, row.r2_key, lease)) {
+  if (!await claimProfileCleanup(db, row.author_id, row.r2_key,
+    row.cleanup_lease ?? null, row.cleanup_started_at ?? null, lease, now)) {
     if (retryBusy) throw new AppError("media_upload_in_progress", 503);
     return "busy";
   }
@@ -166,53 +181,59 @@ export async function cleanupDeletingProfile(db, bucket, row, retryBusy = true) 
       db.prepare(
         `DELETE FROM threads_authors
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
-           AND profile_cleanup_lease = ? AND NOT EXISTS (
+           AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND NOT EXISTS (
              SELECT 1 FROM threads_entries
              WHERE author_id = threads_authors.threads_user_id
            )`,
-      ).bind(row.author_id, lease),
+      ).bind(row.author_id, lease, now),
       db.prepare(
         `UPDATE threads_authors SET profile_media_status = 'pending',
            profile_r2_key = NULL, profile_content_type = NULL, profile_bytes = NULL,
            profile_etag = NULL, profile_error_code = NULL, profile_refreshed_at = NULL,
            profile_upload_lease = NULL, profile_upload_started_at = NULL,
-           profile_cleanup_lease = NULL
+           profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
-           AND profile_cleanup_lease = ? AND EXISTS (
+           AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
+           AND EXISTS (
              SELECT 1 FROM threads_entries
              WHERE author_id = threads_authors.threads_user_id
            )`,
-      ).bind(row.author_id, lease),
+      ).bind(row.author_id, lease, now),
     ]), 2);
     if (changes[0] + changes[1] !== 1 || changes.some((count) => count > 1))
       throw new AppError("storage_unavailable", 503);
     return changes[1] === 1 ? "pending" : "deleted";
   } catch (error) {
-    try { await releaseProfileCleanup(db, row.author_id, lease); } catch {}
+    try { await releaseProfileCleanup(db, row.author_id, lease, now); } catch {}
     throw error;
   }
 }
 
-/** @param {any} db @param {any} bucket */
-async function sweepDeletingProfiles(db, bucket) {
+/** @param {any} db @param {any} bucket @param {number} now */
+async function sweepDeletingProfiles(db, bucket, now) {
   const rows = selectRows(await db.prepare(
     `SELECT threads_user_id AS author_id, profile_r2_key AS r2_key,
-       profile_cleanup_lease AS cleanup_lease
+       profile_cleanup_lease AS cleanup_lease,
+       profile_cleanup_started_at AS cleanup_started_at
      FROM threads_authors WHERE profile_media_status = 'deleting'
-       AND profile_cleanup_lease IS NULL
      ORDER BY threads_user_id`,
-  ).all(), ["author_id", "r2_key", "cleanup_lease"]);
+  ).all(), ["author_id", "r2_key", "cleanup_lease", "cleanup_started_at"]);
   for (const row of rows) {
     if (typeof row.author_id !== "string" || !row.author_id ||
       !(row.r2_key === null || typeof row.r2_key === "string") ||
-      row.cleanup_lease !== null) throw new AppError("storage_unavailable", 503);
+      !(row.cleanup_lease === null || typeof row.cleanup_lease === "string") ||
+      !(row.cleanup_started_at === null || Number.isSafeInteger(row.cleanup_started_at) &&
+        row.cleanup_started_at >= 0)) throw new AppError("storage_unavailable", 503);
     await cleanupDeletingProfile(db, bucket, {
-      author_id: row.author_id, r2_key: row.r2_key, cleanup_lease: null,
-    }, false);
+      author_id: row.author_id, r2_key: row.r2_key, cleanup_lease: row.cleanup_lease,
+      cleanup_started_at: row.cleanup_started_at,
+    }, now, false);
   }
 }
 
-/** @param {unknown} rawMessage @param {{ db: any, bucket: any }} dependencies */
+/** @param {unknown} rawMessage
+ * @param {{ db: any, bucket: any, nowSeconds?: number }} dependencies */
 export async function deleteThreadsArchive(rawMessage, dependencies) {
   let message;
   try {
@@ -221,6 +242,8 @@ export async function deleteThreadsArchive(rawMessage, dependencies) {
   } catch { return MEDIA_ACK; }
   try {
     const postId = requiredString(message.postId);
+    const now = dependencies.nowSeconds === undefined ? Math.floor(Date.now() / 1_000) :
+      inputTimestamp(dependencies.nowSeconds);
     if (await deletingPost(dependencies.db, postId) === "deleting") {
       const rows = await deletionRows(dependencies.db, postId);
       for (const row of rows.media) {
@@ -229,7 +252,7 @@ export async function deleteThreadsArchive(rawMessage, dependencies) {
       }
       await cascadeArchive(dependencies.db, postId, rows.authors);
     }
-    await sweepDeletingProfiles(dependencies.db, dependencies.bucket);
+    await sweepDeletingProfiles(dependencies.db, dependencies.bucket, now);
     return MEDIA_ACK;
   } catch (error) { return mediaRetryResult(storageError(error)) ?? MEDIA_RETRY; }
 }

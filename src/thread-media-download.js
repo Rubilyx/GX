@@ -6,6 +6,15 @@ export const VIDEO_TYPES = new Set(["video/mp4", "video/webm"]);
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const DEFAULT_MAXIMUM_BYTES = 5 * 1024 ** 3;
 
+export class ThreadsMediaWriteError extends AppError {
+  /** @param {string} code @param {number} status
+   * @param {{ key: string, size: number, httpEtag: string, contentType: string }} written */
+  constructor(code, status, written) {
+    super(code, status);
+    this.written = written;
+  }
+}
+
 /** @param {unknown} value */
 export function validateStoredEtag(value) {
   if (typeof value !== "string" || !/^"[\x21\x23-\x7e]*"$/.test(value))
@@ -28,17 +37,27 @@ export function mediaMaximumBytes(value) {
   return /** @type {number} */ (value);
 }
 
-/** @param {string} raw */
-function hasExplicitPort(raw) {
-  const value = raw.trim();
-  const authorityStart = value.slice(0, 8).toLowerCase() === "https://" ? 8 :
-    value.startsWith("//") ? 2 : -1;
-  if (authorityStart < 0) return false;
-  const separators = [value.indexOf("/", authorityStart),
-    value.indexOf("?", authorityStart), value.indexOf("#", authorityStart)]
+/** @param {string} raw @param {boolean} redirect */
+function rawUrlForm(raw, redirect) {
+  if (raw.includes("\\")) return null;
+  let authorityStart;
+  if (raw.slice(0, 8).toLowerCase() === "https://" &&
+    raw.length > 8 && raw[8] !== "/" && raw[8] !== "\\") authorityStart = 8;
+  else if (redirect && raw.startsWith("//") && raw.length > 2 &&
+    raw[2] !== "/" && raw[2] !== "\\") authorityStart = 2;
+  else if (redirect && raw.startsWith("/") && !raw.startsWith("//"))
+    return { authorityStart: null };
+  else return null;
+  return { authorityStart };
+}
+
+/** @param {string} raw @param {number} authorityStart */
+function hasExplicitPort(raw, authorityStart) {
+  const separators = [raw.indexOf("/", authorityStart),
+    raw.indexOf("?", authorityStart), raw.indexOf("#", authorityStart)]
     .filter((index) => index >= 0);
-  const authorityEnd = separators.length ? Math.min(...separators) : value.length;
-  const authority = value.slice(authorityStart, authorityEnd);
+  const authorityEnd = separators.length ? Math.min(...separators) : raw.length;
+  const authority = raw.slice(authorityStart, authorityEnd);
   return authority.slice(authority.lastIndexOf("@") + 1).includes(":");
 }
 
@@ -68,7 +87,10 @@ function responseError(response) {
 /** @param {typeof fetch} fetcher @param {string} rawUrl @param {AbortSignal | undefined} signal */
 async function providerResponse(fetcher, rawUrl, signal) {
   let url;
-  if (hasExplicitPort(rawUrl)) throw new AppError("invalid_media_url", 400);
+  const initial = rawUrlForm(rawUrl, false);
+  if (!initial || initial.authorityStart === null ||
+    hasExplicitPort(rawUrl, initial.authorityStart))
+    throw new AppError("invalid_media_url", 400);
   try { url = new URL(rawUrl); }
   catch { throw new AppError("invalid_media_url", 400); }
   for (let redirects = 0; ; redirects += 1) {
@@ -83,7 +105,10 @@ async function providerResponse(fetcher, rawUrl, signal) {
     if (redirects >= 3) throw new AppError("invalid_media_redirect", 400);
     const location = response.headers.get("location");
     if (!location) throw new AppError("invalid_media_redirect", 400);
-    if (hasExplicitPort(location)) throw new AppError("invalid_media_redirect", 400);
+    const redirect = rawUrlForm(location, true);
+    if (!redirect || redirect.authorityStart !== null &&
+      hasExplicitPort(location, redirect.authorityStart))
+      throw new AppError("invalid_media_redirect", 400);
     try { url = new URL(location, url); }
     catch { throw new AppError("invalid_media_redirect", 400); }
   }
@@ -100,21 +125,6 @@ function putResult(value) {
     throw new AppError("media_storage_unavailable", 503);
   validateStoredEtag(result.httpEtag);
   return /** @type {{ key: string, size: number, httpEtag: string }} */ (result);
-}
-
-/** @param {any} bucket @param {string} key
- * @param {{ httpEtag: string }} written */
-async function deleteIfStillCurrent(bucket, key, written) {
-  let current;
-  try { current = await bucket.head(key); }
-  catch { throw new AppError("media_storage_unavailable", 503); }
-  if (current === null) return;
-  if (!current || typeof current !== "object" ||
-    typeof current.httpEtag !== "string" || !current.httpEtag)
-    throw new AppError("media_storage_unavailable", 503);
-  if (current.httpEtag !== written.httpEtag) return;
-  try { await bucket.delete(key); }
-  catch { throw new AppError("media_storage_unavailable", 503); }
 }
 
 /** @param {any} bucket @param {typeof fetch} fetcher @param {{ url: string, key: string,
@@ -173,13 +183,11 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     throw error instanceof AppError ? error :
       new AppError("media_storage_unavailable", 503);
   }
-  if (result.key !== input.key || result.size !== count) {
-    await deleteIfStillCurrent(bucket, input.key, result);
-    throw new AppError("media_storage_unavailable", 503);
-  }
-  if (declared !== null && count !== declared) {
-    await deleteIfStillCurrent(bucket, input.key, result);
-    throw new AppError("media_byte_mismatch", 400);
-  }
-  return { key: result.key, size: result.size, httpEtag: result.httpEtag, contentType };
+  const written = { key: result.key, size: result.size,
+    httpEtag: result.httpEtag, contentType };
+  if (result.key !== input.key || result.size !== count)
+    throw new ThreadsMediaWriteError("media_storage_unavailable", 503, written);
+  if (declared !== null && count !== declared)
+    throw new ThreadsMediaWriteError("media_byte_mismatch", 400, written);
+  return written;
 }

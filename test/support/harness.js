@@ -651,6 +651,7 @@ export async function startHarness() {
         nowSeconds: options.nowSeconds ?? 4_000, signal: options.signal,
         deleteArchive: options.deleteArchive ?? ((message) => deleteThreadsArchive(message, {
           db: env.PROD_DB, bucket: mediaBucket,
+          nowSeconds: options.nowSeconds ?? 4_000,
         })),
       });
       processed += 1;

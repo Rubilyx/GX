@@ -163,7 +163,10 @@ test("scheduled refresh is registered with waitUntil and exact daily cron", asyn
   const scheduledEnv = {
     ...env,
     PROD_DB: {
-      prepare() { return { first: async () => null }; },
+      prepare() {
+        return { first: async () => null,
+          all: async () => ({ success: true, results: [] }) };
+      },
       batch() { throw new Error("batch not expected"); },
     },
     PROVIDER_FIXTURE: { fetch: async () => { throw new Error("provider not expected"); } },

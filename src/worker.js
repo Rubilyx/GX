@@ -35,7 +35,7 @@ import {
 } from "./threads-capture.js";
 import {
   deleteThreadsArchive, handleThreadsMediaDeadLetter, handleThreadsMediaMessage,
-  serveThreadsMedia,
+  recoverThreadsProfileCleanup, serveThreadsMedia,
 } from "./thread-media.js";
 import {
   dispatchThreadsQueue, dispatchThreadsScheduled, matchThreadsRoute,
@@ -1169,9 +1169,14 @@ function scheduledAdapters(runtime, fetcher) {
   const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
   const safeFetcher = observedFetcher(fetcher, state);
   return {
-    refresh: (/** @type {number} */ nowSeconds) => refreshStoredThreadsCredential(
-      runtime.db, threadsTokenInput(runtime, safeFetcher, nowSeconds),
-    ),
+    async refresh(/** @type {number} */ nowSeconds) {
+      await recoverThreadsProfileCleanup(
+        runtime.db, runtime.threadsMedia, nowSeconds,
+      );
+      return refreshStoredThreadsCredential(
+        runtime.db, threadsTokenInput(runtime, safeFetcher, nowSeconds),
+      );
+    },
   };
 }
 

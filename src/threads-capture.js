@@ -458,6 +458,12 @@ export async function handleThreadsCaptureDeadLetter(rawMessage, dependencies) {
   if (message.type === "delete-archive") {
     if (!dependencies?.db) return { action: "retry", delaySeconds: 1 };
     try {
+      if (typeof dependencies.deleteArchive === "function") {
+        const result = await dependencies.deleteArchive(message);
+        const action = result && typeof result === "object" && !Array.isArray(result)
+          ? /** @type {Record<string, unknown>} */ (result).action : null;
+        if (action === "ack") return ACK;
+      }
       await failThreadsDeletion(
         dependencies.db, message.postId, "queue_retries_exhausted",
         dependencies.nowSeconds,

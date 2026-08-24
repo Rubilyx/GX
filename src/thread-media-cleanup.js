@@ -1,7 +1,7 @@
 import { AppError } from "./domain.js";
 import {
   MEDIA_ACK, MEDIA_RETRY, UPLOAD_STALE_SECONDS, mediaRetryResult, validEntryKey,
-  validProfileKey,
+  validProfileKey, readGlobalProfileMedia,
 } from "./thread-media-store.js";
 import { validateCaptureMessage } from "./threads-domain.js";
 import {
@@ -215,6 +215,60 @@ export async function cleanupSupersededProfileKeys(db, bucket, authorId) {
     ).bind(authorId, row.r2_key).run());
     if (changes !== 1) throw new AppError("storage_unavailable", 503);
   }
+}
+
+/** Recover every durable profile cleanup state by author identity, independent
+ * of the archive/generation that happened to enqueue the work.
+ * @param {any} db @param {any} bucket @param {string} authorId @param {number} now
+ * @param {boolean} [retryBusy] */
+export async function cleanupAuthorProfileState(
+  db, bucket, authorId, now, retryBusy = true,
+) {
+  requiredString(authorId);
+  const timestamp = inputTimestamp(now);
+  const row = await readGlobalProfileMedia(db, authorId);
+  if (!row) return "missing";
+  if (row.status === "deleting") return cleanupDeletingProfile(db, bucket, {
+    author_id: row.author_id, r2_key: row.r2_key, cleanup_lease: row.cleanup_lease,
+    cleanup_started_at: row.cleanup_started_at,
+  }, timestamp, retryBusy);
+  await cleanupSupersededProfileKeys(db, bucket, authorId);
+  return "active";
+}
+
+const SCHEDULED_PROFILE_RECOVERY_LIMIT = 25;
+
+/** Bounded daily executor for durable superseded owners and deleting author
+ * tombstones left after Queue/DLQ exhaustion. Individual transient failures keep
+ * their D1 owner and do not block later owners in the same bounded page.
+ * @param {any} db @param {any} bucket @param {number} now */
+export async function recoverThreadsProfileCleanup(db, bucket, now) {
+  const timestamp = inputTimestamp(now);
+  const rows = selectRows(await db.prepare(
+    `SELECT author.threads_user_id AS author_id
+     FROM threads_authors author
+     WHERE author.profile_media_status = 'deleting'
+       OR EXISTS (
+         SELECT 1 FROM threads_profile_cleanup_keys owned
+         WHERE owned.threads_user_id = author.threads_user_id
+       )
+     ORDER BY author.threads_user_id
+     LIMIT ${SCHEDULED_PROFILE_RECOVERY_LIMIT}`,
+  ).all(), ["author_id"]);
+  let recovered = 0;
+  let pending = 0;
+  for (const row of rows) {
+    if (typeof row.author_id !== "string" || !row.author_id)
+      throw new AppError("storage_unavailable", 503);
+    try {
+      const result = await cleanupAuthorProfileState(
+        db, bucket, row.author_id, timestamp, false,
+      );
+      if (result === "busy") pending += 1;
+      else recovered += 1;
+    } catch { pending += 1; }
+  }
+  return { selected: rows.length, recovered, pending };
 }
 
 /** @param {any} db @param {any} bucket @param {{ author_id: string,

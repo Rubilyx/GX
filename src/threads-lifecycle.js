@@ -737,7 +737,8 @@ export async function startThreadsMediaRetry(
          WHERE entry.threads_post_id = ? AND author.threads_user_id = ?
            AND author.profile_media_status = 'error'
            AND author.profile_upload_lease IS NULL
-           AND author.profile_cleanup_lease IS NULL AND post.status <> 'deleting'
+           AND author.profile_cleanup_lease IS NULL
+           AND post.status IN ('ready','partial','error')
            AND job.status IN ('ready','partial','error')
            AND job.profile_completed = 1 AND job.conversation_completed = 1
            AND job.capture_lease IS NULL AND job.pending_quote_count = 0
@@ -780,7 +781,7 @@ export async function startThreadsMediaRetry(
              AND job.generation = post.sync_generation
            WHERE entry.author_id = threads_authors.threads_user_id
              AND entry.threads_post_id = ? AND post.sync_generation = ?
-             AND post.status <> 'deleting'
+             AND post.status IN ('ready','partial','error')
              AND job.status IN ('ready','partial','error')
              AND job.profile_completed = 1 AND job.conversation_completed = 1
              AND job.capture_lease IS NULL AND job.pending_quote_count = 0

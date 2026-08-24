@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile, readdir } from "node:fs/promises";
 
+import { matchThreadsRoute } from "../../src/threads-worker.js";
+
 /** @param {string} source */
 const normalizedLines = (source) => source.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
 
@@ -275,29 +277,37 @@ test("candidate preflight binds exact seven secrets to authenticated latest-vers
   assert.match(preflight, /response\.status !== 200/);
   assert.match(preflight, /body\?\.success !== true/);
   assert.match(preflight, /result\?\.items/);
-  assert.match(preflight, /resources\?\.bindings/);
-  assert.match(preflight, /binding\.type === "secret_text"/);
+  assert.match(preflight, /normalizeVersionReadback\(detailBody, \{ config, protectedVars \}/);
+  assert.match(preflight, /snapshot\.bindings\.secretNames/);
   assert.match(preflight, /latest-version-secrets\.json/);
   assert.match(preflight, /const required = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"\]/);
   assert.doesNotMatch(release, /wrangler (?:versions )?secret list|Secret Name:/);
 });
 
+test("runbook Meta callback exactly matches the runtime OAuth callback route", async () => {
+  const runbook = await readFile(new URL("../../docs/operations/release.md", import.meta.url), "utf8");
+  const callback = "https://gx.zra.workers.dev/threads/oauth/callback";
+  assert.equal(matchThreadsRoute(new URL(callback).pathname)?.kind, "callback");
+  assert.match(runbook, /`https:\/\/gx\.zra\.workers\.dev\/threads\/oauth\/callback`/);
+  assert.doesNotMatch(runbook, /gx\.zra\.workers\.dev\/threads\/callback/);
+});
+
 test("release and rollback verify version-bound and script-level Threads resources separately", async () => {
   const [release, rollback] = await Promise.all([workflow("release"), workflow("rollback")]);
   for (const source of [release, rollback]) {
-    assert.match(source, /new Set\(\["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"\]\)/);
-    assert.match(source, /binding\.type === "r2_bucket"/);
-    assert.match(source, /\.bucket_name/);
-    assert.match(source, /binding\.type === "queue"/);
-    assert.match(source, /\.queue_name/);
+    assert.match(source, /\.\/scripts\/cloudflare-readback\.mjs/);
+    assert.match(source, /normalizeVersionBindings|assertVersionContinuity/);
     assert.match(source, /workers\/scripts\/gx\/schedules/);
-    assert.match(source, /schedules\[0\]\.cron !== "0 3 \* \* \*"/);
+    assert.match(source, /assertScheduleReadback\(await api\("\/workers\/scripts\/gx\/schedules"\), "0 3 \* \* \*"/);
     assert.match(source, /\/queues\?name=/);
-    assert.match(source, /\/queues\/\$\{encodeURIComponent\(queue\.queue_id\)\}\/consumers/);
-    assert.match(source, /consumer\.script !== "gx"/);
-    assert.match(source, /consumer\.settings\?\.max_retries/);
-    assert.match(source, /consumer\.settings\?\.batch_size/);
+    assert.match(source, /queueIdFromReadback\(await api/);
+    assert.match(source, /assertQueueConsumerReadback\(await api/);
+    assert.doesNotMatch(source, /consumer\.script|consumer\.script_name/);
   }
+  assert.equal(occurrences(release, "assertQueueConsumerReadback(await api"), 3);
+  assert.equal(occurrences(rollback, "assertQueueConsumerReadback(await api"), 2);
+  assert.equal(occurrences(release, "assertScheduleReadback(await api"), 3);
+  assert.equal(occurrences(rollback, "assertScheduleReadback(await api"), 2);
   for (const queue of [
     productionResources.capture, productionResources.media,
     productionResources.captureDlq, productionResources.mediaDlq,
@@ -323,8 +333,14 @@ test("release binds active and candidate PROD_DB before backup and immediately b
   const recheck = release.indexOf("active_prod_db_binding_changed");
   const migration = release.indexOf("npx wrangler d1 migrations apply PROD_DB");
   assert.ok(initial !== -1 && initial < backup && backup < recheck && recheck < migration);
-  assert.ok(occurrences(release, 'versions view "$ACTIVE_WORKER_VERSION_ID" --json --env=""') >= 2);
-  assert.ok(occurrences(release, 'activeProd[0].id !== candidateProd[0].database_id') >= 2);
+  assert.ok(occurrences(release, 'versions view "$ACTIVE_WORKER_VERSION_ID" --json --env=""') >= 3);
+  assert.equal(occurrences(release, 'writeFile(".release/initial-active-worker-version-id"'), 1);
+  assert.equal(occurrences(release, 'writeFile(".release/initial-active-version-bindings.json"'), 1);
+  assert.equal(occurrences(release, 'writeFile(".release/candidate-version-bindings.json"'), 1);
+  assert.match(release, /flag: "wx"/);
+  const preDeploy = release.indexOf("pre_deploy_version_changed");
+  assert.ok(migration < preDeploy && preDeploy < release.indexOf('npx wrangler versions deploy "$WORKER_VERSION_ID@100%"'));
+  assert.ok(occurrences(release, "assertVersionContinuity") >= 5);
   assert.doesNotMatch(release, /non_first_release_production_empty|pre-mutation-production-count/);
   const deploy = release.indexOf('npx wrangler versions deploy "$WORKER_VERSION_ID@100%"');
   const status = release.indexOf("promotion_version_mismatch");
@@ -355,19 +371,29 @@ test("rollback proves current and target PROD_DB continuity twice before deploy"
   const deploy = rollback.indexOf('npx wrangler versions deploy "$WORKER_VERSION_ID@100%"');
   assert.ok(initial !== -1 && initial < recheck && recheck < deploy);
   assert.ok(occurrences(rollback, 'versions view "$ACTIVE_WORKER_VERSION_ID" --json --env=""') >= 2);
-  assert.match(rollback, /activeProd\[0\]\.id !== expectedD1\.get\("PROD_DB"\)/);
-  assert.match(rollback, /activeProd\[0\]\.id !== targetProd\[0\]\.database_id/);
+  assert.equal(occurrences(rollback, 'writeFile(".rollback/initial-active-worker-version-id"'), 1);
+  assert.equal(occurrences(rollback, 'writeFile(".rollback/initial-active-version-bindings.json"'), 1);
+  assert.equal(occurrences(rollback, 'writeFile(".rollback/target-version-bindings.json"'), 1);
+  assert.doesNotMatch(rollback, /writeFile\("\.rollback\/active-worker-version-id"/);
+  assert.ok(occurrences(rollback, "assertVersionContinuity") >= 3);
+  assert.match(rollback, /initial-active-worker-version-id/);
+  assert.match(rollback, /target-version-bindings\.json/);
 });
 
-test("version readbacks reject unsupported resources and exact ASSETS config drift", async () => {
-  const [release, rollback] = await Promise.all([workflow("release"), workflow("rollback")]);
+test("version readbacks delegate complete exact binding validation to the shared module", async () => {
+  const [release, rollback, validator] = await Promise.all([
+    workflow("release"), workflow("rollback"),
+    readFile(new URL("../../scripts/cloudflare-readback.mjs", import.meta.url), "utf8"),
+  ]);
   for (const source of [release, rollback]) {
-    assert.match(source, /unsupported_worker_binding_type/);
-    assert.match(source, /JSON\.stringify\(config\.assets\) !== JSON\.stringify\(expectedAssets\)/);
+    assert.match(source, /cloudflare-readback\.mjs/);
+    assert.match(source, /normalizeVersionBindings|assertVersionContinuity|normalizeVersionReadback/);
+    assert.doesNotMatch(source, /const allowedTypes = new Set/);
   }
-  assert.ok(occurrences(rollback, "unsupported_worker_binding_type") >= 2);
-  assert.ok(occurrences(rollback, "expectedAssets") >= 2);
-  assert.ok(occurrences(rollback, "assets[0].name !== expectedAssets.binding") >= 2);
+  assert.match(validator, /"assets", "d1", "queue", "r2_bucket", "ratelimit", "secret_text", "plain_text"/);
+  assert.match(validator, /assets\.length !== 1/);
+  assert.match(validator, /secretNames/);
+  assert.match(validator, /PRODUCTION_VAR_NAMES/);
 });
 
 test("starting and restored health require exact HTTP 200 and status ok", async () => {
@@ -551,10 +577,9 @@ test("release fails closed on source, dispatch, model, repository, attestation, 
   assert.match(release, /version\.annotations\?\.\["workers\/tag"\] === process\.env\.GITHUB_SHA/);
   assert.match(release, /versions view "\$WORKER_VERSION_ID" --json --env=""/);
   assert.match(release, /candidate_version_binding_mismatch/);
-  assert.match(release, /binding\.type === "assets"/);
-  assert.match(release, /assets\.length !== 1/);
-  assert.match(release, /binding\.type === "secret_text"/);
-  assert.match(release, /binding\.type === "plain_text"/);
+  assert.match(release, /normalizeVersionBindings\(version, \{ config, expectedVars \}/);
+  assert.match(release, /candidate-worker-version-id/);
+  assert.match(release, /candidate-version-bindings\.json/);
   assert.match(release, /metadata\.productionHost !== process\.env\.PRODUCTION_HOST/);
   assert.match(release, /metadata\.schema !== 2/);
   assert.match(release, /gh api --paginate --slurp "\/repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"/);
@@ -649,13 +674,10 @@ test("rollback binds a newest-five immutable release to every identity before mu
   assert.match(rollback, /for subject in "\.rollback\/repo-atlas-\$RELEASE_ID\.tar\.gz" \.rollback\/release-manifest\.json \.rollback\/deployment-record\.json/);
   assert.match(rollback, /npx wrangler versions deploy "\$WORKER_VERSION_ID@100%" --yes[\s\S]*--env=""/);
   assert.match(rollback, /versions deploy "\$WORKER_VERSION_ID@100%"[^\n]*--config \.rollback\/deploy\.jsonc/);
-  assert.ok(occurrences(rollback, 'binding.type === "secret_text"') >= 2);
-  assert.ok(occurrences(rollback, 'binding.type === "plain_text"') >= 2);
-  assert.ok(occurrences(rollback, 'binding.type === "assets"') >= 2);
-  assert.ok(occurrences(rollback, "JSON.stringify(config.assets) !== JSON.stringify(expectedAssets)") >= 2);
+  assert.ok(occurrences(rollback, "assertVersionContinuity") >= 3);
+  assert.ok(occurrences(rollback, "normalizeVersionBindings") >= 2);
   assert.ok(occurrences(rollback, 'readFile(".rollback/payload/wrangler.jsonc", "utf8")') >= 2);
-  assert.ok(rollback.lastIndexOf("JSON.stringify(config.assets) !== JSON.stringify(expectedAssets)") <
-    rollback.indexOf("npx wrangler versions deploy"));
+  assert.ok(rollback.lastIndexOf("assertVersionContinuity") > rollback.indexOf("npx wrangler versions deploy"));
   assert.match(rollback, /JSON\.stringify\(\{ name: source\.name \}/);
   assert.match(rollback, /id: rollback_version[\s\S]*continue-on-error: true/);
   assert.match(rollback, /if: always\(\)[\s\S]*deployments status[\s\S]*rollback_command_failed/);
@@ -663,9 +685,9 @@ test("rollback binds a newest-five immutable release to every identity before mu
   assert.match(rollback, /RELEASE_MODE="read-only"[^\n]*release-smoke\.spec\.js --project=chromium --retries=0/);
   assert.doesNotMatch(rollback, /D1 remains unchanged/);
   assert.match(rollback, /metadata\.schema !== 2/);
-  assert.match(rollback, /d1\.length !== 1/);
-  assert.match(rollback, /requiredSecrets = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"\]/);
-  assert.match(rollback, /expectedVars\.size/);
+  assert.match(rollback, /cloudflare-readback\.mjs/);
+  assert.match(rollback, /initial-active-version-bindings\.json/);
+  assert.match(rollback, /target-version-bindings\.json/);
   assert.ok(rollback.indexOf("metadata.schema !== 2") < rollback.indexOf("npx wrangler versions deploy"));
   assert.match(rollback, /\["archiveSha256","iosEvidenceUrl","recordedAt","releaseId","safariEvidenceUrl","sourceAttestationId","temporaryRelaxation","workerVersionId"\]/);
   assert.match(rollback, /record\.temporaryRelaxation !== metadata\.temporaryRelaxation/);

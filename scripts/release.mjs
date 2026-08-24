@@ -121,6 +121,50 @@ const THREADS_QUEUES = {
   ],
 };
 const THREADS_TRIGGERS = { crons: ["0 3 * * *"] };
+const TEST_THREADS_QUEUE_VARS = {
+  THREADS_CAPTURE_QUEUE_NAME: "repo-atlas-test-threads-capture",
+  THREADS_MEDIA_QUEUE_NAME: "repo-atlas-test-threads-media",
+  THREADS_CAPTURE_DLQ_NAME: "repo-atlas-test-threads-capture-dlq",
+  THREADS_MEDIA_DLQ_NAME: "repo-atlas-test-threads-media-dlq",
+};
+const TEST_ENV = {
+  name: "repo-atlas-test",
+  compatibility_date: "2026-07-29",
+  vars: {
+    ENVIRONMENT: "test",
+    PRODUCTION_HOST: "production.repo-atlas.test",
+    OPENAI_MODEL: "test-snapshot",
+    RELEASE_ID: "test-release",
+    TRUSTED_TYPES_MODE: "report-only",
+    THREADS_APP_ID: "test-threads-app",
+    ...TEST_THREADS_QUEUE_VARS,
+  },
+  secrets: { required: RELEASE_SECRETS },
+  d1_databases: [{
+    binding: "PROD_DB",
+    database_name: "repo-atlas-test-production",
+    database_id: "00000000-0000-0000-0000-000000000001",
+    migrations_dir: "migrations",
+  }],
+  ratelimits: [{
+    name: "REPORT_RATE_LIMITER", namespace_id: "1001", simple: { limit: 60, period: 60 },
+  }],
+  r2_buckets: [{ binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media" }],
+  queues: {
+    producers: [
+      { binding: "THREADS_CAPTURE_QUEUE", queue: "repo-atlas-test-threads-capture" },
+      { binding: "THREADS_MEDIA_QUEUE", queue: "repo-atlas-test-threads-media" },
+    ],
+    consumers: [
+      { queue: "repo-atlas-test-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-capture-dlq" },
+      { queue: "repo-atlas-test-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-media-dlq" },
+      { queue: "repo-atlas-test-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+      { queue: "repo-atlas-test-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+    ],
+  },
+  triggers: THREADS_TRIGGERS,
+  services: [{ binding: "PROVIDER_FIXTURE", service: "provider-fixture" }],
+};
 
 /** @param {unknown} left @param {unknown} right */
 const sameJson = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -134,7 +178,9 @@ function validThreadsWrangler(config) {
     sameJson(value.vars, THREADS_QUEUE_VARS) &&
     sameJson(value.r2_buckets, THREADS_R2_BUCKETS) &&
     sameJson(value.queues, THREADS_QUEUES) &&
-    sameJson(value.triggers, THREADS_TRIGGERS);
+    sameJson(value.triggers, THREADS_TRIGGERS) &&
+    sameJson(Object.keys(value.env ?? {}).sort(), ["test"]) &&
+    sameJson(value.env.test, TEST_ENV);
 }
 
 /** @param {unknown} value */

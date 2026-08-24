@@ -41,8 +41,8 @@ artifacts. Workflow evidence may contain secret names only.
 ## Meta approval and protected environments
 
 Complete Meta application review before setting the production app ID or
-connecting an account. The approved redirect URI must be the production
-`/threads/callback` URL and the approved minimum scopes are exactly
+connecting an account. The approved redirect URI must be
+`https://gx.zra.workers.dev/threads/oauth/callback` and the approved minimum scopes are exactly
 `threads_basic`, `threads_profile_discovery`, and `threads_read_replies`.
 Confirm the app remains approved for those scopes before each production
 connection; do not add publishing or management scopes to this read-only

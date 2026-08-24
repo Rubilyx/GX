@@ -158,8 +158,14 @@ async function releaseRepository(context, wranglerOverrides = {}) {
       vars: THREADS_QUEUE_VARS,
       env: {
         test: {
-          name: "release-fixture-test",
+          name: "repo-atlas-test",
+          compatibility_date: "2026-07-29",
           vars: {
+            ENVIRONMENT: "test",
+            PRODUCTION_HOST: "production.repo-atlas.test",
+            OPENAI_MODEL: "test-snapshot",
+            RELEASE_ID: "test-release",
+            TRUSTED_TYPES_MODE: "report-only",
             THREADS_APP_ID: "test-threads-app",
             THREADS_CAPTURE_QUEUE_NAME: "repo-atlas-test-threads-capture",
             THREADS_MEDIA_QUEUE_NAME: "repo-atlas-test-threads-media",
@@ -169,8 +175,9 @@ async function releaseRepository(context, wranglerOverrides = {}) {
           secrets: { required: THREADS_SECRETS },
           d1_databases: [{
             binding: "PROD_DB",
-            database_name: "release-fixture-test",
+            database_name: "repo-atlas-test-production",
             database_id: "00000000-0000-0000-0000-000000000001",
+            migrations_dir: "migrations",
           }],
           ratelimits: [{
             name: "REPORT_RATE_LIMITER",
@@ -224,6 +231,25 @@ async function releaseRepository(context, wranglerOverrides = {}) {
     gates: Object.fromEntries(GATES.map((gate) => [gate, "passed"])),
   }, null, 2)}\n`);
   return { head, root, summary };
+}
+
+/**
+ * @param {{ head: string, root: string, summary: string }} repository
+ * @param {(config: Record<string, any>) => void} mutate
+ */
+async function mutateReleaseWrangler(repository, mutate) {
+  const path = join(repository.root, "wrangler.jsonc");
+  const config = JSON.parse(await readFile(path, "utf8"));
+  mutate(config);
+  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+  await git(repository.root, ["add", "wrangler.jsonc"]);
+  await git(repository.root, ["-c", "user.name=Repo Atlas", "-c",
+    "user.email=repo-atlas@example.invalid", "commit", "--amend", "--no-edit"]);
+  repository.head = await git(repository.root, ["rev-parse", "HEAD"]);
+  await writeFixture(repository.root, "artifacts/test-summary.json", `${JSON.stringify({
+    commit: repository.head,
+    gates: Object.fromEntries(GATES.map((gate) => [gate, "passed"])),
+  }, null, 2)}\n`);
 }
 
 /** @param {import("node:test").TestContext} context */
@@ -730,7 +756,7 @@ test("createRelease preserves the exact production graph and isolated compatibil
   assert.deepEqual(config.r2_buckets, THREADS_R2);
   assert.deepEqual(config.queues, THREADS_QUEUES);
   assert.deepEqual(config.triggers, THREADS_TRIGGERS);
-  assert.equal(config.env.test.name, "release-fixture-test");
+  assert.equal(config.env.test.name, "repo-atlas-test");
   assert.deepEqual(config.env.test.r2_buckets, [{
     binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media",
   }]);
@@ -769,6 +795,42 @@ test("createRelease rejects incomplete or internally inconsistent Threads resour
       await assert.rejects(createRelease(createOptions(repository.root, {
         root: repository.root,
         out: join(repository.root, `.release-${name.replaceAll(" ", "-")}`),
+        releaseId: repository.head,
+        testSummary: repository.summary,
+      })), /invalid_wrangler_config/);
+    });
+  }
+});
+
+test("createRelease rejects any contaminated or expanded isolated test environment", async (context) => {
+  /** @type {Array<[string, (config: Record<string, any>) => void]>} */
+  const cases = [
+    ["extra environment", (config) => { config.env.extra = {}; }],
+    ["compatibility date", (config) => { config.env.test.compatibility_date = "2026-08-09"; }],
+    ["production D1 name", (config) => { config.env.test.d1_databases[0].database_name = "gx-production"; }],
+    ["production D1 ID", (config) => { config.env.test.d1_databases[0].database_id = "5e031f7f-52cc-495a-9cd9-e080bd0090ac"; }],
+    ["production R2", (config) => { config.env.test.r2_buckets[0].bucket_name = "gx-threads-media"; }],
+    ["extra R2", (config) => { config.env.test.r2_buckets.push({ binding: "EXTRA", bucket_name: "repo-atlas-test-extra" }); }],
+    ["production producer", (config) => { config.env.test.queues.producers[0].queue = "gx-threads-capture"; }],
+    ["extra consumer", (config) => { config.env.test.queues.consumers.push({ queue: "repo-atlas-test-extra", max_batch_size: 1, max_retries: 0 }); }],
+    ["malformed consumer", (config) => { config.env.test.queues.consumers[0].max_retries = 0; }],
+    ["extra cron", (config) => { config.env.test.triggers.crons.push("0 4 * * *"); }],
+    ["extra var", (config) => { config.env.test.vars.EXTRA = "test"; }],
+    ["production queue var", (config) => { config.env.test.vars.THREADS_MEDIA_QUEUE_NAME = "gx-threads-media"; }],
+    ["app ID", (config) => { config.env.test.vars.THREADS_APP_ID = "123"; }],
+    ["extra secret", (config) => { config.env.test.secrets.required.push("EXTRA_SECRET"); }],
+    ["missing secret", (config) => { config.env.test.secrets.required.pop(); }],
+    ["provider service", (config) => { config.env.test.services[0].service = "other-fixture"; }],
+    ["extra service", (config) => { config.env.test.services.push({ binding: "EXTRA", service: "provider-fixture" }); }],
+    ["unknown binding section", (config) => { config.env.test.kv_namespaces = [{ binding: "CACHE", id: "0".repeat(32) }]; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await context.test(name, async (testContext) => {
+      const repository = await releaseRepository(testContext);
+      await mutateReleaseWrangler(repository, mutate);
+      await assert.rejects(createRelease(createOptions(repository.root, {
+        root: repository.root,
+        out: join(repository.root, `.release-test-${name.replaceAll(" ", "-")}`),
         releaseId: repository.head,
         testSummary: repository.summary,
       })), /invalid_wrangler_config/);
@@ -1011,7 +1073,7 @@ test("createRelease allows default and outside-root outputs with repeatable arch
     ...THREADS_SECRETS,
   ] });
   assert.deepEqual(config.d1_databases, [{ binding: "PROD_DB", database_name: "production" }]);
-  assert.equal(config.env.test.name, "release-fixture-test");
+  assert.equal(config.env.test.name, "repo-atlas-test");
   assert.deepEqual(config.env.test.r2_buckets, [{
     binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media",
   }]);

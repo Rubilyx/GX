@@ -235,7 +235,7 @@ jobs:
           if (!/^[0-9]+$/.test(record.sourceAttestationId)) throw new Error("source_attestation_id_invalid");
           if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.workerVersionId))
             throw new Error("worker_version_mismatch");
-          await writeFile(".rollback/worker-version-id", `${record.workerVersionId}\n`);
+          await writeFile(".rollback/worker-version-id", `${record.workerVersionId}\n`, { flag: "wx" });
           NODE
           WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
           npx wrangler deployments status --json --env="" --config wrangler.jsonc > .rollback/current-status.json
@@ -246,13 +246,14 @@ jobs:
           if (!Array.isArray(active) || active.length !== 1 || active[0].percentage !== 100 ||
               !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(active[0].version_id))
             throw new Error("current_active_version_invalid");
-          await writeFile(".rollback/active-worker-version-id", `${active[0].version_id}\n`);
+          await writeFile(".rollback/initial-active-worker-version-id", `${active[0].version_id}\n`, { flag: "wx" });
           NODE
-          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/active-worker-version-id)"
+          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/initial-active-worker-version-id)"
           npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/active-version.json
           npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/version.json
           ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" WORKER_VERSION_ID="$WORKER_VERSION_ID" node --input-type=module <<'NODE'
-          import { readFile } from "node:fs/promises";
+          import { readFile, writeFile } from "node:fs/promises";
+          import { normalizeVersionBindings } from "./scripts/cloudflare-readback.mjs";
           const [version, activeVersion, config, rootConfig, metadata] = await Promise.all([
             readFile(".rollback/version.json", "utf8").then(JSON.parse),
             readFile(".rollback/active-version.json", "utf8").then(JSON.parse),
@@ -262,83 +263,10 @@ jobs:
           ]);
           if (version.id !== process.env.WORKER_VERSION_ID) throw new Error("worker_version_mismatch");
           if (version.annotations?.["workers/tag"] !== process.env.RELEASE_ID) throw new Error("worker_version_tag_mismatch");
-          const bindings = version.resources?.bindings;
-          if (!Array.isArray(bindings)) throw new Error("worker_version_binding_mismatch");
-          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
-          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
-            throw new Error("unsupported_worker_binding_type");
-          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
-          const assets = bindings.filter((binding) => binding.type === "assets");
-          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
-              assets.length !== 1 || assets[0].name !== expectedAssets.binding)
-            throw new Error("worker_version_binding_mismatch");
-          const d1 = bindings.filter((row) => row.type === "d1");
-          const expectedD1 = new Map(config.d1_databases.map((row) => [row.binding, row.database_id]));
           const rootProd = rootConfig.d1_databases?.filter((row) => row.binding === "PROD_DB");
-          if (d1.length !== 1 || d1.length !== expectedD1.size || d1.some((row) => expectedD1.get(row.name) !== row.id) ||
-              rootProd?.length !== 1 || rootProd[0].database_id !== expectedD1.get("PROD_DB"))
+          if (rootProd?.length !== 1 || rootProd[0].database_id !== config.d1_databases?.[0]?.database_id)
             throw new Error("worker_version_binding_mismatch");
-          const targetR2 = bindings.filter((binding) => binding.type === "r2_bucket");
-          const targetQueues = bindings.filter((binding) => binding.type === "queue");
-          const expectedConsumers = [
-            { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
-            { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
-            { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
-            { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
-          ];
-          if (JSON.stringify(config.r2_buckets) !== JSON.stringify([{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }]) ||
-              JSON.stringify(config.queues?.consumers) !== JSON.stringify(expectedConsumers) ||
-              JSON.stringify(config.triggers) !== JSON.stringify({ crons: ["0 3 * * *"] }) ||
-              targetR2.length !== 1 || targetR2[0].name !== "THREADS_MEDIA" || targetR2[0].bucket_name !== "gx-threads-media" ||
-              targetQueues.length !== 2 || targetQueues.some((binding) =>
-                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name))
-            throw new Error("target_threads_resources_invalid");
-          const activeBindings = activeVersion.resources?.bindings;
-          if (activeVersion.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(activeBindings))
-            throw new Error("current_prod_db_binding_mismatch");
-          if (activeBindings.some((binding) => !allowedTypes.has(binding?.type)))
-            throw new Error("unsupported_worker_binding_type");
-          const activeAssets = activeBindings.filter((binding) => binding.type === "assets");
-          const activeProd = activeBindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
-          const activeR2 = activeBindings.filter((binding) => binding.type === "r2_bucket");
-          const activeQueues = activeBindings.filter((binding) => binding.type === "queue");
-          const activeLimiters = activeBindings.filter((binding) => binding.type === "ratelimit");
-          const activeExpectedLimiter = config.ratelimits[0];
-          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
-          const activeSecrets = activeBindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
-          const activeThreadVars = new Map(Object.entries({
-            THREADS_APP_ID: process.env.THREADS_APP_ID,
-            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
-            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
-            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
-            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
-          }));
-          const activeVariables = activeBindings.filter((binding) => binding.type === "plain_text");
-          if (activeAssets.length !== 1 || activeAssets[0].name !== expectedAssets.binding ||
-              activeProd.length !== 1 || activeProd[0].id !== expectedD1.get("PROD_DB") ||
-              activeLimiters.length !== 1 || activeLimiters[0].name !== activeExpectedLimiter.name ||
-              activeLimiters[0].namespace_id !== activeExpectedLimiter.namespace_id ||
-              activeLimiters[0].simple?.limit !== 60 || activeLimiters[0].simple?.period !== 60 ||
-              activeR2.length !== 1 || activeR2[0].name !== "THREADS_MEDIA" || activeR2[0].bucket_name !== "gx-threads-media" ||
-              activeQueues.length !== 2 || activeQueues.some((binding) =>
-                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name) ||
-              JSON.stringify(activeSecrets) !== JSON.stringify(requiredSecrets) || activeVariables.length !== 10 ||
-              activeVariables.some((binding) => activeThreadVars.has(binding.name) && activeThreadVars.get(binding.name) !== binding.text) ||
-              [...activeThreadVars].some(([name]) => !activeVariables.some((binding) => binding.name === name)) ||
-              new Set(activeVariables.map((binding) => binding.name)).size !== activeVariables.length ||
-              !activeVariables.some((binding) => binding.name === "ENVIRONMENT" && binding.text === "deployed") ||
-              !activeVariables.some((binding) => binding.name === "PRODUCTION_HOST" && binding.text === "gx.zra.workers.dev") ||
-              !activeVariables.some((binding) => binding.name === "RELEASE_ID" && /^[0-9a-f]{40}$/.test(binding.text)))
-            throw new Error("active_threads_resources_invalid");
-          const limiter = Array.isArray(bindings) ? bindings.filter((row) => row.type === "ratelimit") : [];
-          const expectedLimiter = config.ratelimits[0];
-          if (limiter.length !== 1 || limiter[0].name !== expectedLimiter.name ||
-              limiter[0].namespace_id !== expectedLimiter.namespace_id ||
-              limiter[0].simple?.limit !== 60 || limiter[0].simple?.period !== 60)
-            throw new Error("worker_version_binding_mismatch");
-          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
-          if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets)) throw new Error("worker_version_binding_mismatch");
-          const expectedVars = new Map(Object.entries({
+          const expectedVars = {
             ENVIRONMENT: "deployed",
             OPENAI_MODEL: metadata.openAiModel,
             PRODUCTION_HOST: metadata.productionHost,
@@ -349,12 +277,24 @@ jobs:
             THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
             THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
             THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
-          }));
-          const variables = bindings.filter((binding) => binding.type === "plain_text");
-          if (expectedVars.size !== 10 || variables.length !== expectedVars.size ||
-              variables.some((binding) => expectedVars.get(binding.name) !== binding.text) ||
-              new Set(variables.map((binding) => binding.name)).size !== variables.length)
-            throw new Error("worker_version_binding_mismatch");
+          };
+          const targetSnapshot = normalizeVersionBindings(version, { config, expectedVars },
+            "worker_version_binding_mismatch");
+          const protectedVars = {
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
+          };
+          const activeSnapshot = normalizeVersionBindings(activeVersion, { config, protectedVars },
+            "active_threads_resources_invalid");
+          if (activeSnapshot.versionId !== process.env.ACTIVE_WORKER_VERSION_ID)
+            throw new Error("current_prod_db_binding_mismatch");
+          await writeFile(".rollback/target-version-bindings.json",
+            `${JSON.stringify(targetSnapshot.bindings, null, 2)}\n`, { flag: "wx" });
+          await writeFile(".rollback/initial-active-version-bindings.json",
+            `${JSON.stringify(activeSnapshot.bindings, null, 2)}\n`, { flag: "wx" });
           NODE
       - name: Verify target and active Threads script resources
         env:
@@ -362,33 +302,25 @@ jobs:
         run: |
           node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
+          import {
+            assertQueueConsumerReadback, assertScheduleReadback, queueIdFromReadback,
+          } from "./scripts/cloudflare-readback.mjs";
           const config = JSON.parse(await readFile(".rollback/payload/wrangler.jsonc", "utf8"));
           const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
           const api = async (path) => {
             const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}${path}`, { headers });
             let body;
             try { body = await response.json(); } catch { body = null; }
-            if (response.status !== 200 || body?.success !== true || !Array.isArray(body.errors) || body.errors.length)
-              throw new Error("target_threads_resources_invalid");
-            return body.result;
+            if (response.status !== 200) throw new Error("target_threads_resources_invalid");
+            return body;
           };
-          const scheduleResult = await api("/workers/scripts/gx/schedules");
-          const schedules = scheduleResult?.schedules;
-          if (!Array.isArray(schedules) || schedules.length !== 1 || schedules[0].cron !== "0 3 * * *")
-            throw new Error("target_threads_resources_invalid");
+          assertScheduleReadback(await api("/workers/scripts/gx/schedules"), "0 3 * * *",
+            "target_threads_resources_invalid");
           for (const expected of config.queues.consumers) {
-            const rows = await api(`/queues?name=${encodeURIComponent(expected.queue)}`);
-            if (!Array.isArray(rows) || rows.length !== 1 || rows[0].queue_name !== expected.queue ||
-                !/^[0-9a-f-]{32,36}$/.test(rows[0].queue_id)) throw new Error("target_threads_resources_invalid");
-            const queue = rows[0];
-            const consumers = await api(`/queues/${encodeURIComponent(queue.queue_id)}/consumers`);
-            if (!Array.isArray(consumers) || consumers.length !== 1) throw new Error("target_threads_resources_invalid");
-            const consumer = consumers[0];
-            if (consumer.type !== "worker" || consumer.script !== "gx" ||
-                (consumer.dead_letter_queue ?? null) !== (expected.dead_letter_queue ?? null) ||
-                consumer.settings?.max_retries !== expected.max_retries ||
-                consumer.settings?.batch_size !== expected.max_batch_size)
-              throw new Error("target_threads_resources_invalid");
+            const queueId = queueIdFromReadback(await api(`/queues?name=${encodeURIComponent(expected.queue)}`),
+              expected.queue, "target_threads_resources_invalid");
+            assertQueueConsumerReadback(await api(`/queues/${encodeURIComponent(queueId)}/consumers`),
+              expected, "target_threads_resources_invalid");
           }
           NODE
       - name: Refuse schema-incompatible rollback
@@ -472,43 +404,17 @@ jobs:
           npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/version-recheck.json
           WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)" node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
-          const [version, config, metadata] = await Promise.all([
+          import { assertVersionContinuity } from "./scripts/cloudflare-readback.mjs";
+          const [version, config, metadata, targetVersionId, targetBindings] = await Promise.all([
             readFile(".rollback/version-recheck.json", "utf8").then(JSON.parse),
             readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
             readFile(".rollback/payload/release-metadata.json", "utf8").then(JSON.parse),
+            readFile(".rollback/worker-version-id", "utf8").then((value) => value.trim()),
+            readFile(".rollback/target-version-bindings.json", "utf8").then(JSON.parse),
           ]);
-          if (version.id !== process.env.WORKER_VERSION_ID) throw new Error("worker_version_mismatch");
+          if (targetVersionId !== process.env.WORKER_VERSION_ID) throw new Error("worker_version_mismatch");
           if (version.annotations?.["workers/tag"] !== process.env.RELEASE_ID) throw new Error("worker_version_tag_mismatch");
-          const bindings = version.resources?.bindings;
-          if (!Array.isArray(bindings)) throw new Error("worker_version_binding_mismatch");
-          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
-          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
-            throw new Error("unsupported_worker_binding_type");
-          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
-          const assets = bindings.filter((binding) => binding.type === "assets");
-          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
-              assets.length !== 1 || assets[0].name !== expectedAssets.binding)
-            throw new Error("worker_version_binding_mismatch");
-          const d1 = bindings.filter((row) => row.type === "d1");
-          const expectedD1 = new Map(config.d1_databases.map((row) => [row.binding, row.database_id]));
-          if (d1.length !== 1 || d1.length !== expectedD1.size || d1.some((row) => expectedD1.get(row.name) !== row.id))
-            throw new Error("worker_version_binding_mismatch");
-          const limiter = Array.isArray(bindings) ? bindings.filter((row) => row.type === "ratelimit") : [];
-          const expectedLimiter = config.ratelimits[0];
-          if (limiter.length !== 1 || limiter[0].name !== expectedLimiter.name ||
-              limiter[0].namespace_id !== expectedLimiter.namespace_id ||
-              limiter[0].simple?.limit !== 60 || limiter[0].simple?.period !== 60)
-            throw new Error("worker_version_binding_mismatch");
-          const r2 = bindings.filter((binding) => binding.type === "r2_bucket");
-          const queues = bindings.filter((binding) => binding.type === "queue");
-          if (r2.length !== 1 || r2[0].name !== "THREADS_MEDIA" || r2[0].bucket_name !== "gx-threads-media" ||
-              queues.length !== 2 || queues.some((binding) =>
-                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name))
-            throw new Error("target_threads_resources_invalid");
-          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
-          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
-          if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets)) throw new Error("worker_version_binding_mismatch");
-          const expectedVars = new Map(Object.entries({
+          const expectedVars = {
             ENVIRONMENT: "deployed",
             OPENAI_MODEL: metadata.openAiModel,
             PRODUCTION_HOST: metadata.productionHost,
@@ -519,12 +425,10 @@ jobs:
             THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
             THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
             THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
-          }));
-          const variables = bindings.filter((binding) => binding.type === "plain_text");
-          if (expectedVars.size !== 10 || variables.length !== expectedVars.size ||
-              variables.some((binding) => expectedVars.get(binding.name) !== binding.text) ||
-              new Set(variables.map((binding) => binding.name)).size !== variables.length)
-            throw new Error("worker_version_binding_mismatch");
+          };
+          assertVersionContinuity(version, { config, expectedVars }, {
+            versionId: targetVersionId, bindings: targetBindings,
+          }, "worker_version_binding_mismatch");
           NODE
           npx wrangler d1 execute PROD_DB --remote --json --env="" --config wrangler.jsonc --command "SELECT COALESCE(SUM(CASE WHEN event_type='client_error' THEN count ELSE 0 END),0) AS client_errors,COALESCE(SUM(CASE WHEN event_type='csp_violation' THEN count ELSE 0 END),0) AS csp_violations FROM telemetry_daily WHERE release_id='$RELEASE_ID'" > .rollback/telemetry-baseline.json
           npx wrangler d1 execute PROD_DB --remote --json --env="" --config wrangler.jsonc --command "SELECT COUNT(*) AS count FROM repositories" > .rollback/repository-count.json
@@ -547,45 +451,39 @@ jobs:
           NODE
           npx wrangler deployments status --json --env="" --config wrangler.jsonc > .rollback/current-status-recheck.json
           node --input-type=module <<'NODE'
-          import { readFile, writeFile } from "node:fs/promises";
-          const status = JSON.parse(await readFile(".rollback/current-status-recheck.json", "utf8"));
+          import { readFile } from "node:fs/promises";
+          const [status, initialVersionId] = await Promise.all([
+            readFile(".rollback/current-status-recheck.json", "utf8").then(JSON.parse),
+            readFile(".rollback/initial-active-worker-version-id", "utf8").then((value) => value.trim()),
+          ]);
           const active = status?.versions;
           if (!Array.isArray(active) || active.length !== 1 || active[0].percentage !== 100 ||
-              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(active[0].version_id))
+              active[0].version_id !== initialVersionId)
             throw new Error("current_active_version_invalid");
-          await writeFile(".rollback/active-worker-version-id", `${active[0].version_id}\n`);
           NODE
-          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/active-worker-version-id)"
+          ACTIVE_WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/initial-active-worker-version-id)"
           npx wrangler versions view "$ACTIVE_WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/active-version-recheck.json
           ACTIVE_WORKER_VERSION_ID="$ACTIVE_WORKER_VERSION_ID" node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
-          const [activeVersion, config, rootConfig] = await Promise.all([
+          import { assertVersionContinuity } from "./scripts/cloudflare-readback.mjs";
+          const [activeVersion, config, initialVersionId, initialBindings] = await Promise.all([
             readFile(".rollback/active-version-recheck.json", "utf8").then(JSON.parse),
             readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
-            readFile("wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".rollback/initial-active-worker-version-id", "utf8").then((value) => value.trim()),
+            readFile(".rollback/initial-active-version-bindings.json", "utf8").then(JSON.parse),
           ]);
-          const bindings = activeVersion.resources?.bindings;
-          if (activeVersion.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(bindings))
+          if (initialVersionId !== process.env.ACTIVE_WORKER_VERSION_ID)
             throw new Error("current_prod_db_binding_changed");
-          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
-          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
-            throw new Error("unsupported_worker_binding_type");
-          const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
-          const activeAssets = bindings.filter((binding) => binding.type === "assets");
-          const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
-          const activeR2 = bindings.filter((binding) => binding.type === "r2_bucket");
-          const activeQueues = bindings.filter((binding) => binding.type === "queue");
-          const targetProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
-          const rootProd = rootConfig.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
-          if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
-              activeAssets.length !== 1 || activeAssets[0].name !== expectedAssets.binding ||
-              targetProd?.length !== 1 || rootProd?.length !== 1 ||
-              rootProd[0].database_id !== targetProd[0].database_id ||
-              activeProd.length !== 1 || activeProd[0].id !== targetProd[0].database_id ||
-              activeR2.length !== 1 || activeR2[0].name !== "THREADS_MEDIA" || activeR2[0].bucket_name !== "gx-threads-media" ||
-              activeQueues.length !== 2 || activeQueues.some((binding) =>
-                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name))
-            throw new Error("active_threads_resources_invalid");
+          const protectedVars = {
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
+          };
+          assertVersionContinuity(activeVersion, { config, protectedVars }, {
+            versionId: initialVersionId, bindings: initialBindings,
+          }, "active_threads_resources_invalid");
           NODE
       - id: rollback_version
         name: Roll back exact Worker version
@@ -616,35 +514,43 @@ jobs:
           WORKER_VERSION_ID="$(tr -d '\r\n' < .rollback/worker-version-id)"
           npx wrangler deployments status --json --env="" --config .rollback/deploy.jsonc > .rollback/status.json
           WORKER_VERSION_ID="$WORKER_VERSION_ID" node -e "const p=require('./.rollback/status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('rollback_version_not_current')"
+          npx wrangler versions view "$WORKER_VERSION_ID" --json --env="" --config wrangler.jsonc > .rollback/restored-version.json
+          WORKER_VERSION_ID="$WORKER_VERSION_ID" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          import { assertVersionContinuity } from "./scripts/cloudflare-readback.mjs";
+          const [version, config, targetVersionId, targetBindings] = await Promise.all([
+            readFile(".rollback/restored-version.json", "utf8").then(JSON.parse),
+            readFile(".rollback/payload/wrangler.jsonc", "utf8").then(JSON.parse),
+            readFile(".rollback/worker-version-id", "utf8").then((value) => value.trim()),
+            readFile(".rollback/target-version-bindings.json", "utf8").then(JSON.parse),
+          ]);
+          if (targetVersionId !== process.env.WORKER_VERSION_ID)
+            throw new Error("rollback_version_not_current");
+          assertVersionContinuity(version, { config, expectedVars: config.vars }, {
+            versionId: targetVersionId, bindings: targetBindings,
+          }, "rollback_version_not_current");
+          NODE
           node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
+          import {
+            assertQueueConsumerReadback, assertScheduleReadback, queueIdFromReadback,
+          } from "./scripts/cloudflare-readback.mjs";
           const config = JSON.parse(await readFile(".rollback/payload/wrangler.jsonc", "utf8"));
           const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
           const api = async (path) => {
             const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}${path}`, { headers });
             let body;
             try { body = await response.json(); } catch { body = null; }
-            if (response.status !== 200 || body?.success !== true || !Array.isArray(body.errors) || body.errors.length)
-              throw new Error("restored_threads_resources_invalid");
-            return body.result;
+            if (response.status !== 200) throw new Error("restored_threads_resources_invalid");
+            return body;
           };
-          const scheduleResult = await api("/workers/scripts/gx/schedules");
-          const schedules = scheduleResult?.schedules;
-          if (!Array.isArray(schedules) || schedules.length !== 1 || schedules[0].cron !== "0 3 * * *")
-            throw new Error("restored_threads_resources_invalid");
+          assertScheduleReadback(await api("/workers/scripts/gx/schedules"), "0 3 * * *",
+            "restored_threads_resources_invalid");
           for (const expected of config.queues.consumers) {
-            const rows = await api(`/queues?name=${encodeURIComponent(expected.queue)}`);
-            if (!Array.isArray(rows) || rows.length !== 1 || rows[0].queue_name !== expected.queue ||
-                !/^[0-9a-f-]{32,36}$/.test(rows[0].queue_id)) throw new Error("restored_threads_resources_invalid");
-            const queue = rows[0];
-            const consumers = await api(`/queues/${encodeURIComponent(queue.queue_id)}/consumers`);
-            if (!Array.isArray(consumers) || consumers.length !== 1) throw new Error("restored_threads_resources_invalid");
-            const consumer = consumers[0];
-            if (consumer.type !== "worker" || consumer.script !== "gx" ||
-                (consumer.dead_letter_queue ?? null) !== (expected.dead_letter_queue ?? null) ||
-                consumer.settings?.max_retries !== expected.max_retries ||
-                consumer.settings?.batch_size !== expected.max_batch_size)
-              throw new Error("restored_threads_resources_invalid");
+            const queueId = queueIdFromReadback(await api(`/queues?name=${encodeURIComponent(expected.queue)}`),
+              expected.queue, "restored_threads_resources_invalid");
+            assertQueueConsumerReadback(await api(`/queues/${encodeURIComponent(queueId)}/consumers`),
+              expected, "restored_threads_resources_invalid");
           }
           NODE
           [[ "$DEPLOY_OUTCOME" = success ]] || { echo rollback_command_failed >&2; exit 1; }

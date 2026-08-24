@@ -122,6 +122,9 @@ One row represents one locally archived root post.
 - `error_code`: nullable fixed application code.
 - `sync_generation`: positive integer incremented for each accepted sync.
 - `last_successful_sync_at`, `created_at`, `updated_at`: Unix seconds.
+- `delete_previous_status`, `delete_previous_error_code`: internal deletion-recovery
+  snapshot populated only while asynchronous deletion owns the archive. Queue enqueue
+  failure or DLQ exhaustion restores a visible retryable archive before clearing it.
 
 Order list rows by `created_at DESC, id DESC`; add indexes for status/order and root author.
 
@@ -132,6 +135,11 @@ Order list rows by `created_at DESC, id DESC`; add indexes for status/order and 
 - `profile_media_status`: `pending`, `ready`, or `error`.
 - `profile_r2_key`, `profile_content_type`, `profile_etag`, `profile_bytes`: nullable until ready.
 - `profile_error_code`, `profile_refreshed_at`, `created_at`, `updated_at`.
+
+An additive sync re-arms profile work from `ready` or `error` without clearing the
+last complete R2 object metadata. Reads may continue serving that previous immutable
+object while replacement work is pending or failed; only a fenced replacement CAS
+changes the winning R2 key.
 
 Authors are shared across archives. An author and profile object are removed only when no remaining entry references that author.
 
@@ -184,13 +192,28 @@ Enforce uniqueness on `(entry_id, source_media_id, kind, ordinal)`. Do not persi
 - `threads_post_id`, `generation`: unique archive/generation pair.
 - `status`: `queued`, `resolving`, `collecting`, `media_pending`, `ready`, `partial`, or `error`.
 - Persisted provider cursor plus expected, ready, and failed counts for entries and media.
+- Separate safe-integer profile and conversation page counts enforce an explicit
+  10,000-page ceiling.
 - Fixed `error_code`, `queued_at`, `started_at`, `content_completed_at`, `completed_at`, `updated_at`.
 
 Only the current generation may advance the root row's status. Stale queue deliveries may complete their own idempotent writes but cannot overwrite a newer generation's job or status.
 
+### `threads_sync_cursors`
+
+Records each accepted profile/conversation cursor for one archive generation and its
+logical page number. The initial null cursor is unique per phase and non-null cursors
+are unique per phase/generation. Page persistence and accepting the next cursor are
+one D1 transaction, so multi-node cycles such as `A → B → A` terminalize without
+acknowledging and enqueueing forever.
+
 ### `threads_oauth_credentials`
 
 A single fixed-key row stores provider user ID, encrypted access token, AES-GCM nonce, exact granted-scope JSON, token expiry, and refresh/update timestamps. Token encryption uses `THREADS_TOKEN_KEY` with a fresh nonce for every write. Plain tokens never enter logs, telemetry, HTML, or JSON responses.
+
+The row also stores a local `reconnect_required` flag. List/detail rendering reads only
+local credential shape, expiry, scopes, and this flag; it never refreshes Meta. Provider
+authentication failures set the flag, transient failures do not, and successful OAuth
+replacement clears it.
 
 ## OAuth and Token Lifecycle
 
@@ -238,7 +261,10 @@ Transient Meta `429` responses honor `Retry-After`; transient Meta/R2/Queue `5xx
 1. `POST /threads` validates authentication, same origin, CSRF, exact form fields, and URL size/shape.
 2. A new shortcode inserts `threads_posts`, generation 1, and a queued sync job. A known shortcode increments `sync_generation` and creates a new queued job without duplicating the archive.
 3. The response redirects immediately to the archive detail with a fixed created/sync-queued flash; enhanced JSON returns the local ID and status.
-4. Capture jobs resolve the provider ID, store the root profile, root entry, all conversation pages, included author replies, links, carousel children, and one-level quotes.
+4. Capture jobs resolve the provider ID and persist valid root/reply/quote text,
+   provenance, author identity, links, and direct stable media identities before
+   optional profile, carousel-child, or nested-quote enrichment. Optional enrichment
+   failures become durable partial/error work without discarding content.
 5. D1 page writes use prepared statements and atomic `batch` calls. A page cursor is advanced only in the same successful batch as its entries.
 6. `finalize-content` creates only missing media rows and media messages. Ready media rows are never re-downloaded by a normal sync.
 7. Content completion plus all media ready produces `ready`. Content completion with any terminal media, quote, or profile failure produces `partial`. Failure to resolve or read the root post produces `error` only when no previous usable snapshot exists; otherwise the old snapshot remains visible with a failed latest-sync notice.
@@ -313,7 +339,7 @@ Deletion uses a dedicated native dialog naming the author and root-post date. Co
 Deleting an archive is asynchronous because D1 and R2 cannot share one transaction.
 
 1. The authenticated mutation atomically marks the archive `deleting`, disables further sync/retry, and queues `delete-archive`.
-2. The deletion job lists the exact R2 keys already referenced by archive media rows. It also identifies author profile objects whose authors will have no references after this archive is removed.
+2. The deletion job lists the exact R2 keys already referenced by archive media rows. It also identifies author profile objects whose authors will have no references after this archive is removed. Enqueue failure or capture-DLQ exhaustion restores the saved pre-delete state so a later delete can safely re-enqueue.
 3. It deletes those objects idempotently, then deletes the `threads_posts` row. Foreign keys cascade to entries, links, media, and jobs; the same D1 batch deletes author rows that have no remaining entry references.
 4. A failure leaves the tombstoned row and object-key inventory available for retry; the UI reports deletion pending or failed rather than claiming completion.
 

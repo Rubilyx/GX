@@ -25,12 +25,16 @@ const threadEntry = {
   id: "entry-1", sourceMediaId: "source-1", kind: "root", parentEntryId: null,
   author: {
     id: "author-1", username: "author<script>", displayName: "작성자 <script>",
-    profileMedia: { status: "ready", contentType: "image/jpeg", etag: "etag", bytes: 12, errorCode: null },
+    profileMedia: { status: "ready", contentType: "image/jpeg", etag: "etag", bytes: 12,
+      errorCode: null, available: true },
   },
   text: "본문 <script> https://safe.example/path", permalink: "https://www.threads.net/@author/post/post-1",
   publishedAt: "2026-08-23T15:30:00.000Z", mediaType: "CAROUSEL_ALBUM", altText: null,
   nestedQuotePermalink: null,
-  links: [{ url: "https://safe.example/path", source: "body", ordinal: 0 }],
+  links: [
+    { url: "https://safe.example/path", source: "body", ordinal: 0 },
+    { url: "https://attachment.example/only", source: "attachment", ordinal: 1 },
+  ],
   media: [
     { id: "image-1", sourceMediaId: "image-source", kind: "image", ordinal: 0, altText: "저장된 이미지", status: "ready" },
     { id: "video-1", sourceMediaId: "video-source", kind: "video", ordinal: 1, altText: "동영상 <script>", status: "ready" },
@@ -41,18 +45,30 @@ const threadEntry = {
   quote: null,
 };
 
+const threadQuote = {
+    ...threadEntry, id: "quote-1", sourceMediaId: "quote-source", kind: "quote",
+    parentEntryId: "entry-1", text: "인용 <b>본문</b>",
+    permalink: "https://www.threads.com/@quoted/post/quote-1",
+    nestedQuotePermalink: "https://www.threads.com/@nested/post/nested-1",
+    media: [{ id: "quote-failed", sourceMediaId: "quote-media", kind: "image",
+      ordinal: 0, altText: null, status: "error" }],
+    links: [{ url: "https://quote-attachment.example/only", source: "attachment", ordinal: 0 }],
+    author: { ...threadEntry.author, id: "quote-author", username: "quoted", displayName: "인용 작성자" },
+  };
+
 const threadArchive = {
   id: "post-1", canonicalUrl: "https://www.threads.net/@author/post/post-1", status: "partial",
-  errorCode: "threads_provider_unavailable", author: threadEntry.author, root: threadEntry,
-  quote: {
-    ...threadEntry, id: "quote-1", sourceMediaId: "quote-source", kind: "quote",
-    parentEntryId: "entry-1", text: "인용 <b>본문</b>", media: [], links: [],
-    author: { ...threadEntry.author, id: "quote-author", username: "quoted", displayName: "인용 작성자" },
-  },
+  errorCode: "threads_provider_unavailable", author: threadEntry.author,
+  root: { ...threadEntry, quote: threadQuote }, quote: threadQuote,
   firstReplies: Array.from({ length: 3 }, (_, index) => ({
     ...threadEntry, id: `reply-${index + 1}`, sourceMediaId: `reply-source-${index + 1}`,
     kind: "author_reply", parentEntryId: null, text: `답글 ${index + 1}`,
-    publishedAt: `2026-08-23T15:3${index + 1}:00.000Z`, media: [], links: [], quote: null,
+    publishedAt: `2026-08-23T15:3${index + 1}:00.000Z`, media: [], links: [],
+    quote: index === 0 ? {
+      ...threadEntry, id: "reply-quote", sourceMediaId: "reply-quote-source",
+      kind: "quote", parentEntryId: `reply-${index + 1}`,
+      text: "답글에 붙은 인용", media: [], links: [], quote: null,
+    } : null,
   })),
   replyCount: 12, mediaProgress: { expected: 5, ready: 4, failed: 1, pending: 0 },
   syncGeneration: 2, createdAt: 1, updatedAt: 2,
@@ -535,10 +551,17 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /data-thread-author-username>@author&lt;script&gt;<\/span>/);
   assert.match(html, /<time data-thread-published-at datetime="2026-08-23T15:30:00\.000Z">2026\.08\.24<\/time>/);
   assert.match(html, /<p data-thread-text>본문 &lt;script&gt; <a href="https:\/\/safe\.example\/path" rel="noreferrer">https:\/\/safe\.example\/path<\/a><\/p>/);
+  assert.match(html, /data-thread-attachment-links[\s\S]*href="https:\/\/attachment\.example\/only"/);
+  assert.match(html, /data-thread-original-link href="https:\/\/www\.threads\.net\/@author\/post\/post-1"/);
   assert.match(html, /<img src="\/threads\/post-1\/media\/image-1" alt="저장된 이미지"/);
   assert.match(html, /<video controls preload="metadata" poster="\/threads\/post-1\/media\/thumbnail-1" aria-label="동영상 &lt;script&gt;"><source src="\/threads\/post-1\/media\/video-1">동영상 &lt;script&gt;<\/video>/);
   assert.match(html, /<video controls preload="metadata" aria-label="보관된 Threads 동영상"><source src="\/threads\/post-1\/media\/video-fallback">보관된 Threads 동영상<\/video>/);
-  assert.match(html, /<section data-thread-quote><p data-thread-text>인용 &lt;b&gt;본문&lt;\/b&gt;<\/p><\/section>/);
+  assert.match(html, /<section data-thread-quote>[\s\S]*data-thread-author-name>인용 작성자<\/strong>/);
+  assert.match(html, /<section data-thread-quote>[\s\S]*data-thread-original-link href="https:\/\/www\.threads\.com\/@quoted\/post\/quote-1"/);
+  assert.match(html, /<section data-thread-quote>[\s\S]*data-thread-nested-quote-link href="https:\/\/www\.threads\.com\/@nested\/post\/nested-1"/);
+  assert.match(html, /<section data-thread-quote>[\s\S]*href="https:\/\/quote-attachment\.example\/only"/);
+  assert.match(html, /action="\/threads\/post-1\/media\/quote-failed\/retry"/);
+  assert.match(html, /data-thread-author-reply[\s\S]*data-thread-quote[\s\S]*답글에 붙은 인용/);
   assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 3);
   assert.match(html, /href="\/threads\/post-1#author-replies">작성자 답글 12개 모두 보기<\/a>/);
   assert.match(html, /<form method="post" action="\/threads\/post-1\/sync" data-thread-sync-form>/);
@@ -551,7 +574,7 @@ test("Threads index renders semantic archived cards, native controls, and safe m
   assert.match(html, /data-thread-delete-confirm[^>]*disabled/);
   assert.match(html, /data-thread-list-heading[^>]*tabindex="-1"/);
   assert.match(html, /Threads 가져오기를 대기열에 추가했습니다/);
-  assert.doesNotMatch(html, /threads\.net\/embed|cdninstagram\.com|<script[^>]+src="https:|profile_r2_key|https:\/\/www\.threads\.net\/@author/);
+  assert.doesNotMatch(html, /threads\.net\/embed|cdninstagram\.com|<script[^>]+src="https:|profile_r2_key/);
 });
 
 test("Threads detail paginates twenty chronological replies and retains shared Repository navigation", () => {

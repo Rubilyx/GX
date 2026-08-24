@@ -60,7 +60,7 @@ async function readStoredMedia(db, postId, mediaId) {
        author.profile_content_type AS content_type, author.profile_bytes AS bytes,
        author.profile_etag AS etag
      FROM threads_authors author
-     WHERE author.threads_user_id = ? AND author.profile_media_status = 'ready'
+     WHERE author.threads_user_id = ?
        AND author.profile_r2_key IS NOT NULL AND author.profile_content_type IS NOT NULL
        AND author.profile_bytes IS NOT NULL AND author.profile_etag IS NOT NULL
        AND EXISTS (

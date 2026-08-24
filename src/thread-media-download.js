@@ -150,17 +150,15 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     throw new AppError("invalid_media_mime", 400);
   }
   const rawLength = response.headers.get("content-length");
-  let declared = null;
-  if (rawLength !== null) {
-    if (!/^\d+$/.test(rawLength) || !Number.isSafeInteger(Number(rawLength))) {
-      cancelUnused(response.body);
-      throw new AppError("invalid_media_length", 400);
-    }
-    declared = Number(rawLength);
-    if (declared > input.maximumBytes) {
-      cancelUnused(response.body);
-      throw new AppError("media_too_large", 413);
-    }
+  if (rawLength === null || !/^\d+$/.test(rawLength) ||
+    !Number.isSafeInteger(Number(rawLength))) {
+    cancelUnused(response.body);
+    throw new AppError("invalid_media_length", 400);
+  }
+  const declared = Number(rawLength);
+  if (declared > input.maximumBytes) {
+    cancelUnused(response.body);
+    throw new AppError("media_too_large", 413);
   }
   const source = response.body ?? new ReadableStream({ start(controller) {
     controller.close();
@@ -176,7 +174,7 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
           throw new AppError("invalid_media_stream", 400);
         count += chunk.byteLength;
         if (count > input.maximumBytes) throw new AppError("media_too_large", 413);
-        if (declared !== null && count > declared)
+        if (count > declared)
           throw new AppError("media_byte_mismatch", 400);
         controller.enqueue(chunk);
       } catch (error) {
@@ -192,7 +190,7 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
   let fixedLengthAbort = null;
   /** @type {Promise<{ ok: true } | { ok: false, error: unknown }> | null} */
   let fixedLengthOutcome = null;
-  if (declared !== null && typeof FixedLengthStream === "function") {
+  if (typeof FixedLengthStream === "function") {
     const fixed = new FixedLengthStream(declared);
     fixedLengthAbort = new AbortController();
     fixedLengthOutcome = counted.pipeTo(fixed.writable, {
@@ -214,7 +212,7 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     else cancelUnused(stored);
     await fixedLengthOutcome;
     if (countedError !== null) throw countedError;
-    if (sourceCompleted && declared !== null && count !== declared)
+    if (sourceCompleted && count !== declared)
       throw new AppError("media_byte_mismatch", 400);
     throw new ThreadsMediaPutUncertainError(input.key);
   }
@@ -225,7 +223,7 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     httpEtag: result.httpEtag, contentType };
   if (result.key !== input.key || result.size !== count)
     throw new ThreadsMediaWriteError("media_storage_unavailable", 503, written);
-  if (declared !== null && count !== declared)
+  if (count !== declared)
     throw new ThreadsMediaWriteError("media_byte_mismatch", 400, written);
   return written;
 }

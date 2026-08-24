@@ -178,6 +178,51 @@ test("scheduled boundary refreshes only near expiry and never queues content", a
   assert.deepEqual([harness.captureMessages.length, harness.mediaMessages.length], queueCounts);
 });
 
+test("archive list and detail use local connection state during a transient Meta outage", async () => {
+  const session = await login(harness.worker);
+  const started = await harness.worker.fetch(`${session.origin}/threads/connect`, {
+    headers: { Cookie: session.cookie },
+  });
+  const location = started.headers.get("location");
+  const cookie = started.headers.get("set-cookie");
+  if (!location || !cookie) throw new Error("OAuth setup missing");
+  const state = new URL(location).searchParams.get("state");
+  assert.equal((await harness.worker.fetch(
+    `${session.origin}/threads/oauth/callback?code=code-1&state=${state}`,
+    { headers: { Cookie: cookie } },
+  )).status, 303);
+  const env = await harness.worker.getEnv();
+  const now = Math.floor(Date.now() / 1_000);
+  await env.PROD_DB.prepare(
+    `UPDATE threads_oauth_credentials SET expires_at = ?, reconnect_required = 0
+     WHERE singleton_id = 1`,
+  ).bind(now + 60).run();
+  const postId = "11111111-1111-4111-8111-111111111111";
+  await seedThreadsArchive(env.PROD_DB, {
+    id: postId, shortcode: "LocalConnectionRead",
+    threadsMediaId: "local-connection-root", rootEntryId: "local-connection-entry",
+    createdAt: now, updatedAt: now,
+  });
+  await harness.setProviderMode({
+    threadsStatus: { refresh_access_token: 500, profile_lookup: 500 },
+  });
+  const list = await harness.worker.fetch(`${session.origin}/threads`, {
+    headers: { Cookie: session.cookie },
+  });
+  assert.equal(list.status, 200);
+  assert.match(await list.text(), /Threads 연결 해제/);
+  const detail = await harness.worker.fetch(
+    `${session.origin}/threads/${postId}`, {
+      headers: { Cookie: session.cookie },
+    },
+  );
+  assert.equal(detail.status, 200);
+  assert.match(await detail.text(), /Archived root/);
+  assert.equal(await env.PROD_DB.prepare(
+    `SELECT reconnect_required FROM threads_oauth_credentials WHERE singleton_id = 1`,
+  ).first("reconnect_required"), 0);
+});
+
 test("authenticated Threads list, capture, detail polling, sync, and delete use exact contracts", async () => {
   assert.equal((await harness.worker.fetch("https://production.repo-atlas.test/threads")).status, 303);
   const session = await login(harness.worker);

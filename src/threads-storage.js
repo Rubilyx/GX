@@ -12,6 +12,7 @@ export const MEDIA_TYPES = new Set([
   "TEXT_POST", "IMAGE", "VIDEO", "CAROUSEL_ALBUM", "REPOST_FACADE",
 ]);
 export const MEDIA_KINDS = new Set(["image", "video", "video_thumbnail"]);
+const MAX_CAPTURE_PAGES = 10_000;
 
 /** @returns {never} */
 export function invalidStorage() { throw new AppError("storage_unavailable", 503); }
@@ -167,6 +168,12 @@ function authorStatement(db, profile, postId, generation, now, requiredMediaId =
      )
      ON CONFLICT(threads_user_id) DO UPDATE SET
        username = excluded.username, display_name = excluded.display_name,
+       profile_media_status = CASE
+         WHEN threads_authors.profile_media_status = 'deleting' THEN 'deleting'
+         ELSE 'pending' END,
+       profile_error_code = CASE
+         WHEN threads_authors.profile_media_status = 'deleting'
+           THEN threads_authors.profile_error_code ELSE NULL END,
        updated_at = excluded.updated_at`,
   ).bind(profile.id, profile.username, profile.name ?? profile.username, now, now,
     postId, generation, requiredMediaId, requiredMediaId,
@@ -532,6 +539,7 @@ export async function saveResolvedThreadsRoot(db, input) {
        WHERE threads_post_id = ? AND generation = ? AND status = ?
          AND status IN ('queued','resolving','collecting')
          AND profile_completed = 0 AND capture_lease IS NULL AND profile_cursor IS ?
+         AND profile_page_count < ${MAX_CAPTURE_PAGES}
          AND EXISTS (
            SELECT 1 FROM threads_posts current_post
            WHERE current_post.id = job.threads_post_id
@@ -647,7 +655,16 @@ export async function saveResolvedThreadsRoot(db, input) {
            )`,
       ).bind(root.id, postId, claim, generation, root.id, captureLease)] : []),
       db.prepare(
+        `INSERT INTO threads_sync_cursors
+           (threads_post_id, generation, phase, cursor, page_number, created_at)
+         SELECT threads_post_id, generation, 'conversation', NULL, 1, ?
+         FROM threads_sync_jobs
+         WHERE threads_post_id = ? AND generation = ? AND capture_lease = ?
+         ON CONFLICT DO NOTHING`,
+      ).bind(now, postId, generation, captureLease),
+      db.prepare(
         `UPDATE threads_sync_jobs SET status = 'collecting', profile_completed = 1,
+           profile_page_count = profile_page_count + 1,
            profile_cursor = NULL, conversation_started = 0,
            conversation_completed = 0, conversation_cursor = NULL,
            capture_lease = NULL, updated_at = ?
@@ -674,8 +691,9 @@ export async function saveResolvedThreadsRoot(db, input) {
     if (owner) {
       for (let index = 1; index <= correction.length; index += 1)
         if (changes[index] !== 1) invalidStorage();
-      if (changes.at(-2) !== 1) invalidStorage();
+      if (changes.at(-3) !== 1) invalidStorage();
     }
+    if (changes.at(-2) !== 1) invalidStorage();
     if (quoteRearm.length && changes[base + 3] !== changes[base + 4]) invalidStorage();
     return { applied: true,
       quoteWork: await pendingQuoteWork(db, postId, generation, "root", [root]) };
@@ -713,12 +731,20 @@ export async function saveThreadsConversationPage(db, input) {
        WHERE threads_post_id = ? AND generation = ? AND status = 'collecting'
          AND profile_completed = 1 AND conversation_completed = 0
          AND capture_lease IS NULL AND conversation_cursor IS ?
+         AND conversation_page_count < ${MAX_CAPTURE_PAGES}
+         AND (? IS NULL OR NOT EXISTS (
+           SELECT 1 FROM threads_sync_cursors seen
+           WHERE seen.threads_post_id = job.threads_post_id
+             AND seen.generation = job.generation AND seen.phase = 'conversation'
+             AND seen.cursor = ?
+         ))
          AND EXISTS (
            SELECT 1 FROM threads_posts post
            WHERE post.id = job.threads_post_id AND post.sync_generation = job.generation
              AND post.status <> 'deleting'
          )`,
-    ).bind(captureLease, now, postId, generation, expectedCursor)];
+    ).bind(captureLease, now, postId, generation, expectedCursor,
+      nextCursor, nextCursor)];
     const rearmStarts = [];
     for (const entry of accepted) {
       const entryId = crypto.randomUUID();
@@ -756,9 +782,22 @@ export async function saveThreadsConversationPage(db, input) {
       db, item, "author_reply", postId, generation, now,
       null, null, null, null, captureLease,
     ));
+    if (nextCursor !== null) statements.push(db.prepare(
+      `INSERT INTO threads_sync_cursors
+         (threads_post_id, generation, phase, cursor, page_number, created_at)
+       SELECT job.threads_post_id, job.generation, 'conversation', ?,
+         job.conversation_page_count + 2, ?
+       FROM threads_sync_jobs job JOIN threads_posts post
+         ON post.id = job.threads_post_id
+       WHERE job.threads_post_id = ? AND job.generation = ?
+         AND job.capture_lease = ? AND job.conversation_cursor IS ?
+         AND post.sync_generation = job.generation AND post.status <> 'deleting'
+       ON CONFLICT DO NOTHING`,
+    ).bind(nextCursor, now, postId, generation, captureLease, expectedCursor));
     statements.push(db.prepare(
       `UPDATE threads_sync_jobs SET status = 'collecting', conversation_started = 1,
-         conversation_completed = ?, conversation_cursor = ?, capture_lease = NULL,
+         conversation_completed = ?, conversation_cursor = ?,
+         conversation_page_count = conversation_page_count + 1, capture_lease = NULL,
          updated_at = ?
        WHERE threads_post_id = ? AND generation = ? AND capture_lease = ?
          AND EXISTS (
@@ -771,9 +810,35 @@ export async function saveThreadsConversationPage(db, input) {
     if (changes.some((count) => count > 1)) invalidStorage();
     if (changes[0] === 0) {
       if (changes.some((count) => count !== 0)) invalidStorage();
+      const state = await db.prepare(
+        `SELECT job.status, job.profile_completed, job.conversation_completed,
+           job.capture_lease, job.conversation_cursor, job.conversation_page_count,
+           CASE WHEN ? IS NULL THEN 0 ELSE EXISTS (
+             SELECT 1 FROM threads_sync_cursors seen
+             WHERE seen.threads_post_id = job.threads_post_id
+               AND seen.generation = job.generation AND seen.phase = 'conversation'
+               AND seen.cursor = ?
+           ) END AS cursor_seen
+         FROM threads_sync_jobs job JOIN threads_posts post
+           ON post.id = job.threads_post_id
+         WHERE job.threads_post_id = ? AND job.generation = ?
+           AND post.sync_generation = job.generation AND post.status <> 'deleting'`,
+      ).bind(nextCursor, nextCursor, postId, generation).first();
+      if (state !== null) {
+        const row = exactRow(state, ["status", "profile_completed",
+          "conversation_completed", "capture_lease", "conversation_cursor",
+          "conversation_page_count", "cursor_seen"]);
+        const pageCount = d1NonnegativeInteger(row.conversation_page_count);
+        if (row.status === "collecting" && row.profile_completed === 1 &&
+          row.conversation_completed === 0 && row.capture_lease === null &&
+          row.conversation_cursor === expectedCursor &&
+          (pageCount >= MAX_CAPTURE_PAGES || row.cursor_seen === 1))
+          throw new AppError("threads_provider_protocol_error", 502);
+      }
       return { applied: false, accepted: 0, nextCursor, quoteWork: [] };
     }
     if (changes.at(-1) !== 1) invalidStorage();
+    if (nextCursor !== null && changes.at(-2) !== 1) invalidStorage();
     for (const start of rearmStarts)
       if (changes[start] !== changes[start + 1]) invalidStorage();
     return { applied: true, accepted: accepted.length, nextCursor,
@@ -962,5 +1027,120 @@ export async function failThreadsQuote(db, input) {
     }
     if (changes.some((count) => count !== 1)) invalidStorage();
     return true;
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number, authorId: string,
+ * profile: unknown, nowSeconds: number }} input */
+export async function saveThreadsAuthorProfile(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const authorId = requiredString(input?.authorId);
+  const profile = providerProfile(input?.profile);
+  const now = inputTimestamp(input?.nowSeconds);
+  if (profile.id !== authorId)
+    throw new AppError("threads_provider_protocol_error", 502);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_authors SET username = ?, display_name = ?,
+         profile_media_status = CASE WHEN profile_media_status = 'deleting'
+           THEN 'deleting' ELSE 'pending' END,
+         profile_error_code = CASE WHEN profile_media_status = 'deleting'
+           THEN profile_error_code ELSE NULL END, updated_at = ?
+       WHERE threads_user_id = ? AND EXISTS (
+         SELECT 1 FROM threads_posts post
+         WHERE post.id = ? AND post.sync_generation = ? AND post.status <> 'deleting'
+           AND EXISTS (
+             SELECT 1 FROM threads_entries entry
+             WHERE entry.threads_post_id = post.id AND entry.author_id = ?
+           )
+       )`,
+    ).bind(profile.username, profile.name ?? profile.username, now, authorId,
+      postId, generation, authorId).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number, authorId: string,
+ * errorCode: string, nowSeconds: number }} input */
+export async function failThreadsAuthorProfile(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const authorId = requiredString(input?.authorId);
+  const errorCode = requiredString(input?.errorCode);
+  const now = inputTimestamp(input?.nowSeconds);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_authors SET profile_media_status = 'error',
+         profile_error_code = ?, updated_at = ?
+       WHERE threads_user_id = ? AND profile_media_status <> 'deleting'
+         AND profile_upload_lease IS NULL AND EXISTS (
+           SELECT 1 FROM threads_entries entry JOIN threads_posts post
+             ON post.id = entry.threads_post_id
+           WHERE entry.author_id = threads_authors.threads_user_id
+             AND entry.threads_post_id = ? AND post.sync_generation = ?
+             AND post.status <> 'deleting'
+         )`,
+    ).bind(errorCode, now, authorId, postId, generation).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number,
+ * parentEntryId?: string | null, media: unknown[], nowSeconds: number }} input */
+export async function saveThreadsMediaDescriptors(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const parentEntryId = nullableString(input?.parentEntryId);
+  const media = mediaDescriptors(input?.media);
+  const now = inputTimestamp(input?.nowSeconds);
+  if (media.length === 0) return 0;
+  try {
+    const statements = media.map((item) => db.prepare(
+      `INSERT INTO threads_media
+         (id, entry_id, source_media_id, kind, ordinal, alt_text, status,
+          created_at, updated_at)
+       SELECT ?, entry.id, ?, ?, ?, ?, 'pending', ?, ?
+       FROM threads_entries entry JOIN threads_posts post
+         ON post.id = entry.threads_post_id
+       WHERE entry.threads_post_id = ? AND entry.source_media_id = ?
+         AND entry.kind IN ('root','author_reply','quote')
+         AND (? IS NULL OR entry.parent_entry_id = ?)
+         AND post.sync_generation = ? AND post.status <> 'deleting'
+       ON CONFLICT(entry_id, source_media_id, kind, ordinal) DO NOTHING`,
+    ).bind(crypto.randomUUID(), item.sourceMediaId, item.kind, item.ordinal,
+      item.altText, now, now, postId, item.entrySourceMediaId,
+      parentEntryId, parentEntryId, generation));
+    const changes = mutationBatch(await db.batch(statements), statements.length);
+    if (changes.some((count) => count > 1)) invalidStorage();
+    return changes.reduce((sum, count) => sum + count, 0);
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number,
+ * parentEntryId: string, quoteId: string, permalink: string, nowSeconds: number }} input */
+export async function saveThreadsNestedQuotePermalink(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const parentEntryId = requiredString(input?.parentEntryId);
+  const quoteId = requiredString(input?.quoteId);
+  const permalink = boundedOptionalPermalink(input?.permalink);
+  const now = inputTimestamp(input?.nowSeconds);
+  if (permalink === null) throw new AppError("invalid_threads_state", 400);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_entries SET nested_quote_permalink = ?, last_seen_at = ?
+       WHERE threads_post_id = ? AND kind = 'quote' AND parent_entry_id = ?
+         AND source_media_id = ? AND nested_quote_permalink IS NULL
+         AND EXISTS (
+           SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
+             AND status <> 'deleting'
+         )`,
+    ).bind(permalink, now, postId, parentEntryId, quoteId,
+      postId, generation).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
   } catch (error) { throw storageError(error); }
 }

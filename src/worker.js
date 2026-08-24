@@ -19,11 +19,12 @@ import {
 import { parseCspReport, parseTelemetry, recordTelemetry } from "./telemetry.js";
 import {
   createThreadsSync, getThreadsArchive, listThreadsArchives, recalculateThreadsStatus,
-  startThreadsDeletion,
+  startThreadsDeletion, startThreadsMediaRetry,
 } from "./threads.js";
 import {
   beginThreadsOAuth, clearThreadsOAuthCookie, disconnectThreads, finishThreadsOAuth,
-  getThreadsAccessToken, refreshStoredThreadsCredential,
+  getThreadsAccessToken, getThreadsConnectionState, markThreadsReconnectRequired,
+  refreshStoredThreadsCredential,
 } from "./threads-oauth.js";
 import {
   parseThreadsDetailQuery, parseThreadsListQuery, validateCaptureMessage,
@@ -537,23 +538,19 @@ function threadsTokenInput(runtime, fetcher, nowSeconds) {
   };
 }
 
-/** @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher @param {number} nowSeconds */
-async function threadsConnection(runtime, fetcher, nowSeconds) {
-  try {
-    await getThreadsAccessToken(runtime.db, threadsTokenInput(runtime, fetcher, nowSeconds));
-    return { connected: true, reconnectRequired: false };
-  } catch (error) {
-    if (error instanceof AppError && error.code === "threads_reconnect_required")
-      return { connected: false, reconnectRequired: true };
-    throw error;
-  }
-}
+/** @param {ThreadsRuntime} runtime @param {number} nowSeconds */
+const threadsConnection = (runtime, nowSeconds) =>
+  getThreadsConnectionState(runtime.db, nowSeconds);
 
 /** @param {string} postId @param {any} author */
 function threadsAuthorJson(postId, author) {
   if (!author) return null;
   const profile = author.profileMedia ? { ...author.profileMedia } : null;
-  if (profile?.status === "ready") profile.url = `/threads/${postId}/media/${author.id}`;
+  if (profile?.available === true)
+    profile.url = `/threads/${postId}/media/${author.id}`;
+  else if (profile) profile.url = null;
+  if (profile) profile.retryUrl = profile.status === "error"
+    ? `/threads/${postId}/media/${author.id}/retry` : null;
   return { ...author, profileMedia: profile };
 }
 
@@ -799,7 +796,7 @@ async function threadsListRoute(request, runtime, fetcher, session, wantsJson, u
   }
   const { page, flash } = threadsListQuery(url);
   const result = await listThreadsArchives(runtime.db, { page });
-  const connection = await threadsConnection(runtime, fetcher, Math.floor(Date.now() / 1_000));
+  const connection = await threadsConnection(runtime, Math.floor(Date.now() / 1_000));
   if (wantsJson) return json({
     archives: result.archives.map(threadsArchiveJson), page: result.page,
     totalPages: result.totalPages, total: result.total, ...connection,
@@ -827,34 +824,12 @@ async function threadsDetailRoute(url, runtime, fetcher, session, id, wantsJson,
       totalReplies: result.totalReplies, actions: threadsActions(id),
     }, 200, { ETag: etag });
   }
-  const connection = await threadsConnection(runtime, fetcher, Math.floor(Date.now() / 1_000));
+  const connection = await threadsConnection(runtime, Math.floor(Date.now() / 1_000));
   return html(renderThreadsDetailPage({
     releaseId: runtime.releaseId, modulePreloads,
     csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
     ...result, ...connection, flash,
   }), 200, {}, "app", runtime.trustedTypesMode);
-}
-
-/** @param {any} entry @param {string} mediaId @returns {boolean} */
-function failedMediaInEntry(entry, mediaId) {
-  if (!entry) return false;
-  return (entry.media ?? []).some((/** @type {any} */ item) =>
-    item.id === mediaId && item.status === "error") ||
-    failedMediaInEntry(entry.quote, mediaId);
-}
-
-/** @param {ThreadsRuntime} runtime @param {string} postId @param {string} mediaId */
-async function failedMedia(runtime, postId, mediaId) {
-  let page = 1;
-  while (true) {
-    const detail = await getThreadsArchive(runtime.db, postId, { repliesPage: page });
-    if (!detail) return null;
-    if (failedMediaInEntry(detail.archive.root, mediaId) ||
-      detail.replies.some((entry) => failedMediaInEntry(entry, mediaId)))
-      return detail.archive;
-    if (page >= detail.totalReplyPages) return null;
-    page += 1;
-  }
 }
 
 /** @param {Request} request @param {ThreadsRuntime} runtime @param {string} postId @param {string} action @param {boolean} wantsJson */
@@ -884,15 +859,11 @@ async function threadsMutationRoute(request, runtime, postId, action, wantsJson)
 async function threadsRetryRoute(request, runtime, postId, mediaId, wantsJson) {
   const form = await parseForm(request, 16_384, new Set(["csrf"]));
   await requireAuthenticatedMutation(request, runtime, form);
-  const archive = await failedMedia(runtime, postId, mediaId);
-  if (!archive) appError("threads_media_not_found", 404);
-  try {
-    await runtime.threadsMediaQueue.send({
-      version: 1, type: "retry-media", postId,
-      generation: archive.syncGeneration, mediaId,
-    });
-  } catch { appError("queue_unavailable", 503); }
-  const result = { threadsPostId: postId, mediaId, status: "queued" };
+  const queued = await startThreadsMediaRetry(
+    runtime.db, runtime.threadsMediaQueue, postId, mediaId,
+    Math.floor(Date.now() / 1_000),
+  );
+  const result = { threadsPostId: postId, mediaId: queued.targetId, status: "queued" };
   return wantsJson ? json(result)
     : redirect(`/threads/${postId}?flash=threads_retry_queued`);
 }
@@ -1175,6 +1146,7 @@ export async function handleThreadsQueue(batch, env, context, fetcher = globalTh
     db: runtime.db, bucket: runtime.threadsMedia,
     captureQueue: runtime.threadsCaptureQueue, mediaQueue: runtime.threadsMediaQueue,
     fetcher: safeFetcher, getAccessToken, recalculateStatus: recalculateThreadsStatus,
+    markReconnectRequired: () => markThreadsReconnectRequired(runtime.db, nowSeconds),
     nowSeconds,
     deleteArchive: (/** @type {unknown} */ message) => deleteThreadsArchive(message, {
       db: runtime.db, bucket: runtime.threadsMedia, nowSeconds,

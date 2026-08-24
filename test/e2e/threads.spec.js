@@ -32,8 +32,11 @@ async function connectConfiguredThreads(harness) {
 }
 
 /** @param {any} harness
- * @param {{ status?: string, replies?: number, failedMedia?: boolean }} [options] */
-async function seedArchive(harness, { status = "ready", replies = 12, failedMedia = false } = {}) {
+ * @param {{ status?: string, replies?: number, failedMedia?: boolean,
+ * quotedReply?: boolean }} [options] */
+async function seedArchive(harness, {
+  status = "ready", replies = 12, failedMedia = false, quotedReply = false,
+} = {}) {
   const env = await harness.worker.getEnv();
   await seedThreadsArchive(env.PROD_DB, {
     id: POST_ID, rootEntryId: ROOT_ID, status,
@@ -52,6 +55,32 @@ async function seedArchive(harness, { status = "ready", replies = 12, failedMedi
       `작성자 답글 ${index}`, `https://www.threads.com/@meta/post/Reply${index}`,
       `2026-08-24T00:${String(index).padStart(2, "0")}:00.000Z`,
     ).run();
+  }
+  if (quotedReply && replies >= 12) {
+    const parentId = "44444444-4444-4444-4444-000000000012";
+    const quoteId = "55555555-5555-4555-8555-555555555555";
+    await env.PROD_DB.prepare(
+      `INSERT INTO threads_entries
+         (id, threads_post_id, source_media_id, kind, parent_entry_id, author_id,
+          text, permalink, published_at, media_type, nested_quote_permalink,
+          first_seen_at, last_seen_at, created_at)
+       VALUES (?, ?, 'expanded-quote-source', 'quote', ?, 'author-1',
+         '확장 답글 인용 본문', 'https://www.threads.com/@meta/post/ExpandedQuote',
+         '2026-08-24T00:12:30.000Z', 'IMAGE',
+         'https://www.threads.com/@nested/post/NestedExpanded', 1, 1, 1)`,
+    ).bind(quoteId, POST_ID, parentId).run();
+    await env.PROD_DB.prepare(
+      `INSERT INTO threads_links (id, entry_id, url, source, ordinal)
+       VALUES ('expanded-quote-link', ?, 'https://attachment.example/expanded',
+         'attachment', 0)`,
+    ).bind(quoteId).run();
+    await env.PROD_DB.prepare(
+      `INSERT INTO threads_media
+         (id, entry_id, source_media_id, kind, ordinal, status, error_code,
+          created_at, updated_at)
+       VALUES ('expanded-quote-media', ?, 'expanded-quote-source', 'image', 0,
+         'error', 'threads_media_unavailable', 1, 1)`,
+    ).bind(quoteId).run();
   }
   if (failedMedia) {
     await env.PROD_DB.prepare(
@@ -81,6 +110,7 @@ function author() {
     id: "author-1", username: "meta", displayName: "Meta",
     profileMedia: {
       status: "pending", contentType: null, etag: null, bytes: null, errorCode: null,
+      available: false, url: null, retryUrl: null,
     },
   };
 }
@@ -401,6 +431,13 @@ test("capture renders pending state, progresses through polling, and stops at re
     const id = new URL(request.url()).pathname.split("/").pop();
     if (!id) throw new Error("missing_post_id");
     const body = detail(id, polls === 1 ? "collecting" : "ready", 0);
+    if (polls > 1) {
+      body.archive.root.text = "폴링으로 완성된 루트 본문";
+      body.archive.firstReplies = [entry(1)];
+      body.archive.replyCount = 1;
+      body.replies = [entry(1)];
+      body.totalReplies = 1;
+    }
     body.archive.mediaProgress = polls === 1
       ? { expected: 2, ready: 1, failed: 0, pending: 1 }
       : { expected: 2, ready: 2, failed: 0, pending: 0 };
@@ -414,13 +451,17 @@ test("capture renders pending state, progresses through polling, and stops at re
   await expect(card).toHaveAttribute("data-thread-status", "pending");
   await expect(card).toHaveAttribute("data-thread-status", "ready", { timeout: 8_000 });
   await expect(card.locator("[data-thread-progress]")).toHaveText("미디어 2/2 준비");
+  await expect(card.locator(":scope > [data-thread-root] [data-thread-text]")).toHaveText(
+    "폴링으로 완성된 루트 본문",
+  );
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(1);
   const stoppedAt = polls;
   await page.waitForTimeout(1_500);
   expect(polls).toBe(stoppedAt);
 });
 
-test("plain reply expansion loads twelve in-card replies while modified click stays native", async ({ page, context, harness }) => {
-  await seedArchive(harness);
+test("plain reply expansion loads complete quoted provenance while modified click stays native", async ({ page, context, harness }) => {
+  await seedArchive(harness, { quotedReply: true });
   await login(page);
   await page.goto("/threads");
   const link = page.locator("[data-thread-all-replies]");
@@ -437,6 +478,17 @@ test("plain reply expansion loads twelve in-card replies while modified click st
   await expect(card.locator("[data-thread-author-reply]")).toHaveCount(12);
   await expect(link).toHaveText("작성자 답글 12개 접기");
   await expect(card.locator("[data-thread-author-reply]").last()).toContainText("작성자 답글 12");
+  const quote = card.locator("[data-thread-author-reply]").last().locator("[data-thread-quote]");
+  await expect(quote).toContainText("확장 답글 인용 본문");
+  await expect(quote.locator("[data-thread-original-link]")).toHaveAttribute(
+    "href", "https://www.threads.com/@meta/post/ExpandedQuote",
+  );
+  await expect(quote.locator("[data-thread-nested-quote-link]")).toHaveAttribute(
+    "href", "https://www.threads.com/@nested/post/NestedExpanded",
+  );
+  await expect(quote.getByRole("link", { name: "https://attachment.example/expanded" }))
+    .toBeVisible();
+  await expect(quote.getByRole("button", { name: "미디어 재시도" })).toBeVisible();
 });
 
 test("retry preserves content, sync adds reply thirteen, and shared delete restores focus", async ({ page, harness }) => {
@@ -456,6 +508,7 @@ test("retry preserves content, sync adds reply thirteen, and shared delete resto
     threadsPostId: POST_ID, mediaId: MEDIA_ID, status: "queued",
   });
   expect((await retryRequest).postData()).toContain('name="csrf"');
+  await expect(card).toHaveAttribute("data-thread-status", "collecting");
   await expect.poll(() => mediaAttempts(harness)).toBeGreaterThan(attemptsBefore);
   await expect(card.locator("[data-thread-retry-form]")).toHaveAttribute(
     "data-thread-retry-status", "queued",
@@ -465,7 +518,8 @@ test("retry preserves content, sync adds reply thirteen, and shared delete resto
 
   await card.getByRole("link", { name: "작성자 답글 12개 모두 보기" }).click();
   let detailPolls = 0;
-  await page.route(new RegExp(`/threads/${POST_ID}(?:\\?.*)?$`), async (route, request) => {
+  const syncedDetail = new RegExp(`/threads/${POST_ID}(?:\\?.*)?$`);
+  await page.route(syncedDetail, async (route, request) => {
     if (request.method() !== "GET" || !request.headers().accept?.includes("application/json"))
       return route.fallback();
     detailPolls += 1;
@@ -475,12 +529,14 @@ test("retry preserves content, sync adds reply thirteen, and shared delete resto
   });
   await page.route(`**/threads/${POST_ID}/sync`, (route) => route.fulfill({
     status: 200, contentType: "application/json",
-    body: JSON.stringify({ threadsPostId: POST_ID, generation: 2, status: "pending", duplicate: false }),
+    body: JSON.stringify({ threadsPostId: POST_ID, generation: 2,
+      status: "collecting", duplicate: true }),
   }));
   await card.getByRole("button", { name: "동기화" }).click();
   await expect(card).toHaveAttribute("data-thread-status", "ready", { timeout: 6_000 });
-  expect(detailPolls).toBe(2);
+  expect(detailPolls).toBe(1);
   await expect(card.locator("[data-thread-author-reply]")).toHaveCount(13, { timeout: 6_000 });
+  await page.unroute(syncedDetail);
 
   const opener = card.locator("[data-thread-delete] > summary");
   const dialog = page.locator("[data-thread-delete-dialog]");
@@ -493,7 +549,11 @@ test("retry preserves content, sync adds reply thirteen, and shared delete resto
   await page.keyboard.press("Escape");
   await expect(opener).toBeFocused();
   await opener.click();
+  const deleteResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith(`/${POST_ID}/delete`));
   await dialog.getByRole("button", { name: "보관 삭제", exact: true }).click();
+  await deleteResponse;
+  await expect(card).toHaveAttribute("data-thread-status", "deleting");
   await expect(card).toHaveCount(0);
   await expect(page.locator("[data-thread-empty-heading]")).toBeFocused();
 });

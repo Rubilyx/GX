@@ -6,8 +6,10 @@ import {
 import { normalizeThreadsUrl, validateCaptureMessage } from "./threads-domain.js";
 import {
   advanceThreadsProfileCursor, claimThreadsJob, failThreadsQuote,
-  finalizeThreadsContent, listThreadsPendingQuoteWork, markThreadsJobError,
-  saveResolvedThreadsRoot, saveThreadsConversationPage, saveThreadsQuote,
+  failThreadsAuthorProfile, failThreadsDeletion, finalizeThreadsContent,
+  listThreadsPendingQuoteWork, markThreadsEnrichmentFailure, markThreadsJobError,
+  saveResolvedThreadsRoot, saveThreadsAuthorProfile, saveThreadsConversationPage,
+  saveThreadsMediaDescriptors, saveThreadsNestedQuotePermalink, saveThreadsQuote,
 } from "./threads.js";
 
 const ACK = Object.freeze({ action: "ack" });
@@ -86,12 +88,12 @@ async function recoverPersistedWork(message, job, dependencies) {
 /** @param {Record<string, any>} item @param {string} entrySourceMediaId @param {number} ordinal */
 function directDescriptors(item, entrySourceMediaId, ordinal) {
   const descriptors = [];
-  if (item.mediaType === "IMAGE" && item.mediaUrl) descriptors.push({
+  if (item.mediaType === "IMAGE") descriptors.push({
     entrySourceMediaId, sourceMediaId: item.id, kind: "image", ordinal,
     altText: item.altText ?? null,
   });
   if (item.mediaType === "VIDEO") {
-    if (item.mediaUrl) descriptors.push({
+    descriptors.push({
       entrySourceMediaId, sourceMediaId: item.id, kind: "video", ordinal,
       altText: item.altText ?? null,
     });
@@ -103,27 +105,82 @@ function directDescriptors(item, entrySourceMediaId, ordinal) {
   return descriptors;
 }
 
-/** @param {Record<string, any>} entry @param {string} token @param {any} dependencies */
-async function mediaDescriptors(entry, token, dependencies) {
-  if (entry.mediaType !== "CAROUSEL_ALBUM") return directDescriptors(entry, entry.id, 0);
-  const descriptors = [];
-  for (let ordinal = 0; ordinal < entry.children.length; ordinal += 1) {
-    const childId = entry.children[ordinal];
-    const child = await fetchThreadsMedia(dependencies.fetcher, {
-      accessToken: token, mediaId: childId, signal: dependencies.signal,
-    });
-    if (child.id !== childId) throw new AppError("threads_provider_protocol_error", 502);
-    descriptors.push(...directDescriptors(child, entry.id, ordinal));
-  }
-  return descriptors;
+/** @param {Record<string, any>} entry */
+function fallbackProfile(entry) {
+  return {
+    id: entry.ownerId, username: entry.username,
+    name: entry.username, profilePictureUrl: null,
+  };
 }
 
-/** @param {Record<string, any>[]} entries @param {string} token @param {any} dependencies */
-async function allMediaDescriptors(entries, token, dependencies) {
-  const descriptors = [];
-  for (const entry of entries)
-    descriptors.push(...await mediaDescriptors(entry, token, dependencies));
-  return descriptors;
+/** @param {unknown} error */
+function providerEnrichmentError(error) {
+  if (!(error instanceof AppError)) return true;
+  return new Set([
+    "threads_post_unavailable", "threads_provider_protocol_error",
+    "threads_provider_unavailable", "threads_rate_limited",
+  ]).has(error.code);
+}
+
+/** @param {Record<string, any>} entry @param {string} token @param {any} dependencies
+ * @param {Record<string, any>} message */
+async function enrichProfile(entry, token, dependencies, message) {
+  try {
+    const profile = await fetchThreadsProfile(dependencies.fetcher, {
+      accessToken: token, username: entry.username, signal: dependencies.signal,
+    });
+    if (profile.id !== entry.ownerId)
+      throw new AppError("threads_provider_protocol_error", 502);
+    await saveThreadsAuthorProfile(dependencies.db, {
+      postId: message.postId, generation: message.generation,
+      authorId: entry.ownerId, profile, nowSeconds: dependencies.nowSeconds,
+    });
+  } catch (error) {
+    if (error instanceof AppError && error.code === "threads_reconnect_required")
+      throw error;
+    if (!providerEnrichmentError(error)) throw error;
+    await failThreadsAuthorProfile(dependencies.db, {
+      postId: message.postId, generation: message.generation,
+      authorId: entry.ownerId, errorCode: "threads_profile_unavailable",
+      nowSeconds: dependencies.nowSeconds,
+    });
+  }
+}
+
+/** @param {Record<string, any>[]} entries @param {string} token
+ * @param {any} dependencies @param {Record<string, any>} message
+ * @param {string | null} [parentEntryId] */
+async function enrichCarousels(
+  entries, token, dependencies, message, parentEntryId = null,
+) {
+  for (const entry of entries.filter((item) => item.mediaType === "CAROUSEL_ALBUM")) {
+    for (let ordinal = 0; ordinal < entry.children.length; ordinal += 1) {
+      const childId = entry.children[ordinal];
+      try {
+        const child = await fetchThreadsMedia(dependencies.fetcher, {
+          accessToken: token, mediaId: childId, signal: dependencies.signal,
+        });
+        if (child.id !== childId)
+          throw new AppError("threads_provider_protocol_error", 502);
+        const descriptors = directDescriptors(child, entry.id, ordinal);
+        if (descriptors.length === 0)
+          throw new AppError("threads_provider_protocol_error", 502);
+        await saveThreadsMediaDescriptors(dependencies.db, {
+          postId: message.postId, generation: message.generation,
+          parentEntryId, media: descriptors, nowSeconds: dependencies.nowSeconds,
+        });
+      } catch (error) {
+        if (error instanceof AppError && error.code === "threads_reconnect_required")
+          throw error;
+        if (!providerEnrichmentError(error)) throw error;
+        await markThreadsEnrichmentFailure(dependencies.db, {
+          postId: message.postId, generation: message.generation,
+          errorCode: "threads_media_descriptor_unavailable",
+          nowSeconds: dependencies.nowSeconds,
+        });
+      }
+    }
+  }
 }
 
 /** @param {Record<string, any>} message @param {any} dependencies */
@@ -145,9 +202,6 @@ async function resolvePost(message, dependencies) {
   );
   if (!normalized.username) throw new AppError("threads_provider_protocol_error", 502);
   const token = accessToken(await dependencies.getAccessToken());
-  const profile = await fetchThreadsProfile(dependencies.fetcher, {
-    accessToken: token, username: normalized.username, signal: dependencies.signal,
-  });
   const page = await fetchThreadsProfilePostsPage(dependencies.fetcher, {
     accessToken: token, username: normalized.username, after: message.cursor,
     signal: dependencies.signal,
@@ -178,7 +232,8 @@ async function resolvePost(message, dependencies) {
     });
     return;
   }
-  const media = await mediaDescriptors(root, token, dependencies);
+  const profile = fallbackProfile(root);
+  const media = directDescriptors(root, root.id, 0);
   const saved = await saveResolvedThreadsRoot(dependencies.db, {
     postId: message.postId, generation: message.generation, profile, root,
     expectedProfileCursor: message.cursor,
@@ -192,6 +247,8 @@ async function resolvePost(message, dependencies) {
     if (current) await recoverPersistedWork(message, current, dependencies);
     return;
   }
+  await enrichProfile(root, token, dependencies, message);
+  await enrichCarousels([root], token, dependencies, message);
   await sendCapture(dependencies.captureQueue, {
     version: 1, type: "collect-conversation", postId: message.postId,
     generation: message.generation, cursor: null,
@@ -222,7 +279,7 @@ async function collectConversation(message, dependencies) {
   if (page.nextCursor !== null && page.nextCursor === message.cursor)
     throw new AppError("threads_provider_protocol_error", 502);
   const accepted = page.data.filter((entry) => entry.ownerId === job.rootAuthorId);
-  const media = await allMediaDescriptors(accepted, token, dependencies);
+  const media = accepted.flatMap((entry) => directDescriptors(entry, entry.id, 0));
   const saved = await saveThreadsConversationPage(dependencies.db, {
     postId: message.postId, generation: message.generation, entries: accepted,
     expectedCursor: message.cursor, nextCursor: page.nextCursor, media,
@@ -235,6 +292,7 @@ async function collectConversation(message, dependencies) {
     if (current) await recoverPersistedWork(message, current, dependencies);
     return;
   }
+  await enrichCarousels(accepted, token, dependencies, message);
   if (page.nextCursor !== null) await sendCapture(dependencies.captureQueue, {
     version: 1, type: "collect-conversation", postId: message.postId,
     generation: message.generation, cursor: page.nextCursor,
@@ -282,16 +340,12 @@ async function collectQuote(message, dependencies) {
   }
   const token = accessToken(await dependencies.getAccessToken());
   let quote;
-  let profile;
   try {
     quote = await fetchThreadsMedia(dependencies.fetcher, {
       accessToken: token, mediaId: message.quoteId, signal: dependencies.signal,
     });
     if (quote.id !== message.quoteId)
       throw new AppError("threads_provider_protocol_error", 502);
-    profile = await fetchThreadsProfile(dependencies.fetcher, {
-      accessToken: token, username: quote.username, signal: dependencies.signal,
-    });
   } catch (error) {
     if (!(error instanceof AppError) || error.code !== "threads_post_unavailable") throw error;
     await failThreadsQuote(dependencies.db, {
@@ -302,7 +356,19 @@ async function collectQuote(message, dependencies) {
     await afterQuote(message, dependencies);
     return;
   }
-  let nestedQuotePermalink = null;
+  const stored = await saveThreadsQuote(dependencies.db, {
+    postId: message.postId, generation: message.generation,
+    parentEntryId: message.entryId, profile: fallbackProfile(quote), quote,
+    nestedQuotePermalink: null,
+    media: directDescriptors(quote, quote.id, 0),
+    nowSeconds: dependencies.nowSeconds,
+  });
+  if (!stored) {
+    await afterQuote(message, dependencies);
+    return;
+  }
+  await enrichProfile(quote, token, dependencies, message);
+  await enrichCarousels([quote], token, dependencies, message, message.entryId);
   if (quote.quotedPostId) {
     try {
       const nested = await fetchThreadsMedia(dependencies.fetcher, {
@@ -310,17 +376,22 @@ async function collectQuote(message, dependencies) {
       });
       if (nested.id !== quote.quotedPostId)
         throw new AppError("threads_provider_protocol_error", 502);
-      nestedQuotePermalink = nested.permalink;
+      await saveThreadsNestedQuotePermalink(dependencies.db, {
+        postId: message.postId, generation: message.generation,
+        parentEntryId: message.entryId, quoteId: quote.id,
+        permalink: nested.permalink, nowSeconds: dependencies.nowSeconds,
+      });
     } catch (error) {
-      if (!(error instanceof AppError) || error.code !== "threads_post_unavailable") throw error;
+      if (error instanceof AppError && error.code === "threads_reconnect_required")
+        throw error;
+      if (!providerEnrichmentError(error)) throw error;
+      await markThreadsEnrichmentFailure(dependencies.db, {
+        postId: message.postId, generation: message.generation,
+        errorCode: "threads_nested_quote_unavailable",
+        nowSeconds: dependencies.nowSeconds,
+      });
     }
   }
-  const media = await mediaDescriptors(quote, token, dependencies);
-  await saveThreadsQuote(dependencies.db, {
-    postId: message.postId, generation: message.generation,
-    parentEntryId: message.entryId, profile, quote, nestedQuotePermalink, media,
-    nowSeconds: dependencies.nowSeconds,
-  });
   await afterQuote(message, dependencies);
 }
 
@@ -367,6 +438,11 @@ export async function handleThreadsCaptureMessage(rawMessage, dependencies) {
     }
     return ACK;
   } catch (error) {
+    if (error instanceof AppError && error.code === "threads_reconnect_required" &&
+      typeof dependencies?.markReconnectRequired === "function") {
+      try { await dependencies.markReconnectRequired(); }
+      catch (recordError) { return retryResult(recordError) ?? ACK; }
+    }
     const retry = retryResult(error);
     if (retry) return retry;
     try { return await terminal(message, error, dependencies); }
@@ -379,6 +455,16 @@ export async function handleThreadsCaptureDeadLetter(rawMessage, dependencies) {
   let message;
   try { message = /** @type {Record<string, any>} */ (validateCaptureMessage(rawMessage)); }
   catch { return ACK; }
+  if (message.type === "delete-archive") {
+    if (!dependencies?.db) return { action: "retry", delaySeconds: 1 };
+    try {
+      await failThreadsDeletion(
+        dependencies.db, message.postId, "queue_retries_exhausted",
+        dependencies.nowSeconds,
+      );
+      return ACK;
+    } catch (error) { return retryResult(error) ?? ACK; }
+  }
   if (typeof message.generation !== "number") return ACK;
   if (!dependencies?.db) return { action: "retry", delaySeconds: 1 };
   try {

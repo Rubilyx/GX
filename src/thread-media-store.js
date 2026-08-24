@@ -145,13 +145,39 @@ function profileRow(value) {
   if (typeof row.pending_r2_key === "string" &&
     !validProfileKey(row.pending_r2_key, row.author_id))
     throw new AppError("storage_unavailable", 503);
-  if (row.status === "ready") {
+  if (row.r2_key !== null && row.r2_key !== undefined) {
     if (typeof row.r2_key !== "string" || !validProfileKey(row.r2_key, row.author_id))
       throw new AppError("storage_unavailable", 503);
     validateStoredContentType(row.content_type); d1NonnegativeInteger(row.bytes);
     validateStoredEtag(row.etag);
   }
   return row;
+}
+
+/** @param {any} db @param {Record<string, any>} message
+ * @param {Record<string, any>} row @param {Record<string, any>} profile
+ * @param {number} now */
+export async function updateClaimedProfileMetadata(db, message, row, profile, now) {
+  if (profile.id !== row.author_id || typeof profile.username !== "string" ||
+    !profile.username || !(profile.name === null || typeof profile.name === "string"))
+    throw new AppError("threads_provider_protocol_error", 502);
+  const changes = mutationChanges(await db.prepare(
+    `UPDATE threads_authors SET username = ?, display_name = ?, updated_at = ?
+     WHERE threads_user_id = ? AND profile_media_status = 'pending'
+       AND profile_upload_lease = ? AND profile_upload_started_at = ?
+       AND profile_pending_r2_key = ? AND profile_upload_recovering = 0
+       AND profile_cleanup_lease IS NULL AND EXISTS (
+         SELECT 1 FROM threads_entries entry JOIN threads_posts post
+           ON post.id = entry.threads_post_id
+         WHERE entry.author_id = threads_authors.threads_user_id
+           AND entry.threads_post_id = ? AND post.sync_generation = ?
+           AND post.status <> 'deleting'
+       )`,
+  ).bind(profile.username, profile.name ?? profile.username, now, row.author_id,
+    row.upload_lease, row.upload_started_at, row.pending_r2_key,
+    message.postId, message.generation).run());
+  if (changes > 1) throw new AppError("storage_unavailable", 503);
+  return changes === 1;
 }
 
 

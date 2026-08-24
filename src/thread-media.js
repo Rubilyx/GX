@@ -14,6 +14,7 @@ import {
   readyEntryUpload, readyProfileUpload,
   recalculateMediaStatus, releaseEntryUpload, releaseProfileUpload,
   terminalMediaCode, terminalizeEntryDeadLetter, terminalizeProfileDeadLetter,
+  updateClaimedProfileMetadata,
 } from "./thread-media-store.js";
 import { fetchThreadsMedia, fetchThreadsProfile } from "./threads-api.js";
 import { validateMediaMessage } from "./threads-domain.js";
@@ -171,6 +172,9 @@ async function archiveEntry(message, dependencies) {
       signal: dependencies.signal,
     });
   } catch (error) {
+    if (error instanceof AppError && error.code === "threads_reconnect_required" &&
+      typeof dependencies?.markReconnectRequired === "function")
+      await dependencies.markReconnectRequired();
     if (error instanceof ThreadsMediaPutUncertainError) {
       if (await reconcileEntryPut(message, dependencies, error.key)) return;
       throw error;
@@ -238,14 +242,20 @@ async function archiveProfile(message, dependencies) {
     });
     if (profile.id !== row.author_id)
       throw new AppError("threads_provider_protocol_error", 502);
-    if (!profile.profilePictureUrl) throw new AppError("threads_media_unavailable", 404);
     if (!await ownsProfileUpload(dependencies.db, message, row)) return;
+    if (!await updateClaimedProfileMetadata(
+      dependencies.db, message, row, profile, now,
+    )) return;
+    if (!profile.profilePictureUrl) throw new AppError("threads_media_unavailable", 404);
     object = await downloadThreadsMedia(dependencies.bucket, dependencies.fetcher, {
       url: profile.profilePictureUrl, key: row.pending_r2_key,
       expected: IMAGE_TYPES,
       maximumBytes: mediaMaximumBytes(dependencies.maximumBytes), signal: dependencies.signal,
     });
   } catch (error) {
+    if (error instanceof AppError && error.code === "threads_reconnect_required" &&
+      typeof dependencies?.markReconnectRequired === "function")
+      await dependencies.markReconnectRequired();
     if (error instanceof ThreadsMediaPutUncertainError) {
       if (await reconcileProfilePut(message, dependencies, error.key)) return;
       throw error;

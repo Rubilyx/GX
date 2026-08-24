@@ -403,7 +403,7 @@ test("enforces declared and counted byte limits without retaining a partial obje
     maximumBytes: 32, contentLength: null,
     body: new Uint8Array([1, 2, 3, 4, 5]),
   });
-  assert.equal([...missingLength.bucket.objects.values()][0]?.bytes.byteLength, 5);
+  assert.equal(missingLength.bucket.objects.size, 0);
 
   const oversized = await archiveEntry({
     maximumBytes: 32, contentLength: null, body: new Uint8Array(33),
@@ -413,6 +413,20 @@ test("enforces declared and counted byte limits without retaining a partial obje
   for (const invalid of ["-1", "1.5", "9007199254740992"])
     assert.equal((await archiveEntry({ maximumBytes: 32, contentLength: invalid }))
       .bucket.objects.size, 0);
+});
+
+test("rejects a missing Content-Length before opening an R2 upload", async () => {
+  let putCalls = 0;
+  await assert.rejects(downloadThreadsMedia({
+    async put() { putCalls += 1; return null; },
+  }, async () => new Response(new Uint8Array([1, 2, 3]), {
+    headers: { "Content-Type": "image/jpeg" },
+  }), {
+    url: "https://scontent.cdninstagram.com/no-length", key: "pending-key",
+    expected: new Set(["image/jpeg"]), maximumBytes: 32,
+  }), (error) => error instanceof AppError && error.code === "invalid_media_length" &&
+    error.status === 400);
+  assert.equal(putCalls, 0);
 });
 
 test("deletes a just-written object when the provider stream is truncated", async () => {

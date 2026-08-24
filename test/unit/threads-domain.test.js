@@ -11,6 +11,11 @@ test("normalizes canonical and legacy Threads URLs", () => {
   assert.deepEqual(normalizeThreadsUrl("https://threads.net/t/abc-1"), { kind:"short", submittedUrl:"https://threads.net/t/abc-1", canonicalUrl:null, username:null, shortcode:"abc-1" });
   invalid(() => normalizeThreadsUrl("http://threads.com/t/x"), "invalid_threads_url");
   for (const x of ["https://threads.com.evil/t/x","https://u:p@threads.com/t/x","https://threads.com:443/t/x","https://threads.com:0443/t/x","https://threads.com:444/t/x","https://threads.com/t/x/y","https://threads.com/t/%ZZ"]) invalid(() => normalizeThreadsUrl(x), "invalid_threads_url");
+  for (const repaired of [
+    "https:/threads.com/t/x", "https:\\threads.com\\t\\x",
+    "https://threads.com\\t\\x", "  HTTPS:/threads.com/t/x  ",
+    "HTTPS://threads.com/t/x",
+  ]) invalid(() => normalizeThreadsUrl(repaired), "invalid_threads_url");
 });
 
 test("parses strict Threads query pages", () => {

@@ -3,6 +3,16 @@ import { AppError } from "./domain.js";
 /** @typedef {{ kind: "canonical" | "short", submittedUrl: string, canonicalUrl: string | null, username: string | null, shortcode: string }} ThreadsUrl */
 /** @typedef {{ url: string, source: "body" | "attachment", ordinal: number }} ThreadsLink */
 /** @typedef {Record<string, readonly string[]>} MessageSets */
+/** @typedef {{ version: 1, type: "resolve-post" | "collect-conversation", postId: string, generation: number, cursor: string | null }} ThreadsCursorCaptureMessage */
+/** @typedef {{ version: 1, type: "collect-quote", postId: string, generation: number, entryId: string, quoteId: string }} ThreadsQuoteCaptureMessage */
+/** @typedef {{ version: 1, type: "finalize-content", postId: string, generation: number }} ThreadsFinalizeCaptureMessage */
+/** @typedef {{ version: 1, type: "delete-archive", postId: string }} ThreadsDeleteCaptureMessage */
+/** @typedef {ThreadsCursorCaptureMessage | ThreadsQuoteCaptureMessage | ThreadsFinalizeCaptureMessage | ThreadsDeleteCaptureMessage} ThreadsCaptureMessage */
+/** @typedef {{ version: 1, type: "archive-entry-media", postId: string, generation: number, entryId: string, mediaId: string }} ThreadsEntryMediaMessage */
+/** @typedef {{ version: 1, type: "archive-profile", postId: string, generation: number, authorId: string }} ThreadsProfileMediaMessage */
+/** @typedef {{ version: 1, type: "retry-media", postId: string, generation: number, mediaId: string }} ThreadsRetryMediaMessage */
+/** @typedef {{ version: 1, type: "delete-object", objectKey: string }} ThreadsDeleteObjectMessage */
+/** @typedef {ThreadsEntryMediaMessage | ThreadsProfileMediaMessage | ThreadsRetryMediaMessage | ThreadsDeleteObjectMessage} ThreadsMediaMessage */
 
 const HOSTS = new Set(["threads.com", "www.threads.com", "threads.net", "www.threads.net"]);
 const HANDLE = /^[A-Za-z0-9._]{1,64}$/;
@@ -13,10 +23,11 @@ const badUrl = () => { throw new AppError("invalid_threads_url", 400); };
 /** @param {unknown} raw @returns {ThreadsUrl} */
 export function normalizeThreadsUrl(raw) {
   const submitted = String(raw).trim();
-  const authorityStart = submitted.slice(0, 8).toLowerCase() === "https://" ? 8 : -1;
+  if (!submitted.startsWith("https://") || submitted.includes("\\")) return badUrl();
+  const authorityStart = 8;
   const separators = authorityStart >= 0 ? [submitted.indexOf("/", authorityStart), submitted.indexOf("?", authorityStart), submitted.indexOf("#", authorityStart)].filter((index) => index >= 0) : [];
   const authorityEnd = separators.length ? Math.min(...separators) : submitted.length;
-  const authority = authorityStart >= 0 ? submitted.slice(authorityStart, authorityEnd) : "";
+  const authority = submitted.slice(authorityStart, authorityEnd);
   const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
   if (hostPort.includes(":")) return badUrl();
   let url;
@@ -90,7 +101,9 @@ function validate(raw, sets) {
   for (const key of keys) if (key !== "version" && key !== "type") { const value = message[key]; if (["generation"].includes(key) ? (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) : ["cursor"].includes(key) ? (value !== null && typeof value !== "string") : (typeof value !== "string" || !value)) throw new AppError("invalid_threads_queue_message", 400); }
   return Object.fromEntries(keys.map((key) => [key, message[key]]));
 }
-/** @param {unknown} raw @returns {Record<string, unknown>} */
-export const validateCaptureMessage = (raw) => validate(raw, CAPTURE);
-/** @param {unknown} raw @returns {Record<string, unknown>} */
-export const validateMediaMessage = (raw) => validate(raw, MEDIA);
+/** @param {unknown} raw @returns {ThreadsCaptureMessage} */
+export const validateCaptureMessage = (raw) =>
+  /** @type {ThreadsCaptureMessage} */ (/** @type {unknown} */ (validate(raw, CAPTURE)));
+/** @param {unknown} raw @returns {ThreadsMediaMessage} */
+export const validateMediaMessage = (raw) =>
+  /** @type {ThreadsMediaMessage} */ (/** @type {unknown} */ (validate(raw, MEDIA)));

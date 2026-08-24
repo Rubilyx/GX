@@ -8,6 +8,8 @@ import {
   mutationChanges, nullableString, POST_STATUSES, requiredString, selectRows, storageError,
 } from "./threads-storage.js";
 
+const MAX_CAPTURE_PAGES = 10_000;
+
 const SYNC_ROW_KEYS = [
   "id", "status", "error_code", "sync_generation", "job_status", "job_error_code",
 ];
@@ -82,6 +84,7 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
       if (!current) {
         postId = crypto.randomUUID();
         generation = 1;
+        const jobId = crypto.randomUUID();
         const changes = mutationBatch(await db.batch([
           db.prepare(
             `INSERT INTO threads_posts
@@ -96,9 +99,15 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
                (id, threads_post_id, generation, status, queued_at, updated_at)
              SELECT ?, ?, 1, 'queued', ?, ?
              WHERE EXISTS (SELECT 1 FROM threads_posts WHERE id = ?)`,
-          ).bind(crypto.randomUUID(), postId, now, now, postId),
-        ]), 2);
-        if (changes.some((count) => count > 1) || changes[0] !== changes[1]) invalidStorage();
+          ).bind(jobId, postId, now, now, postId),
+          db.prepare(
+            `INSERT INTO threads_sync_cursors
+               (threads_post_id, generation, phase, cursor, page_number, created_at)
+             SELECT ?, 1, 'profile', NULL, 1, ?
+             WHERE EXISTS (SELECT 1 FROM threads_sync_jobs WHERE id = ?)`,
+          ).bind(postId, now, jobId),
+        ]), 3);
+        if (changes.some((count) => count > 1 || count !== changes[0])) invalidStorage();
         if (changes[0] === 0) continue;
       } else {
         postId = current.id;
@@ -109,6 +118,7 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
         }
         const next = generation + 1;
         if (!Number.isSafeInteger(next)) invalidStorage();
+        const jobId = crypto.randomUUID();
         const changes = mutationBatch(await db.batch([
           db.prepare(
             `UPDATE threads_posts
@@ -127,9 +137,15 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
              WHERE EXISTS (
                SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
              )`,
-          ).bind(crypto.randomUUID(), postId, next, now, now, postId, next),
-        ]), 2);
-        if (changes.some((count) => count > 1) || changes[0] !== changes[1]) invalidStorage();
+          ).bind(jobId, postId, next, now, now, postId, next),
+          db.prepare(
+            `INSERT INTO threads_sync_cursors
+               (threads_post_id, generation, phase, cursor, page_number, created_at)
+             SELECT ?, ?, 'profile', NULL, 1, ?
+             WHERE EXISTS (SELECT 1 FROM threads_sync_jobs WHERE id = ?)`,
+          ).bind(postId, next, now, jobId),
+        ]), 3);
+        if (changes.some((count) => count > 1 || count !== changes[0])) invalidStorage();
         if (changes[0] === 0) continue;
         generation = next;
       }
@@ -149,7 +165,8 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
 
 const JOB_ROW_KEYS = [
   "post_id", "generation", "status", "profile_completed", "conversation_started",
-  "conversation_completed", "capture_lease", "profile_cursor", "conversation_cursor",
+  "conversation_completed", "capture_lease", "profile_page_count",
+  "conversation_page_count", "profile_cursor", "conversation_cursor",
   "pending_quote_count", "expected_entry_count", "expected_media_count",
   "ready_media_count", "failed_media_count", "error_code", "root_author_id",
   "threads_media_id", "canonical_url", "submitted_url", "shortcode",
@@ -173,7 +190,8 @@ function mapJobRow(row) {
     !(row.canonical_url === null || typeof row.canonical_url === "string") ||
     typeof row.submitted_url !== "string" || !row.submitted_url ||
     typeof row.shortcode !== "string" || !row.shortcode) invalidStorage();
-  for (const key of ["pending_quote_count", "expected_entry_count", "expected_media_count",
+  for (const key of ["profile_page_count", "conversation_page_count",
+    "pending_quote_count", "expected_entry_count", "expected_media_count",
     "ready_media_count", "failed_media_count"]) d1NonnegativeInteger(row[key]);
   return {
     postId: row.post_id, generation: row.generation, status: row.status,
@@ -181,6 +199,8 @@ function mapJobRow(row) {
     conversationStarted: row.conversation_started === 1,
     conversationCompleted: row.conversation_completed === 1,
     captureLease: row.capture_lease,
+    profilePageCount: row.profile_page_count,
+    conversationPageCount: row.conversation_page_count,
     profileCursor: row.profile_cursor, conversationCursor: row.conversation_cursor,
     pendingQuoteCount: row.pending_quote_count, expectedEntryCount: row.expected_entry_count,
     expectedMediaCount: row.expected_media_count, readyMediaCount: row.ready_media_count,
@@ -210,7 +230,8 @@ export async function claimThreadsJob(db, postId, generation, status) {
          )
        RETURNING
          threads_post_id AS post_id, generation, status, profile_completed,
-         conversation_started, conversation_completed, capture_lease, profile_cursor,
+         conversation_started, conversation_completed, capture_lease,
+         profile_page_count, conversation_page_count, profile_cursor,
          conversation_cursor, pending_quote_count, expected_entry_count,
          expected_media_count, ready_media_count, failed_media_count, error_code,
          (SELECT root_author_id FROM threads_posts WHERE id = threads_post_id) AS root_author_id,
@@ -231,19 +252,68 @@ export async function advanceThreadsProfileCursor(db, input) {
   const nextCursor = nullableString(input?.nextCursor);
   const now = inputTimestamp(input?.nowSeconds);
   try {
-    const changed = mutationChanges(await db.prepare(
+    const statements = [db.prepare(
       `UPDATE threads_sync_jobs AS j SET
-         profile_cursor = ?, status = 'resolving', updated_at = ?
+         profile_cursor = ?, profile_page_count = profile_page_count + 1,
+         status = 'resolving', updated_at = ?
        WHERE threads_post_id = ? AND generation = ? AND status = 'resolving'
          AND profile_completed = 0 AND capture_lease IS NULL AND profile_cursor IS ?
+         AND profile_page_count < ?
+         AND (? IS NULL OR NOT EXISTS (
+           SELECT 1 FROM threads_sync_cursors seen
+           WHERE seen.threads_post_id = j.threads_post_id
+             AND seen.generation = j.generation AND seen.phase = 'profile'
+             AND seen.cursor = ?
+         ))
          AND EXISTS (
            SELECT 1 FROM threads_posts p
            WHERE p.id = j.threads_post_id AND p.sync_generation = j.generation
              AND p.status <> 'deleting'
          )`,
-    ).bind(nextCursor, now, postId, generation, expectedCursor).run());
-    if (changed > 1) invalidStorage();
-    return changed === 1;
+    ).bind(nextCursor, now, postId, generation, expectedCursor,
+      MAX_CAPTURE_PAGES, nextCursor, nextCursor)];
+    if (nextCursor !== null) statements.push(db.prepare(
+      `INSERT INTO threads_sync_cursors
+         (threads_post_id, generation, phase, cursor, page_number, created_at)
+       SELECT j.threads_post_id, j.generation, 'profile', ?,
+         j.profile_page_count + 1, ?
+       FROM threads_sync_jobs j JOIN threads_posts p ON p.id = j.threads_post_id
+       WHERE j.threads_post_id = ? AND j.generation = ?
+         AND j.status = 'resolving' AND j.profile_completed = 0
+         AND j.capture_lease IS NULL AND j.profile_cursor = ?
+         AND p.sync_generation = j.generation AND p.status <> 'deleting'
+       ON CONFLICT DO NOTHING`,
+    ).bind(nextCursor, now, postId, generation, nextCursor));
+    const changes = mutationBatch(await db.batch(statements), statements.length);
+    if (changes.some((count) => count > 1)) invalidStorage();
+    if (changes[0] === 1) {
+      if (changes.some((count) => count !== 1)) invalidStorage();
+      return true;
+    }
+    if (changes.some((count) => count !== 0)) invalidStorage();
+    const state = await db.prepare(
+      `SELECT j.status, j.profile_completed, j.capture_lease, j.profile_cursor,
+         j.profile_page_count,
+         CASE WHEN ? IS NULL THEN 0 ELSE EXISTS (
+           SELECT 1 FROM threads_sync_cursors seen
+           WHERE seen.threads_post_id = j.threads_post_id
+             AND seen.generation = j.generation AND seen.phase = 'profile'
+             AND seen.cursor = ?
+         ) END AS cursor_seen
+       FROM threads_sync_jobs j JOIN threads_posts p ON p.id = j.threads_post_id
+       WHERE j.threads_post_id = ? AND j.generation = ?
+         AND p.sync_generation = j.generation AND p.status <> 'deleting'`,
+    ).bind(nextCursor, nextCursor, postId, generation).first();
+    if (state !== null) {
+      const row = exactRow(state, ["status", "profile_completed", "capture_lease",
+        "profile_cursor", "profile_page_count", "cursor_seen"]);
+      const pageCount = d1NonnegativeInteger(row.profile_page_count);
+      if (row.status === "resolving" && row.profile_completed === 0 &&
+        row.capture_lease === null && row.profile_cursor === expectedCursor &&
+        (pageCount >= MAX_CAPTURE_PAGES || row.cursor_seen === 1))
+        throw new AppError("threads_provider_protocol_error", 502);
+    }
+    return false;
   } catch (error) { throw storageError(error); }
 }
 
@@ -276,6 +346,29 @@ export async function markThreadsJobError(db, input) {
     ]), 2);
     if (changes.some((count) => count > 1) || changes[0] !== changes[1]) invalidStorage();
     return changes[0] === 1;
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {{ postId: string, generation: number,
+ * errorCode: string, nowSeconds: number }} input */
+export async function markThreadsEnrichmentFailure(db, input) {
+  const postId = requiredString(input?.postId);
+  const generation = inputPositiveInteger(input?.generation);
+  const errorCode = requiredString(input?.errorCode);
+  const now = inputTimestamp(input?.nowSeconds);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_sync_jobs AS job SET error_code = COALESCE(error_code, ?),
+         updated_at = ?
+       WHERE threads_post_id = ? AND generation = ?
+         AND status IN ('queued','resolving','collecting')
+         AND EXISTS (
+           SELECT 1 FROM threads_posts post WHERE post.id = job.threads_post_id
+             AND post.sync_generation = job.generation AND post.status <> 'deleting'
+         )`,
+    ).bind(errorCode, now, postId, generation).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
   } catch (error) { throw storageError(error); }
 }
 
@@ -595,20 +688,176 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
   } catch (error) { throw storageError(error); }
 }
 
+const RETRY_TARGET_KEYS = [
+  "target_type", "target_id", "generation", "item_status", "item_error_code",
+  "post_status", "post_error_code", "job_status", "job_error_code", "completed_at",
+];
+
+/** @param {any} db @param {any} mediaQueue @param {string} postId
+ * @param {string} targetId @param {number} nowSeconds */
+export async function startThreadsMediaRetry(
+  db, mediaQueue, postId, targetId, nowSeconds,
+) {
+  requiredString(postId); requiredString(targetId);
+  const now = inputTimestamp(nowSeconds);
+  try {
+    const raw = await db.prepare(
+      `WITH candidates AS (
+         SELECT 0 AS priority, 'entry' AS target_type, media.id AS target_id,
+           post.sync_generation AS generation, media.status AS item_status,
+           media.error_code AS item_error_code, post.status AS post_status,
+           post.error_code AS post_error_code, job.status AS job_status,
+           job.error_code AS job_error_code, job.completed_at
+         FROM threads_media media
+         JOIN threads_entries entry ON entry.id = media.entry_id
+         JOIN threads_posts post ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.threads_post_id = ? AND media.id = ?
+           AND media.status = 'error' AND media.upload_lease IS NULL
+           AND post.status <> 'deleting'
+         UNION ALL
+         SELECT 1, 'profile', author.threads_user_id, post.sync_generation,
+           author.profile_media_status, author.profile_error_code, post.status,
+           post.error_code, job.status, job.error_code, job.completed_at
+         FROM threads_authors author
+         JOIN threads_entries entry ON entry.author_id = author.threads_user_id
+         JOIN threads_posts post ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.threads_post_id = ? AND author.threads_user_id = ?
+           AND author.profile_media_status = 'error'
+           AND author.profile_upload_lease IS NULL
+           AND author.profile_cleanup_lease IS NULL AND post.status <> 'deleting'
+       )
+       SELECT target_type, target_id, generation, item_status, item_error_code,
+         post_status, post_error_code, job_status, job_error_code, completed_at
+       FROM candidates ORDER BY priority LIMIT 1`,
+    ).bind(postId, targetId, postId, targetId).first();
+    if (raw === null) throw new AppError("threads_media_not_found", 404);
+    const row = exactRow(raw, RETRY_TARGET_KEYS);
+    if (!['entry', 'profile'].includes(row.target_type) ||
+      typeof row.target_id !== "string" || !row.target_id ||
+      !Number.isSafeInteger(row.generation) || row.generation < 1 ||
+      row.item_status !== "error" ||
+      !(row.item_error_code === null || typeof row.item_error_code === "string") ||
+      !POST_STATUSES.has(row.post_status) || !JOB_STATUSES.has(row.job_status) ||
+      !(row.post_error_code === null || typeof row.post_error_code === "string") ||
+      !(row.job_error_code === null || typeof row.job_error_code === "string") ||
+      !(row.completed_at === null || Number.isSafeInteger(row.completed_at) &&
+        row.completed_at >= 0)) invalidStorage();
+    const targetUpdate = row.target_type === "entry" ? db.prepare(
+      `UPDATE threads_media SET status = 'pending', error_code = NULL, updated_at = ?
+       WHERE id = ? AND status = 'error' AND upload_lease IS NULL
+         AND EXISTS (
+           SELECT 1 FROM threads_entries entry JOIN threads_posts post
+             ON post.id = entry.threads_post_id
+           WHERE entry.id = threads_media.entry_id AND entry.threads_post_id = ?
+             AND post.sync_generation = ? AND post.status <> 'deleting'
+         )`,
+    ).bind(now, targetId, postId, row.generation) : db.prepare(
+      `UPDATE threads_authors SET profile_media_status = 'pending',
+         profile_error_code = NULL, updated_at = ?
+       WHERE threads_user_id = ? AND profile_media_status = 'error'
+         AND profile_upload_lease IS NULL AND profile_cleanup_lease IS NULL
+         AND EXISTS (
+           SELECT 1 FROM threads_entries entry JOIN threads_posts post
+             ON post.id = entry.threads_post_id
+           WHERE entry.author_id = threads_authors.threads_user_id
+             AND entry.threads_post_id = ? AND post.sync_generation = ?
+             AND post.status <> 'deleting'
+         )`,
+    ).bind(now, targetId, postId, row.generation);
+    const pendingPredicate = row.target_type === "entry"
+      ? `EXISTS (SELECT 1 FROM threads_media media JOIN threads_entries entry
+           ON entry.id = media.entry_id WHERE media.id = ? AND media.status = 'pending'
+           AND entry.threads_post_id = threads_posts.id)`
+      : `EXISTS (SELECT 1 FROM threads_authors author JOIN threads_entries entry
+           ON entry.author_id = author.threads_user_id
+           WHERE author.threads_user_id = ? AND author.profile_media_status = 'pending'
+             AND entry.threads_post_id = threads_posts.id)`;
+    const statements = [targetUpdate,
+      db.prepare(
+        `UPDATE threads_posts SET status = 'collecting', error_code = NULL, updated_at = ?
+         WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
+           AND ${pendingPredicate}`,
+      ).bind(now, postId, row.generation, targetId),
+      db.prepare(
+        `UPDATE threads_sync_jobs SET status = 'media_pending', completed_at = NULL,
+           updated_at = ?
+         WHERE threads_post_id = ? AND generation = ?
+           AND EXISTS (
+             SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
+               AND status = 'collecting' AND ${pendingPredicate}
+           )`,
+      ).bind(now, postId, row.generation, postId, row.generation, targetId),
+    ];
+    const changes = mutationBatch(await db.batch(statements), statements.length);
+    if (changes.some((count) => count !== 1)) {
+      if (changes.every((count) => count === 0))
+        throw new AppError("threads_media_not_found", 404);
+      invalidStorage();
+    }
+    const message = row.target_type === "entry" ? {
+      version: 1, type: "retry-media", postId,
+      generation: row.generation, mediaId: targetId,
+    } : {
+      version: 1, type: "archive-profile", postId,
+      generation: row.generation, authorId: targetId,
+    };
+    if (!await sendMedia(mediaQueue, message)) {
+      const restoreTarget = row.target_type === "entry" ? db.prepare(
+        `UPDATE threads_media SET status = 'error', error_code = ?, updated_at = ?
+         WHERE id = ? AND status = 'pending' AND upload_lease IS NULL`,
+      ).bind(row.item_error_code, now, targetId) : db.prepare(
+        `UPDATE threads_authors SET profile_media_status = 'error',
+           profile_error_code = ?, updated_at = ?
+         WHERE threads_user_id = ? AND profile_media_status = 'pending'
+           AND profile_upload_lease IS NULL`,
+      ).bind(row.item_error_code, now, targetId);
+      const restored = mutationBatch(await db.batch([
+        restoreTarget,
+        db.prepare(
+          `UPDATE threads_posts SET status = ?, error_code = ?, updated_at = ?
+           WHERE id = ? AND sync_generation = ? AND status = 'collecting'`,
+        ).bind(row.post_status, row.post_error_code, now, postId, row.generation),
+        db.prepare(
+          `UPDATE threads_sync_jobs SET status = ?, error_code = ?, completed_at = ?,
+             updated_at = ? WHERE threads_post_id = ? AND generation = ?
+             AND status = 'media_pending'`,
+        ).bind(row.job_status, row.job_error_code, row.completed_at, now,
+          postId, row.generation),
+      ]), 3);
+      if (restored.some((count) => count !== 1)) invalidStorage();
+      throw new AppError("queue_unavailable", 503);
+    }
+    return {
+      threadsPostId: postId, generation: row.generation,
+      targetId, targetType: row.target_type, status: "queued",
+    };
+  } catch (error) { throw storageError(error); }
+}
+
 /** @param {any} db @param {any} captureQueue @param {string} postId @param {number} nowSeconds */
 export async function startThreadsDeletion(db, captureQueue, postId, nowSeconds) {
   requiredString(postId);
   const now = inputTimestamp(nowSeconds);
   try {
-    const current = await db.prepare("SELECT status FROM threads_posts WHERE id = ?")
+    const current = await db.prepare(
+      `SELECT status, error_code, delete_previous_status, delete_previous_error_code
+       FROM threads_posts WHERE id = ?`,
+    )
       .bind(postId).first();
     if (current === null) throw new AppError("threads_archive_not_found", 404);
-    const row = exactRow(current, ["status"]);
+    const row = exactRow(current, ["status", "error_code", "delete_previous_status",
+      "delete_previous_error_code"]);
     if (!POST_STATUSES.has(row.status)) invalidStorage();
     if (row.status === "deleting")
       return { threadsPostId: postId, status: "deleting", duplicate: true };
     const changed = mutationChanges(await db.prepare(
-      `UPDATE threads_posts SET status = 'deleting', error_code = NULL, updated_at = ?
+      `UPDATE threads_posts SET delete_previous_status = status,
+         delete_previous_error_code = error_code, status = 'deleting',
+         error_code = NULL, updated_at = ?
        WHERE id = ? AND status <> 'deleting'`,
     ).bind(now, postId).run());
     if (changed !== 1) invalidStorage();
@@ -616,12 +865,30 @@ export async function startThreadsDeletion(db, captureQueue, postId, nowSeconds)
       await sendCapture(captureQueue, { version: 1, type: "delete-archive", postId });
     } catch (error) {
       const recorded = mutationChanges(await db.prepare(
-        `UPDATE threads_posts SET error_code = 'queue_unavailable', updated_at = ?
+        `UPDATE threads_posts SET status = COALESCE(delete_previous_status, 'error'),
+           error_code = 'queue_unavailable', delete_previous_status = NULL,
+           delete_previous_error_code = NULL, updated_at = ?
          WHERE id = ? AND status = 'deleting'`,
       ).bind(now, postId).run());
       if (recorded !== 1) invalidStorage();
       throw error;
     }
     return { threadsPostId: postId, status: "deleting", duplicate: false };
+  } catch (error) { throw storageError(error); }
+}
+
+/** @param {any} db @param {string} postId @param {string} errorCode @param {number} nowSeconds */
+export async function failThreadsDeletion(db, postId, errorCode, nowSeconds) {
+  requiredString(postId); requiredString(errorCode);
+  const now = inputTimestamp(nowSeconds);
+  try {
+    const changed = mutationChanges(await db.prepare(
+      `UPDATE threads_posts SET status = COALESCE(delete_previous_status, 'error'),
+         error_code = ?, delete_previous_status = NULL,
+         delete_previous_error_code = NULL, updated_at = ?
+       WHERE id = ? AND status = 'deleting'`,
+    ).bind(errorCode, now, postId).run());
+    if (changed > 1) invalidStorage();
+    return changed === 1;
   } catch (error) { throw storageError(error); }
 }

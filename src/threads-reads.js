@@ -131,6 +131,7 @@ async function mapEntryRows(db, rows) {
       profileMedia: {
         status: row.profile_media_status, contentType: row.profile_content_type,
         etag: row.profile_etag, bytes: row.profile_bytes, errorCode: row.profile_error_code,
+        available: row.profile_r2_key !== null,
       },
     };
     mapped.set(row.id, {
@@ -161,6 +162,7 @@ function mapArchive(post, entries) {
     profileMedia: {
       status: post.profile_media_status, contentType: post.profile_content_type,
       etag: post.profile_etag, bytes: post.profile_bytes, errorCode: post.profile_error_code,
+      available: post.profile_r2_key !== null,
     },
   } : null);
   return {

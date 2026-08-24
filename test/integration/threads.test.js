@@ -65,7 +65,8 @@ test("0004 creates the normalized Threads archive schema", async () => {
   ).all();
   assert.deepEqual(tables.results.map(/** @param {Record<string, unknown>} row */ (row) => String(row.name)), [
     "threads_authors", "threads_entries", "threads_links", "threads_media",
-    "threads_oauth_credentials", "threads_posts", "threads_sync_jobs",
+    "threads_oauth_credentials", "threads_posts", "threads_sync_cursors",
+    "threads_sync_jobs",
   ]);
   const indexes = await env.PROD_DB.prepare(
     "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'threads_entries' ORDER BY name",
@@ -176,12 +177,37 @@ test("Threads capture jobs expose durable phases and a nullable capture lease", 
   const columns = await db.prepare("PRAGMA table_info(threads_sync_jobs)").all();
   assert.deepEqual(columns.results.filter((row) => [
     "profile_completed", "conversation_started", "conversation_completed", "capture_lease",
+    "profile_page_count", "conversation_page_count",
   ].includes(String(row.name))).map((row) => [row.name, row.notnull, row.dflt_value]), [
     ["profile_completed", 1, "0"],
     ["conversation_started", 1, "0"],
     ["conversation_completed", 1, "0"],
     ["capture_lease", 0, null],
+    ["profile_page_count", 1, "0"],
+    ["conversation_page_count", 1, "0"],
   ]);
+});
+
+test("Threads OAuth exposes local-only connection state and successful replacement clears reconnect", async () => {
+  const oauth = await import("../../src/threads-oauth.js");
+  assert.equal(typeof oauth.getThreadsConnectionState, "function");
+  assert.equal(typeof oauth.markThreadsReconnectRequired, "function");
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  assert.deepEqual(await oauth.getThreadsConnectionState(db, 1_000), {
+    connected: false, reconnectRequired: false,
+  });
+  await connect(db);
+  assert.deepEqual(await oauth.getThreadsConnectionState(db, 1_001), {
+    connected: true, reconnectRequired: false,
+  });
+  assert.equal(await oauth.markThreadsReconnectRequired(db, 1_002), true);
+  assert.deepEqual(await oauth.getThreadsConnectionState(db, 1_003), {
+    connected: false, reconnectRequired: true,
+  });
+  await connect(db, { stateByte: 12, tokenByte: 13 });
+  assert.deepEqual(await oauth.getThreadsConnectionState(db, 1_004), {
+    connected: true, reconnectRequired: false,
+  });
 });
 
 test("Threads OAuth credential callback stores ciphertext and decrypts only with its configured key", async () => {
@@ -1526,6 +1552,218 @@ test("conversation cursor loops terminate while stale generations and bounded 42
   assert.deepEqual(limited, { action: "retry", delaySeconds: 900 });
 });
 
+test("capture cursor ledger rejects A-B-A cycles and the explicit page ceiling without enqueueing", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/CursorLedger", 4_150,
+  );
+  await harness.setProviderMode({
+    threadsProfilePages: [{ data: [rawThreadsMedia("cursor-ledger-root", "CursorLedger")] }],
+    threadsConversationPages: [
+      { data: [], nextCursor: "cursor-a" },
+      { data: [], nextCursor: "cursor-b" },
+      { data: [], nextCursor: "cursor-a" },
+    ],
+  });
+  const fetcher = providerFixture({
+    threadsProfilePages: [{ data: [rawThreadsMedia("cursor-ledger-root", "CursorLedger")] }],
+    threadsConversationPages: [
+      { data: [], nextCursor: "cursor-a" },
+      { data: [], nextCursor: "cursor-b" },
+      { data: [], nextCursor: "cursor-a" },
+    ],
+  });
+  const dependencies = {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue, fetcher,
+    getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_151,
+    deleteArchive: async () => ({ action: "ack" }),
+  };
+  for (let delivery = 0; delivery < 4; delivery += 1) {
+    const current = harness.captureMessages.shift();
+    if (!current) throw new Error(`test_cursor_cycle_delivery_${delivery}_missing`);
+    assert.deepEqual(await handleThreadsCaptureMessage(current, dependencies), {
+      action: "ack",
+    });
+  }
+  assert.equal(harness.captureMessages.length, 0);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code, conversation_page_count FROM threads_sync_jobs
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "error", error_code: "threads_provider_protocol_error",
+    conversation_page_count: 2,
+  });
+  assert.deepEqual(await db.prepare(
+    `SELECT phase, cursor, page_number FROM threads_sync_cursors
+     WHERE threads_post_id = ? AND generation = 1 AND phase = 'conversation'
+     ORDER BY page_number`,
+  ).bind(sync.threadsPostId).all().then((result) => result.results), [
+    { phase: "conversation", cursor: null, page_number: 1 },
+    { phase: "conversation", cursor: "cursor-a", page_number: 2 },
+    { phase: "conversation", cursor: "cursor-b", page_number: 3 },
+  ]);
+
+  const capped = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/CursorCap", 4_152,
+  );
+  harness.captureMessages.length = 0;
+  await claimThreadsJob(db, capped.threadsPostId, 1, "resolving");
+  await saveResolvedThreadsRoot(db, {
+    postId: capped.threadsPostId, generation: 1, profile: profile(),
+    root: media("cursor-cap-root", "author-1", {
+      rootPostId: null, repliedToId: null,
+      permalink: "https://www.threads.com/@meta/post/CursorCap",
+    }), nowSeconds: 4_153,
+  });
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET conversation_page_count = 10000
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(capped.threadsPostId).run();
+  assert.deepEqual(await handleThreadsCaptureMessage({
+    version: 1, type: "collect-conversation", postId: capped.threadsPostId,
+    generation: 1, cursor: null,
+  }, {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+    fetcher: providerFixture({ threadsConversationPages: [
+      { data: [], nextCursor: "cursor-over-cap" },
+    ] }), getAccessToken: async () => ({ accessToken: "token" }),
+    nowSeconds: 4_154, deleteArchive: async () => ({ action: "ack" }),
+  }), { action: "ack" });
+  assert.equal(harness.captureMessages.length, 0);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code FROM threads_sync_jobs
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(capped.threadsPostId).first(), {
+    status: "error", error_code: "threads_provider_protocol_error",
+  });
+});
+
+test("capture persists content before optional profile and carousel enrichment failures", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/ContentFirst", 4_180,
+  );
+  const message = harness.captureMessages.shift();
+  const root = rawThreadsMedia("content-first-root", "ContentFirst", "author-1", {
+    media_type: "CAROUSEL_ALBUM", text: "content survives enrichment",
+    children: { data: [{ id: "missing-carousel-child" }] },
+  });
+  assert.deepEqual(await handleThreadsCaptureMessage(message, {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+    fetcher: providerFixture({
+      threadsProfilePages: [{ data: [root] }],
+      threadsMedia: {
+        "missing-carousel-child": rawThreadsMedia(
+          "missing-carousel-child", "MissingCarouselChild",
+        ),
+      },
+      threadsStatus: { profile_lookup: 404, media: 404 },
+    }),
+    getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_181,
+    deleteArchive: async () => ({ action: "ack" }),
+  }), { action: "ack" });
+  assert.equal(await db.prepare(
+    `SELECT text FROM threads_entries WHERE threads_post_id = ? AND kind = 'root'`,
+  ).bind(sync.threadsPostId).first("text"), "content survives enrichment");
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_error_code FROM threads_authors
+     WHERE threads_user_id = 'author-1'`,
+  ).first(), {
+    profile_media_status: "error", profile_error_code: "threads_profile_unavailable",
+  });
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code FROM threads_sync_jobs
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "collecting", error_code: "threads_media_descriptor_unavailable",
+  });
+});
+
+test("capture persists a retryable media identity when a direct provider URL is missing", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/MissingDirectUrl", 4_190,
+  );
+  await harness.setProviderMode({
+    threadsProfilePages: [{ data: [rawThreadsMedia(
+      "missing-direct-root", "MissingDirectUrl", "author-1", {
+        media_type: "IMAGE", text: "image identity survives", media_url: undefined,
+      },
+    )] }],
+    threadsConversationPages: [{ data: [] }],
+  });
+  await harness.drainCaptureQueue({ nowSeconds: 4_191 });
+  assert.deepEqual(await db.prepare(
+    `SELECT media.source_media_id, media.kind, media.status
+     FROM threads_media media JOIN threads_entries entry ON entry.id = media.entry_id
+     WHERE entry.threads_post_id = ?`,
+  ).bind(sync.threadsPostId).first(), {
+    source_media_id: "missing-direct-root", kind: "image", status: "pending",
+  });
+  assert.ok(harness.mediaMessages.some((message) =>
+    message.type === "archive-entry-media"));
+});
+
+test("provider authentication failures persist reconnect while transient failures remain retryable", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  for (const scenario of [
+    { name: "Auth", status: 401, action: "ack", marks: 1 },
+    { name: "Transient", status: 500, action: "retry", marks: 0 },
+  ]) {
+    const sync = await createThreadsSync(
+      db, harness.captureQueue,
+      `https://www.threads.com/@meta/post/Provider${scenario.name}`, 4_195,
+    );
+    const message = harness.captureMessages.shift();
+    let marks = 0;
+    const result = await handleThreadsCaptureMessage(message, {
+      db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+      fetcher: providerFixture({ threadsStatus: { profile_posts: scenario.status } }),
+      getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_196,
+      markReconnectRequired: async () => { marks += 1; },
+      deleteArchive: async () => ({ action: "ack" }),
+    });
+    assert.equal(result.action, scenario.action);
+    assert.equal(marks, scenario.marks);
+    harness.captureMessages.length = 0;
+    if (scenario.status === 401) assert.deepEqual(await db.prepare(
+      `SELECT status, error_code FROM threads_sync_jobs
+       WHERE threads_post_id = ? AND generation = 1`,
+    ).bind(sync.threadsPostId).first(), {
+      status: "error", error_code: "threads_reconnect_required",
+    });
+  }
+
+  for (const scenario of [
+    { name: "auth", status: 401, action: "ack", marks: 1 },
+    { name: "transient", status: 500, action: "retry", marks: 0 },
+  ]) {
+    const seeded = await seedPendingMedia(db, {
+      postId: `provider-media-${scenario.name}`,
+      shortcode: `ProviderMedia${scenario.name}`,
+      entryId: `provider-media-${scenario.name}-entry`,
+      media: [{ id: `provider-media-${scenario.name}-item`,
+        sourceId: `provider-media-${scenario.name}-source`, kind: "image", ordinal: 0 }],
+    });
+    let marks = 0;
+    const result = await handleThreadsMediaMessage({
+      version: 1, type: "archive-entry-media", postId: seeded.postId,
+      generation: 1, entryId: seeded.entryId,
+      mediaId: `provider-media-${scenario.name}-item`,
+    }, mediaDependencies(db, providerFixture({
+      threadsMedia: {
+        [`provider-media-${scenario.name}-source`]: rawThreadsMedia(
+          `provider-media-${scenario.name}-source`, "ProviderMedia", "author-1", {
+            media_type: "IMAGE", media_url: "https://scontent.cdninstagram.com/unused",
+          },
+        ),
+      }, threadsStatus: { media: scenario.status },
+    }), { markReconnectRequired: async () => { marks += 1; } }));
+    assert.equal(result.action, scenario.action);
+    assert.equal(marks, scenario.marks);
+  }
+});
+
 test("capture consumer recovers profile, conversation, quote, and finalization crash windows", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   /** @param {typeof fetch} fetcher */
@@ -1941,13 +2179,19 @@ test("Threads finalization is idempotent, stale generations cannot advance statu
   );
   assert.deepEqual(await db.prepare(
     "SELECT status, error_code FROM threads_posts WHERE id = 'delete-queue-failure'",
-  ).first(), { status: "deleting", error_code: "queue_unavailable" });
+  ).first(), { status: "ready", error_code: "queue_unavailable" });
   assert.equal(await db.prepare(
     "SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = 'delete-queue-failure'",
   ).first("count"), 1);
   await harness.setQueueMode({});
+  assert.deepEqual(await startThreadsDeletion(
+    db, harness.captureQueue, "delete-queue-failure", 3_008,
+  ), { threadsPostId: "delete-queue-failure", status: "deleting", duplicate: false });
+  assert.deepEqual(harness.captureMessages.at(-1), {
+    version: 1, type: "delete-archive", postId: "delete-queue-failure",
+  });
 
-  assert.deepEqual(await startThreadsDeletion(db, harness.captureQueue, sync.threadsPostId, 3_008),
+  assert.deepEqual(await startThreadsDeletion(db, harness.captureQueue, sync.threadsPostId, 3_009),
     { threadsPostId: sync.threadsPostId, status: "deleting", duplicate: false });
   assert.deepEqual(harness.captureMessages.at(-1), {
     version: 1, type: "delete-archive", postId: sync.threadsPostId,
@@ -1955,9 +2199,160 @@ test("Threads finalization is idempotent, stale generations cannot advance statu
   assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM threads_entries WHERE threads_post_id = ?")
     .bind(sync.threadsPostId).first("count"), 1);
   await assert.rejects(
-    createThreadsSync(db, harness.captureQueue, "https://threads.net/t/RootShort", 3_009),
+    createThreadsSync(db, harness.captureQueue, "https://threads.net/t/RootShort", 3_010),
     (error) => error instanceof AppError && error.code === "threads_archive_deleting",
   );
+});
+
+test("delete DLQ restores a visible retryable archive and a later delete re-enqueues", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedThreadsArchive(db, {
+    id: "delete-dlq-retry", shortcode: "DeleteDlqRetry",
+    threadsMediaId: "delete-dlq-root", status: "ready", jobStatus: "ready",
+    rootEntryId: "delete-dlq-root-entry", createdAt: 3_020, updatedAt: 3_020,
+  });
+  await startThreadsDeletion(db, harness.captureQueue, "delete-dlq-retry", 3_021);
+  const deletion = harness.captureMessages.pop();
+  assert.deepEqual(await handleThreadsCaptureDeadLetter(deletion, {
+    db, nowSeconds: 3_022,
+  }), { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    "SELECT status, error_code FROM threads_posts WHERE id = 'delete-dlq-retry'",
+  ).first(), { status: "ready", error_code: "queue_retries_exhausted" });
+  assert.deepEqual(await startThreadsDeletion(
+    db, harness.captureQueue, "delete-dlq-retry", 3_023,
+  ), { threadsPostId: "delete-dlq-retry", status: "deleting", duplicate: false });
+  assert.deepEqual(harness.captureMessages, [{
+    version: 1, type: "delete-archive", postId: "delete-dlq-retry",
+  }]);
+});
+
+test("media retry uses one archive-scoped lookup for deep replies and rejects deleting archives", async () => {
+  const facade = await import("../../src/threads.js");
+  assert.equal(typeof facade.startThreadsMediaRetry, "function");
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedThreadsArchive(db, {
+    id: "constant-retry", shortcode: "ConstantRetry", threadsMediaId: "constant-root",
+    status: "partial", jobStatus: "partial", rootEntryId: "constant-root-entry",
+    createdAt: 3_030, updatedAt: 3_030,
+  });
+  const inserts = [];
+  for (let index = 0; index < 200; index += 1) inserts.push(db.prepare(
+    `INSERT INTO threads_entries
+       (id, threads_post_id, source_media_id, kind, author_id, text, permalink,
+        published_at, media_type, first_seen_at, last_seen_at, created_at)
+     VALUES (?, 'constant-retry', ?, 'author_reply', 'author-1', '', NULL,
+       ?, 'TEXT_POST', 1, 1, 1)`,
+  ).bind(`constant-reply-${index}`, `constant-source-${index}`,
+    `2026-08-24T00:${String(index % 60).padStart(2, "0")}:00.000Z`));
+  await db.batch(inserts);
+  await db.prepare(
+    `INSERT INTO threads_media
+       (id, entry_id, source_media_id, kind, ordinal, status, error_code)
+     VALUES ('deep-failed-media', 'constant-reply-199', 'constant-source-199',
+       'image', 0, 'error', 'threads_media_unavailable')`,
+  ).run();
+  let queries = 0;
+  const counted = {
+    prepare(/** @type {string} */ sql) { queries += 1; return db.prepare(sql); },
+    batch(/** @type {D1PreparedStatement[]} */ statements) {
+      queries += 1; return db.batch(statements);
+    },
+  };
+  assert.deepEqual(await facade.startThreadsMediaRetry(
+    counted, harness.mediaQueue, "constant-retry", "deep-failed-media", 3_031,
+  ), {
+    threadsPostId: "constant-retry", generation: 1,
+    targetId: "deep-failed-media", targetType: "entry", status: "queued",
+  });
+  assert.ok(queries <= 5, `retry used ${queries} D1 operations`);
+  assert.deepEqual(harness.mediaMessages, [{
+    version: 1, type: "retry-media", postId: "constant-retry",
+    generation: 1, mediaId: "deep-failed-media",
+  }]);
+  await db.prepare("UPDATE threads_posts SET status = 'deleting' WHERE id = 'constant-retry'").run();
+  await assert.rejects(facade.startThreadsMediaRetry(
+    db, harness.mediaQueue, "constant-retry", "deep-failed-media", 3_032,
+  ), (error) => error instanceof AppError && error.code === "threads_media_not_found");
+});
+
+test("additive profile refresh preserves the old ready object through failure and supports retry", async () => {
+  const facade = await import("../../src/threads.js");
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  await seedThreadsArchive(db, {
+    id: "profile-refresh", shortcode: "ProfileRefresh",
+    threadsMediaId: "profile-refresh-root", status: "ready", jobStatus: "ready",
+    rootEntryId: "profile-refresh-root-entry", createdAt: 3_040, updatedAt: 3_040,
+  });
+  const oldKey = testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A);
+  const oldObject = await harness.mediaBucket.put(oldKey,
+    new Blob(["old"], { type: "image/jpeg" }).stream(), {
+      httpMetadata: { contentType: "image/jpeg" },
+    });
+  assert.ok(oldObject);
+  await db.prepare(
+    `UPDATE threads_authors SET profile_media_status = 'ready', profile_r2_key = ?,
+       profile_content_type = 'image/jpeg', profile_bytes = ?, profile_etag = ?,
+       profile_error_code = NULL WHERE threads_user_id = 'author-1'`,
+  ).bind(oldKey, oldObject.size, oldObject.httpEtag).run();
+  const sync = await createThreadsSync(
+    db, harness.captureQueue,
+    "https://www.threads.com/@meta/post/ProfileRefresh", 3_041,
+  );
+  harness.captureMessages.length = 0;
+  await claimThreadsJob(db, sync.threadsPostId, 2, "resolving");
+  await saveResolvedThreadsRoot(db, {
+    postId: sync.threadsPostId, generation: 2, expectedProfileCursor: null,
+    profile: profile(), root: media("profile-refresh-root", "author-1", {
+      rootPostId: null, repliedToId: null,
+      permalink: "https://www.threads.com/@meta/post/ProfileRefresh",
+    }), nowSeconds: 3_042,
+  });
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_error_code
+     FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first(), {
+    profile_media_status: "pending", profile_r2_key: oldKey, profile_error_code: null,
+  });
+  const message = { version: 1, type: "archive-profile",
+    postId: sync.threadsPostId, generation: 2, authorId: "author-1" };
+  const invalid = providerFixture({ mediaBodies: {
+    "fixture-avatar": { body: new Uint8Array([1, 2, 3]), headers: {
+      "Content-Type": "text/plain", "Content-Length": "3",
+    } },
+  } });
+  assert.deepEqual(await handleThreadsMediaMessage(
+    message, mediaDependencies(db, invalid, { nowSeconds: 3_043 }),
+  ), { action: "ack" });
+  assert.deepEqual(await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_error_code
+     FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first(), {
+    profile_media_status: "error", profile_r2_key: oldKey,
+    profile_error_code: "invalid_media_mime",
+  });
+  assert.equal((await serveThreadsMedia(new Request(
+    `https://app.test/threads/${sync.threadsPostId}/media/author-1`,
+  ), { db, bucket: harness.mediaBucket })).status, 200);
+  assert.equal((await facade.startThreadsMediaRetry(
+    db, harness.mediaQueue, sync.threadsPostId, "author-1", 3_044,
+  )).targetType, "profile");
+  const retry = harness.mediaMessages.pop();
+  const valid = providerFixture({ mediaBodies: {
+    "fixture-avatar": { body: new Uint8Array([4, 5, 6]), headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "3",
+    } },
+  } });
+  assert.deepEqual(await handleThreadsMediaMessage(
+    retry, mediaDependencies(db, valid, { nowSeconds: 3_045 }),
+  ), { action: "ack" });
+  const refreshed = await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_error_code
+     FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first();
+  assert.equal(refreshed?.profile_media_status, "ready");
+  assert.equal(refreshed?.profile_error_code, null);
+  assert.notEqual(refreshed?.profile_r2_key, oldKey);
 });
 
 /** @param {D1Database} db @param {string} id @param {number} createdAt @param {string} [jobStatus] */

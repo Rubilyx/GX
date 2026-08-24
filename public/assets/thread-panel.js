@@ -5,11 +5,14 @@ const POST_ID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
 const LOCAL_ID = /^[0-9A-Za-z_-]+$/;
 const STATUS = Object.freeze({
   pending: "수집 대기", collecting: "수집 중", ready: "보관 완료",
-  partial: "일부 보관됨", error: "보관 실패",
+  partial: "일부 보관됨", error: "보관 실패", deleting: "삭제 중",
 });
 const SESSION = "세션이 만료되었습니다. 다시 로그인하세요.";
 const REQUEST_ERROR = "Threads 요청을 처리하지 못했습니다. 다시 시도하세요.";
 const REPLIES_ERROR = "작성자 답글을 불러오지 못했습니다. 다시 시도하세요.";
+
+/** @param {unknown} value */
+const pollingStatus = (value) => ["pending", "collecting", "deleting"].includes(String(value));
 
 /** @param {unknown} value @param {string[]} keys */
 function exact(value, keys) {
@@ -55,18 +58,23 @@ function externalUrl(value) {
 
 /** @param {unknown} value @param {string} postId */
 function validateProfile(value, postId) {
-  const base = ["status", "contentType", "etag", "bytes", "errorCode"];
-  if (!exact(value, base) && !exact(value, [...base, "url"]))
-    throw new Error("invalid_profile");
+  const keys = ["status", "contentType", "etag", "bytes", "errorCode",
+    "available", "url", "retryUrl"];
+  if (!exact(value, keys)) throw new Error("invalid_profile");
   const profile = /** @type {Record<string, unknown>} */ (value);
   if (!["pending", "ready", "error"].includes(String(profile.status)) ||
     !nullableString(profile.contentType) || !nullableString(profile.etag) ||
-    !(profile.bytes === null || nonnegative(profile.bytes)) || !nullableString(profile.errorCode))
+    !(profile.bytes === null || nonnegative(profile.bytes)) ||
+    !nullableString(profile.errorCode) || typeof profile.available !== "boolean" ||
+    !nullableString(profile.url) || !nullableString(profile.retryUrl))
     throw new Error("invalid_profile");
-  if (profile.status === "ready") {
-    if (!localUrl(profile.url,
-      new RegExp(`^/threads/${postId}/media/[0-9A-Za-z_-]+$`))) throw new Error("invalid_profile");
-  } else if (Object.hasOwn(profile, "url")) throw new Error("invalid_profile");
+  const available = localUrl(profile.url,
+    new RegExp(`^/threads/${postId}/media/[0-9A-Za-z_-]+$`));
+  const retry = localUrl(profile.retryUrl,
+    new RegExp(`^/threads/${postId}/media/[0-9A-Za-z_-]+/retry$`));
+  if ((profile.available ? !available : profile.url !== null) ||
+    (profile.status === "error" ? !retry : profile.retryUrl !== null))
+    throw new Error("invalid_profile");
   return profile;
 }
 
@@ -146,7 +154,7 @@ function validateArchive(value, postId) {
     "firstReplies", "replyCount", "mediaProgress", "syncGeneration", "createdAt", "updatedAt"];
   if (!exact(value, keys)) throw new Error("invalid_archive");
   const archive = /** @type {Record<string, unknown>} */ (value);
-  if (archive.id !== postId || !["pending", "collecting", "ready", "partial", "error"]
+  if (archive.id !== postId || !["pending", "collecting", "ready", "partial", "error", "deleting"]
     .includes(String(archive.status)) || !nullableString(archive.canonicalUrl) ||
     !nullableString(archive.errorCode) || !Array.isArray(archive.firstReplies) ||
     !nonnegative(archive.replyCount) || !nonnegative(archive.syncGeneration) ||
@@ -240,17 +248,12 @@ function seoulDate(value) {
   return `${map.year}.${map.month}.${map.day}`;
 }
 
-/** @param {Record<string, unknown>} entry @param {string} postId */
-function replyNode(entry, postId) {
-  const article = document.createElement("article");
-  article.dataset.threadAuthorReply = "";
-  article.dataset.threadEntryId = /** @type {string} */ (entry.id);
-  article.dataset.threadExpandedReply = "";
-  const author = /** @type {Record<string, unknown>} */ (entry.author);
+/** @param {Record<string, unknown>} author @param {string} postId */
+function authorNode(author, postId) {
   const header = document.createElement("header");
   header.className = "thread-author";
   const profile = /** @type {Record<string, unknown>} */ (author.profileMedia);
-  if (profile.status === "ready") {
+  if (profile.available === true) {
     const image = document.createElement("img");
     image.dataset.threadAuthorImage = "";
     image.src = /** @type {string} */ (profile.url);
@@ -269,6 +272,90 @@ function replyNode(entry, postId) {
   username.textContent = `@${author.username}`;
   header.appendChild(name);
   header.appendChild(username);
+  if (profile.status === "error") {
+    const form = retryForm(/** @type {string} */ (profile.retryUrl),
+      "프로필 이미지 재시도");
+    if (form) header.appendChild(form);
+  }
+  void postId;
+  return header;
+}
+
+/** @param {string} action @param {string} label */
+function retryForm(action, label) {
+  if (typeof action !== "string" || !action) return null;
+  const form = document.createElement("form");
+  form.method = "post";
+  form.action = action;
+  form.dataset.threadRetryForm = "";
+  const token = document.querySelector('[data-thread-sync-form] input[name="csrf"]');
+  if (token instanceof HTMLInputElement) {
+    const csrf = document.createElement("input");
+    csrf.type = "hidden";
+    csrf.name = "csrf";
+    csrf.value = token.value;
+    form.appendChild(csrf);
+  }
+  const button = document.createElement("button");
+  button.type = "submit";
+  button.textContent = label;
+  form.appendChild(button);
+  return form;
+}
+
+/** @param {Record<string, unknown>} entry */
+function attachmentLinksNode(entry) {
+  const links = /** @type {Record<string, unknown>[]} */ (entry.links);
+  const attachments = links.filter((link) => link.source === "attachment");
+  if (!attachments.length) return null;
+  const list = document.createElement("ul");
+  list.dataset.threadAttachmentLinks = "";
+  for (const link of attachments) {
+    const item = document.createElement("li");
+    const anchor = document.createElement("a");
+    anchor.href = /** @type {string} */ (link.url);
+    anchor.rel = "noreferrer";
+    anchor.textContent = /** @type {string} */ (link.url);
+    item.appendChild(anchor);
+    list.appendChild(item);
+  }
+  return list;
+}
+
+/** @param {Record<string, unknown>} entry */
+function provenanceNode(entry) {
+  const container = document.createElement("div");
+  container.className = "thread-provenance";
+  if (entry.permalink !== null) {
+    const original = document.createElement("a");
+    original.dataset.threadOriginalLink = "";
+    original.href = /** @type {string} */ (entry.permalink);
+    original.rel = "noreferrer";
+    original.textContent = "원본 게시물 보기";
+    container.appendChild(original);
+  }
+  if (entry.nestedQuotePermalink !== null) {
+    const nested = document.createElement("a");
+    nested.dataset.threadNestedQuoteLink = "";
+    nested.href = /** @type {string} */ (entry.nestedQuotePermalink);
+    nested.rel = "noreferrer";
+    nested.textContent = "다음 인용 게시물 보기";
+    container.appendChild(nested);
+  }
+  return container;
+}
+
+/** @param {Record<string, unknown>} entry @param {string} postId
+ * @param {{ reply?: boolean, expanded?: boolean, quote?: boolean }} [options] */
+function entryNode(entry, postId, options = {}) {
+  const article = document.createElement("article");
+  if (options.reply) {
+    article.dataset.threadAuthorReply = "";
+    article.dataset.threadEntryId = /** @type {string} */ (entry.id);
+    if (options.expanded !== false) article.dataset.threadExpandedReply = "";
+  }
+  if (options.quote) article.dataset.threadQuoteEntry = "";
+  const author = /** @type {Record<string, unknown>} */ (entry.author);
   const time = document.createElement("time");
   time.dataset.threadPublishedAt = "";
   time.dateTime = /** @type {string} */ (entry.publishedAt);
@@ -280,12 +367,27 @@ function replyNode(entry, postId) {
   appendLinkedText(text, /** @type {string} */ (entry.text),
     /** @type {Record<string, unknown>[]} */ (entry.links));
   root.appendChild(text);
+  const attachments = attachmentLinksNode(entry);
+  if (attachments) root.appendChild(attachments);
   root.appendChild(mediaNode(entry, postId));
-  article.appendChild(header);
+  root.appendChild(provenanceNode(entry));
+  article.appendChild(authorNode(author, postId));
   article.appendChild(time);
   article.appendChild(root);
+  if (!options.quote) {
+    const quote = document.createElement("section");
+    quote.dataset.threadQuote = "";
+    if (entry.quote === null) quote.hidden = true;
+    else quote.appendChild(entryNode(
+      /** @type {Record<string, unknown>} */ (entry.quote), postId, { quote: true },
+    ));
+    article.appendChild(quote);
+  }
   return article;
 }
+
+/** @param {Record<string, unknown>} entry @param {string} postId */
+const replyNode = (entry, postId) => entryNode(entry, postId, { reply: true });
 
 /** @param {HTMLElement} node @param {string} text @param {Record<string, unknown>[]} links */
 function appendLinkedText(node, text, links) {
@@ -388,7 +490,7 @@ class ThreadPanel extends HTMLElement {
         loading: false, expansionEpoch: 0, pollEpoch: 0, generation,
       };
       this.states.set(card, state);
-      if (card.dataset.threadStatus === "pending" || card.dataset.threadStatus === "collecting")
+      if (pollingStatus(card.dataset.threadStatus))
         this.schedule(state);
     }
     this.visibilityHandler = () => this.visibilityChanged();
@@ -431,8 +533,7 @@ class ThreadPanel extends HTMLElement {
         state.timer = null;
         state.controller?.abort();
         state.controller = null;
-      } else if ((state.card.dataset.threadStatus === "pending" ||
-        state.card.dataset.threadStatus === "collecting") && state.timer === null &&
+      } else if (pollingStatus(state.card.dataset.threadStatus) && state.timer === null &&
         state.controller === null) this.schedule(state);
     }
   }
@@ -469,6 +570,10 @@ class ThreadPanel extends HTMLElement {
       const body = await responseJson(response);
       if (state.pollEpoch !== epoch) return;
       if (!response.ok) {
+        if (response.status === 404 && state.card.dataset.threadStatus === "deleting") {
+          this.removeArchivedCard(state);
+          return;
+        }
         if (response.status === 401 && errorCode(body) === "session_expired") {
           panelMessage(this, SESSION);
           state.stopped = true;
@@ -483,16 +588,20 @@ class ThreadPanel extends HTMLElement {
       state.card.dataset.threadGeneration = String(state.generation);
       const etag = response.headers.get("ETag");
       state.etag = typeof etag === "string" ? etag : "";
-      this.applyPolling(state.card, result.archive);
+      const previousStatus = state.card.dataset.threadStatus ?? "";
+      const completed = pollingStatus(previousStatus) && !pollingStatus(result.archive.status);
+      if (completed)
+        this.applyCompleteArchive(state, result.archive, result.replies);
+      else this.applyPolling(state.card, result.archive);
       state.delayIndex = Math.min(state.delayIndex + 1, POLL_DELAYS.length - 1);
-      if (!["pending", "collecting"].includes(String(result.archive.status)) && state.expanded)
+      if (!completed && !pollingStatus(result.archive.status) && state.expanded)
         await this.loadReplies(state, true);
     } catch {
       if (!controller.signal.aborted && state.pollEpoch === epoch)
         panelMessage(this, REQUEST_ERROR);
     } finally {
       if (state.controller === controller) state.controller = null;
-      if (!state.stopped && ["pending", "collecting"].includes(state.card.dataset.threadStatus ?? ""))
+      if (!state.stopped && pollingStatus(state.card.dataset.threadStatus))
         this.schedule(state);
     }
   }
@@ -515,6 +624,93 @@ class ThreadPanel extends HTMLElement {
       if (name instanceof HTMLElement) name.textContent = /** @type {string} */ (record.displayName);
       if (username instanceof HTMLElement) username.textContent = `@${record.username}`;
     }
+  }
+
+  /** @param {any} state @param {Record<string, unknown>} archive
+   * @param {Record<string, unknown>[]} replies */
+  applyCompleteArchive(state, archive, replies) {
+    const wasExpanded = state.expanded;
+    this.applyPolling(state.card, archive);
+    state.expansionEpoch += 1;
+    state.expansionController?.abort();
+    state.expansionController = null;
+    state.loading = false;
+    state.expanded = wasExpanded;
+    const root = archive.root;
+    if (root && typeof root === "object") {
+      const rendered = entryNode(
+        /** @type {Record<string, unknown>} */ (root), state.id,
+      );
+      const currentAuthor = state.card.querySelector(":scope > .thread-author");
+      const replacementAuthor = rendered.querySelector(":scope > .thread-author");
+      if (currentAuthor && replacementAuthor)
+        currentAuthor.replaceWith(replacementAuthor);
+      for (const selector of [":scope > [data-thread-published-at]",
+        ":scope > [data-thread-root]", ":scope > [data-thread-quote]"])
+        state.card.querySelector(selector)?.remove();
+      const replyAnchor = state.card.querySelector(":scope > [data-thread-replies]");
+      if (replyAnchor) for (const selector of [":scope > [data-thread-published-at]",
+        ":scope > [data-thread-root]", ":scope > [data-thread-quote]"]) {
+        const node = rendered.querySelector(selector);
+        if (node) state.card.insertBefore(node, replyAnchor);
+      }
+    } else if (archive.author && typeof archive.author === "object") {
+      const current = state.card.querySelector(":scope > .thread-author");
+      if (current) current.replaceWith(authorNode(
+        /** @type {Record<string, unknown>} */ (archive.author), state.id,
+      ));
+    }
+    const repliesNode = state.card.querySelector(":scope > [data-thread-replies]");
+    const firstReplies = /** @type {Record<string, unknown>[]} */ (archive.firstReplies);
+    if (repliesNode instanceof HTMLElement) {
+      const previewIds = new Set(firstReplies.map((entry) => entry.id));
+      const nodes = firstReplies.map((entry) => entryNode(
+        entry, state.id, { reply: true, expanded: false },
+      ));
+      if (wasExpanded) for (const entry of replies)
+        if (!previewIds.has(entry.id)) nodes.push(entryNode(entry, state.id, { reply: true }));
+      repliesNode.replaceChildren(...nodes);
+    }
+    const actions = state.card.querySelector(":scope > .thread-actions");
+    let link = actions?.querySelector("[data-thread-all-replies]");
+    if (repliesNode instanceof HTMLElement && repliesNode.id !== "author-replies" &&
+      Number(archive.replyCount) > firstReplies.length && actions instanceof HTMLElement) {
+      if (!(link instanceof HTMLAnchorElement)) {
+        link = document.createElement("a");
+        link.dataset.threadAllReplies = "";
+        link.href = `${state.detailUrl}#author-replies`;
+        actions.appendChild(link);
+      }
+      link.dataset.threadTotal = String(archive.replyCount);
+      link.textContent = `작성자 답글 ${archive.replyCount}개 ${wasExpanded ? "접기" : "모두 보기"}`;
+      link.removeAttribute("aria-busy");
+    } else if (link instanceof HTMLAnchorElement) link.remove();
+  }
+
+  /** @param {any} state */
+  removeArchivedCard(state) {
+    state.controller?.abort();
+    state.expansionController?.abort();
+    if (state.timer !== null) clearTimeout(state.timer);
+    this.states.delete(state.card);
+    const list = this.querySelector("[data-thread-archive-list]");
+    state.card.remove();
+    let focusTarget = this.querySelector("[data-thread-list-heading]");
+    if (list instanceof HTMLElement && !list.querySelector("[data-thread-archive]")) {
+      const empty = document.createElement("section");
+      empty.dataset.threadEmpty = "";
+      const heading = document.createElement("h2");
+      heading.dataset.threadEmptyHeading = "";
+      heading.tabIndex = -1;
+      heading.textContent = "보관한 Threads가 없습니다";
+      const copy = document.createElement("p");
+      copy.textContent = "Threads URL을 추가하세요.";
+      empty.appendChild(heading);
+      empty.appendChild(copy);
+      list.appendChild(empty);
+      focusTarget = heading;
+    }
+    if (focusTarget instanceof HTMLElement) focusTarget.focus();
   }
 
   /** @param {MouseEvent} event */
@@ -652,7 +848,7 @@ class ThreadPanel extends HTMLElement {
           throw new Error("invalid_sync");
         const result = /** @type {Record<string, unknown>} */ (body);
         if (result.threadsPostId !== state.id || !nonnegative(result.generation) ||
-          Number(result.generation) < 1 || result.status !== "pending" ||
+          Number(result.generation) < 1 || !["pending", "collecting"].includes(String(result.status)) ||
           typeof result.duplicate !== "boolean") throw new Error("invalid_sync");
         if (state.timer !== null) clearTimeout(state.timer);
         state.timer = null;
@@ -665,9 +861,10 @@ class ThreadPanel extends HTMLElement {
         state.delayIndex = 0;
         state.generation = Number(result.generation);
         state.card.dataset.threadGeneration = String(state.generation);
-        state.card.dataset.threadStatus = "pending";
+        state.card.dataset.threadStatus = /** @type {string} */ (result.status);
         this.applyPolling(state.card, {
-          status: "pending", mediaProgress: { expected: 0, ready: 0, failed: 0, pending: 0 },
+          status: result.status,
+          mediaProgress: { expected: 0, ready: 0, failed: 0, pending: 0 },
         });
         this.schedule(state);
       } else {
@@ -679,6 +876,19 @@ class ThreadPanel extends HTMLElement {
           throw new Error("invalid_retry");
         form.dataset.threadRetryStatus = "queued";
         if (button instanceof HTMLButtonElement) button.textContent = "미디어 재시도 대기 중";
+        if (state.timer !== null) clearTimeout(state.timer);
+        state.timer = null;
+        state.pollEpoch += 1;
+        const previousController = state.controller;
+        state.controller = null;
+        previousController?.abort();
+        state.etag = "";
+        state.stopped = false;
+        state.delayIndex = 0;
+        state.card.dataset.threadStatus = "collecting";
+        const label = state.card.querySelector("[data-thread-status-label]");
+        if (label instanceof HTMLElement) label.textContent = STATUS.collecting;
+        this.schedule(state);
         retryQueued = true;
       }
       panelMessage(this, "");
@@ -767,34 +977,25 @@ class ThreadPanel extends HTMLElement {
       const result = /** @type {Record<string, unknown>} */ (body);
       if (result.threadsPostId !== state.id || result.status !== "deleting" ||
         typeof result.duplicate !== "boolean") throw new Error("invalid_delete");
-      state.controller?.abort();
-      state.expansionController?.abort();
       if (state.timer !== null) clearTimeout(state.timer);
-      this.states.delete(state.card);
-      this.deleteOpener = null;
+      state.timer = null;
+      state.pollEpoch += 1;
+      const previousController = state.controller;
+      state.controller = null;
+      previousController?.abort();
+      state.expansionController?.abort();
+      state.etag = "";
+      state.stopped = false;
+      state.delayIndex = 0;
+      state.card.dataset.threadStatus = "deleting";
+      const label = state.card.querySelector("[data-thread-status-label]");
+      if (label instanceof HTMLElement) label.textContent = STATUS.deleting;
+      for (const action of state.card.querySelectorAll("button, [data-thread-all-replies]")) {
+        if (action instanceof HTMLButtonElement) action.disabled = true;
+        else if (action instanceof HTMLAnchorElement) action.setAttribute("aria-disabled", "true");
+      }
       dialog.close();
-      const list = this.querySelector("[data-thread-archive-list]");
-      if (!(list instanceof HTMLElement)) {
-        location.href = "/threads";
-        return;
-      }
-      state.card.remove();
-      let focusTarget = this.querySelector("[data-thread-list-heading]");
-      if (!list.querySelector("[data-thread-archive]")) {
-        const empty = document.createElement("section");
-        empty.dataset.threadEmpty = "";
-        const heading = document.createElement("h2");
-        heading.dataset.threadEmptyHeading = "";
-        heading.tabIndex = -1;
-        heading.textContent = "보관한 Threads가 없습니다";
-        const copy = document.createElement("p");
-        copy.textContent = "Threads URL을 추가하세요.";
-        empty.appendChild(heading);
-        empty.appendChild(copy);
-        list.appendChild(empty);
-        focusTarget = heading;
-      }
-      if (focusTarget instanceof HTMLElement) focusTarget.focus();
+      this.schedule(state);
     } catch {
       const status = dialog.querySelector("[data-thread-delete-status]");
       if (status instanceof HTMLElement) status.textContent = REQUEST_ERROR;

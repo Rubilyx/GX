@@ -43,6 +43,9 @@ CREATE TABLE threads_posts (
   root_author_id TEXT REFERENCES threads_authors(threads_user_id),
   status TEXT NOT NULL CHECK (status IN ('pending','collecting','ready','partial','error','deleting')),
   error_code TEXT,
+  delete_previous_status TEXT
+    CHECK (delete_previous_status IS NULL OR delete_previous_status IN ('pending','collecting','ready','partial','error')),
+  delete_previous_error_code TEXT,
   sync_generation INTEGER NOT NULL DEFAULT 1 CHECK (sync_generation >= 1),
   last_successful_sync_at INTEGER,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -168,6 +171,8 @@ CREATE TABLE threads_sync_jobs (
   conversation_started INTEGER NOT NULL DEFAULT 0 CHECK (conversation_started IN (0,1)),
   conversation_completed INTEGER NOT NULL DEFAULT 0 CHECK (conversation_completed IN (0,1)),
   capture_lease TEXT,
+  profile_page_count INTEGER NOT NULL DEFAULT 0 CHECK (profile_page_count >= 0),
+  conversation_page_count INTEGER NOT NULL DEFAULT 0 CHECK (conversation_page_count >= 0),
   profile_cursor TEXT, conversation_cursor TEXT,
   pending_quote_count INTEGER NOT NULL DEFAULT 0 CHECK (pending_quote_count >= 0),
   expected_entry_count INTEGER NOT NULL DEFAULT 0 CHECK (expected_entry_count >= 0),
@@ -180,9 +185,28 @@ CREATE TABLE threads_sync_jobs (
 );
 CREATE INDEX threads_sync_jobs_status_idx ON threads_sync_jobs(status, updated_at, id);
 
+CREATE TABLE threads_sync_cursors (
+  threads_post_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  phase TEXT NOT NULL CHECK (phase IN ('profile','conversation')),
+  cursor TEXT,
+  page_number INTEGER NOT NULL CHECK (page_number >= 1),
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (threads_post_id, generation)
+    REFERENCES threads_sync_jobs(threads_post_id, generation) ON DELETE CASCADE,
+  UNIQUE (threads_post_id, generation, phase, page_number)
+);
+CREATE UNIQUE INDEX threads_sync_cursors_value_idx
+ON threads_sync_cursors(threads_post_id, generation, phase, cursor)
+WHERE cursor IS NOT NULL;
+CREATE UNIQUE INDEX threads_sync_cursors_initial_idx
+ON threads_sync_cursors(threads_post_id, generation, phase)
+WHERE cursor IS NULL;
+
 CREATE TABLE threads_oauth_credentials (
   singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
   provider_user_id TEXT NOT NULL, encrypted_access_token TEXT NOT NULL, token_nonce TEXT NOT NULL,
   scopes_json TEXT NOT NULL CHECK (json_valid(scopes_json) AND json_type(scopes_json) = 'array'),
-  expires_at INTEGER NOT NULL, refreshed_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL, refreshed_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  reconnect_required INTEGER NOT NULL DEFAULT 0 CHECK (reconnect_required IN (0,1))
 );

@@ -17,7 +17,7 @@ const MAXIMUM_CIPHERTEXT_VALUE = 384;
 
 /** @typedef {(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>} Fetcher */
 /** @typedef {(length: number) => Uint8Array} RandomBytes */
-/** @typedef {{ providerUserId: string, encryptedAccessToken: string, tokenNonce: string, scopes: string[], expiresAt: number, refreshedAt: number, updatedAt: number }} Credential */
+/** @typedef {{ providerUserId: string, encryptedAccessToken: string, tokenNonce: string, scopes: string[], expiresAt: number, refreshedAt: number, updatedAt: number, reconnectRequired: boolean }} Credential */
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
 function plainObject(value) {
@@ -239,6 +239,7 @@ function credentialRow(value) {
       ? JSON.parse(value.scopes_json) : null;
     if (!Array.isArray(scopes) || !scopes.every((scope) => typeof scope === "string") || !exactScopes(scopes))
       return null;
+    if (value.reconnect_required !== 0 && value.reconnect_required !== 1) return null;
     return {
       providerUserId: boundedString(value.provider_user_id),
       encryptedAccessToken: storedString(value.encrypted_access_token, MAXIMUM_CIPHERTEXT_VALUE),
@@ -246,6 +247,7 @@ function credentialRow(value) {
       expiresAt: requireInteger(value.expires_at, "threads_reconnect_required", 401),
       refreshedAt: requireInteger(value.refreshed_at, "threads_reconnect_required", 401),
       updatedAt: requireInteger(value.updated_at, "threads_reconnect_required", 401),
+      reconnectRequired: value.reconnect_required === 1,
     };
   } catch { return null; }
 }
@@ -255,7 +257,7 @@ async function readCredential(db) {
   try {
     return credentialRow(await db.prepare(
       `SELECT provider_user_id, encrypted_access_token, token_nonce, scopes_json,
-              expires_at, refreshed_at, updated_at
+              expires_at, refreshed_at, updated_at, reconnect_required
        FROM threads_oauth_credentials WHERE singleton_id = 1`,
     ).first());
   } catch { throw new AppError("storage_unavailable", 503); }
@@ -338,7 +340,8 @@ export async function finishThreadsOAuth(db, input) {
          scopes_json = excluded.scopes_json,
          expires_at = excluded.expires_at,
          refreshed_at = excluded.refreshed_at,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at,
+         reconnect_required = 0`,
     ).bind(exchanged.userId, encrypted.encryptedAccessToken, encrypted.tokenNonce,
       JSON.stringify(debug.scopes), debug.expiresAt, nowSeconds, nowSeconds);
     let stored;
@@ -357,10 +360,17 @@ export async function refreshStoredThreadsCredential(db, input) {
   const appId = configuredString(input?.appId);
   const nowSeconds = requireInteger(input?.nowSeconds, "threads_reconnect_required", 401);
   const credential = await readCredential(db);
-  if (!credential || credential.expiresAt <= nowSeconds) return { refreshed: false, reconnectRequired: true };
+  if (!credential) return { refreshed: false, reconnectRequired: true };
+  if (credential.reconnectRequired || credential.expiresAt <= nowSeconds) {
+    await markThreadsReconnectRequired(db, nowSeconds);
+    return { refreshed: false, reconnectRequired: true };
+  }
   let accessToken;
   try { accessToken = await decryptAccessToken(credential, input?.tokenKey); }
-  catch { return { refreshed: false, reconnectRequired: true }; }
+  catch {
+    await markThreadsReconnectRequired(db, nowSeconds);
+    return { refreshed: false, reconnectRequired: true };
+  }
   if (credential.expiresAt - nowSeconds > REFRESH_SECONDS)
     return { refreshed: false, reconnectRequired: false };
   let refreshed;
@@ -372,18 +382,25 @@ export async function refreshStoredThreadsCredential(db, input) {
     refreshed = { ...refreshed, accessToken: refreshedAccessToken };
   } catch (error) {
     if (error instanceof AppError && error.code === "threads_reconnect_required")
-      return { refreshed: false, reconnectRequired: true };
+      return markThreadsReconnectRequired(db, nowSeconds).then(() => ({
+        refreshed: false, reconnectRequired: true,
+      }));
     throw error;
   }
-  if (!verifiedDebug(debug, appId, credential.providerUserId, nowSeconds))
+  if (!verifiedDebug(debug, appId, credential.providerUserId, nowSeconds)) {
+    await markThreadsReconnectRequired(db, nowSeconds);
     return { refreshed: false, reconnectRequired: true };
+  }
   let encrypted;
   try { encrypted = await encryptAccessToken(refreshed.accessToken, input?.tokenKey, input?.randomBytes); }
-  catch { return { refreshed: false, reconnectRequired: true }; }
+  catch {
+    await markThreadsReconnectRequired(db, nowSeconds);
+    return { refreshed: false, reconnectRequired: true };
+  }
   const statement = db.prepare(
     `UPDATE threads_oauth_credentials SET
        encrypted_access_token = ?, token_nonce = ?, scopes_json = ?, expires_at = ?,
-       refreshed_at = ?, updated_at = ?
+       refreshed_at = ?, updated_at = ?, reconnect_required = 0
      WHERE singleton_id = 1 AND provider_user_id = ? AND encrypted_access_token = ?
        AND token_nonce = ? AND expires_at = ?`,
   ).bind(encrypted.encryptedAccessToken, encrypted.tokenNonce, JSON.stringify(debug.scopes),
@@ -404,7 +421,8 @@ export async function getThreadsAccessToken(db, input) {
   const refresh = await refreshStoredThreadsCredential(db, input);
   if (refresh.reconnectRequired) throw new AppError("threads_reconnect_required", 401);
   const credential = await readCredential(db);
-  if (!credential || credential.expiresAt <= input.nowSeconds || !exactScopes(credential.scopes))
+  if (!credential || credential.reconnectRequired || credential.expiresAt <= input.nowSeconds ||
+    !exactScopes(credential.scopes))
     throw new AppError("threads_reconnect_required", 401);
   let accessToken;
   try { accessToken = await decryptAccessToken(credential, input?.tokenKey); }
@@ -413,6 +431,48 @@ export async function getThreadsAccessToken(db, input) {
     accessToken, providerUserId: credential.providerUserId,
     expiresAt: credential.expiresAt, scopes: [...credential.scopes],
   };
+}
+
+/** @param {D1Database} db @param {number} nowSeconds */
+export async function getThreadsConnectionState(db, nowSeconds) {
+  const now = requireInteger(nowSeconds, "threads_reconnect_required", 401);
+  let raw;
+  try {
+    raw = await db.prepare(
+      `SELECT encrypted_access_token, token_nonce, scopes_json, expires_at,
+         reconnect_required FROM threads_oauth_credentials WHERE singleton_id = 1`,
+    ).first();
+  } catch { throw new AppError("storage_unavailable", 503); }
+  if (raw === null) return { connected: false, reconnectRequired: false };
+  try {
+    if (!plainObject(raw) || raw.reconnect_required !== 0 && raw.reconnect_required !== 1 ||
+      !Number.isSafeInteger(raw.expires_at) || Number(raw.expires_at) <= now ||
+      typeof raw.scopes_json !== "string" || !exactScopes(JSON.parse(raw.scopes_json)))
+      return { connected: false, reconnectRequired: true };
+    const nonce = fromBase64Url(storedString(raw.token_nonce, 16));
+    const ciphertext = fromBase64Url(storedString(
+      raw.encrypted_access_token, MAXIMUM_CIPHERTEXT_VALUE,
+    ));
+    if (nonce.length !== 12 || ciphertext.length < 17 ||
+      ciphertext.length > MAXIMUM_PROVIDER_VALUE + 16 || raw.reconnect_required === 1)
+      return { connected: false, reconnectRequired: true };
+    return { connected: true, reconnectRequired: false };
+  } catch { return { connected: false, reconnectRequired: true }; }
+}
+
+/** @param {D1Database} db @param {number} nowSeconds */
+export async function markThreadsReconnectRequired(db, nowSeconds) {
+  const now = requireInteger(nowSeconds, "threads_reconnect_required", 401);
+  let result;
+  try {
+    result = await db.prepare(
+      `UPDATE threads_oauth_credentials SET reconnect_required = 1, updated_at = ?
+       WHERE singleton_id = 1 AND reconnect_required = 0`,
+    ).bind(now).run();
+  } catch { throw new AppError("storage_unavailable", 503); }
+  if (!result || result.success !== true || !Number.isSafeInteger(result.meta?.changes) ||
+    ![0, 1].includes(result.meta.changes)) throw new AppError("storage_unavailable", 503);
+  return result.meta.changes === 1;
 }
 
 /** @param {D1Database} db */

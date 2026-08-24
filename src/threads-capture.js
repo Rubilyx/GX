@@ -61,27 +61,23 @@ async function sendPendingQuotes(message, dependencies) {
 
 /** @param {Record<string, any>} message @param {Record<string, any>} job @param {any} dependencies */
 async function recoverPersistedWork(message, job, dependencies) {
-  if (message.type === "resolve-post") {
-    if (job.profileCursor === null && job.threadsMediaId)
-      await sendCapture(dependencies.captureQueue, {
-        version: 1, type: "collect-conversation", postId: message.postId,
-        generation: message.generation, cursor: job.conversationCursor,
-      });
-    else await sendCapture(dependencies.captureQueue, {
+  if (!job.profileCompleted) {
+    await sendCapture(dependencies.captureQueue, {
       version: 1, type: "resolve-post", postId: message.postId,
       generation: message.generation, cursor: job.profileCursor,
     });
-    await sendPendingQuotes(message, dependencies);
     return;
   }
-  if (message.type === "collect-conversation" && job.conversationCursor !== null)
+  if (!job.conversationCompleted) {
     await sendCapture(dependencies.captureQueue, {
       version: 1, type: "collect-conversation", postId: message.postId,
       generation: message.generation, cursor: job.conversationCursor,
     });
+    if (job.conversationStarted) await sendPendingQuotes(message, dependencies);
+    return;
+  }
   await sendPendingQuotes(message, dependencies);
-  if (message.type === "collect-conversation" && job.conversationCursor === null &&
-    job.pendingQuoteCount === 0) await sendCapture(dependencies.captureQueue, {
+  if (job.pendingQuoteCount === 0) await sendCapture(dependencies.captureQueue, {
     version: 1, type: "finalize-content", postId: message.postId,
     generation: message.generation,
   });
@@ -136,6 +132,10 @@ async function resolvePost(message, dependencies) {
     dependencies.db, message.postId, message.generation, "resolving",
   );
   if (!job) return;
+  if (job.profileCompleted) {
+    await recoverPersistedWork(message, job, dependencies);
+    return;
+  }
   if (message.cursor !== job.profileCursor) {
     await recoverPersistedWork(message, job, dependencies);
     return;
@@ -181,15 +181,21 @@ async function resolvePost(message, dependencies) {
   const media = await mediaDescriptors(root, token, dependencies);
   const saved = await saveResolvedThreadsRoot(dependencies.db, {
     postId: message.postId, generation: message.generation, profile, root,
+    expectedProfileCursor: message.cursor,
     profileCursor: null, conversationCursor: null, media,
     nowSeconds: dependencies.nowSeconds,
   });
-  if (!saved.saved) return;
+  if (!saved.applied) {
+    const current = await claimThreadsJob(
+      dependencies.db, message.postId, message.generation, "resolving",
+    );
+    if (current) await recoverPersistedWork(message, current, dependencies);
+    return;
+  }
   await sendCapture(dependencies.captureQueue, {
     version: 1, type: "collect-conversation", postId: message.postId,
     generation: message.generation, cursor: null,
   });
-  await sendPendingQuotes(message, dependencies);
 }
 
 /** @param {Record<string, any>} message @param {any} dependencies */
@@ -198,6 +204,10 @@ async function collectConversation(message, dependencies) {
     dependencies.db, message.postId, message.generation, "collecting",
   );
   if (!job) return;
+  if (!job.profileCompleted || job.conversationCompleted) {
+    await recoverPersistedWork(message, job, dependencies);
+    return;
+  }
   if (message.cursor !== job.conversationCursor) {
     await recoverPersistedWork(message, job, dependencies);
     return;
@@ -215,9 +225,16 @@ async function collectConversation(message, dependencies) {
   const media = await allMediaDescriptors(accepted, token, dependencies);
   const saved = await saveThreadsConversationPage(dependencies.db, {
     postId: message.postId, generation: message.generation, entries: accepted,
-    nextCursor: page.nextCursor, media, nowSeconds: dependencies.nowSeconds,
+    expectedCursor: message.cursor, nextCursor: page.nextCursor, media,
+    nowSeconds: dependencies.nowSeconds,
   });
-  if (saved.accepted !== accepted.length) return;
+  if (!saved.applied || saved.accepted !== accepted.length) {
+    const current = await claimThreadsJob(
+      dependencies.db, message.postId, message.generation, "collecting",
+    );
+    if (current) await recoverPersistedWork(message, current, dependencies);
+    return;
+  }
   if (page.nextCursor !== null) await sendCapture(dependencies.captureQueue, {
     version: 1, type: "collect-conversation", postId: message.postId,
     generation: message.generation, cursor: page.nextCursor,
@@ -237,8 +254,8 @@ async function afterQuote(message, dependencies) {
     dependencies.db, message.postId, message.generation, "collecting",
   );
   if (!job) return;
-  await sendPendingQuotes(message, dependencies);
-  if (job.conversationCursor === null && job.pendingQuoteCount === 0)
+  if (job.conversationStarted) await sendPendingQuotes(message, dependencies);
+  if (job.conversationCompleted && job.pendingQuoteCount === 0)
     await sendCapture(dependencies.captureQueue, {
       version: 1, type: "finalize-content", postId: message.postId,
       generation: message.generation,
@@ -251,6 +268,10 @@ async function collectQuote(message, dependencies) {
     dependencies.db, message.postId, message.generation, "collecting",
   );
   if (!job) return;
+  if (!job.profileCompleted || !job.conversationStarted) {
+    await recoverPersistedWork(message, job, dependencies);
+    return;
+  }
   const pending = await listThreadsPendingQuoteWork(dependencies.db, {
     postId: message.postId, generation: message.generation,
   });
@@ -287,6 +308,8 @@ async function collectQuote(message, dependencies) {
       const nested = await fetchThreadsMedia(dependencies.fetcher, {
         accessToken: token, mediaId: quote.quotedPostId, signal: dependencies.signal,
       });
+      if (nested.id !== quote.quotedPostId)
+        throw new AppError("threads_provider_protocol_error", 502);
       nestedQuotePermalink = nested.permalink;
     } catch (error) {
       if (!(error instanceof AppError) || error.code !== "threads_post_unavailable") throw error;

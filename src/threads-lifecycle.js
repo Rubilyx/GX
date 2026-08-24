@@ -148,7 +148,8 @@ export async function createThreadsSync(db, captureQueue, rawUrl, nowSeconds) {
 }
 
 const JOB_ROW_KEYS = [
-  "post_id", "generation", "status", "profile_cursor", "conversation_cursor",
+  "post_id", "generation", "status", "profile_completed", "conversation_started",
+  "conversation_completed", "capture_lease", "profile_cursor", "conversation_cursor",
   "pending_quote_count", "expected_entry_count", "expected_media_count",
   "ready_media_count", "failed_media_count", "error_code", "root_author_id",
   "threads_media_id", "canonical_url", "submitted_url", "shortcode",
@@ -160,6 +161,10 @@ function mapJobRow(row) {
   if (typeof row.post_id !== "string" || !row.post_id ||
     !Number.isSafeInteger(row.generation) || row.generation < 1 ||
     !JOB_STATUSES.has(row.status) ||
+    ![0, 1].includes(row.profile_completed) ||
+    ![0, 1].includes(row.conversation_started) ||
+    ![0, 1].includes(row.conversation_completed) ||
+    !(row.capture_lease === null || typeof row.capture_lease === "string") ||
     !(row.profile_cursor === null || typeof row.profile_cursor === "string") ||
     !(row.conversation_cursor === null || typeof row.conversation_cursor === "string") ||
     !(row.error_code === null || typeof row.error_code === "string") ||
@@ -172,6 +177,10 @@ function mapJobRow(row) {
     "ready_media_count", "failed_media_count"]) d1NonnegativeInteger(row[key]);
   return {
     postId: row.post_id, generation: row.generation, status: row.status,
+    profileCompleted: row.profile_completed === 1,
+    conversationStarted: row.conversation_started === 1,
+    conversationCompleted: row.conversation_completed === 1,
+    captureLease: row.capture_lease,
     profileCursor: row.profile_cursor, conversationCursor: row.conversation_cursor,
     pendingQuoteCount: row.pending_quote_count, expectedEntryCount: row.expected_entry_count,
     expectedMediaCount: row.expected_media_count, readyMediaCount: row.ready_media_count,
@@ -193,13 +202,15 @@ export async function claimThreadsJob(db, postId, generation, status) {
          status = ?, started_at = COALESCE(started_at, unixepoch()), updated_at = unixepoch()
        WHERE threads_post_id = ? AND generation = ?
          AND status IN ('queued','resolving','collecting')
+         AND capture_lease IS NULL
          AND EXISTS (
            SELECT 1 FROM threads_posts p
            WHERE p.id = j.threads_post_id AND p.sync_generation = j.generation
              AND p.status <> 'deleting'
          )
        RETURNING
-         threads_post_id AS post_id, generation, status, profile_cursor,
+         threads_post_id AS post_id, generation, status, profile_completed,
+         conversation_started, conversation_completed, capture_lease, profile_cursor,
          conversation_cursor, pending_quote_count, expected_entry_count,
          expected_media_count, ready_media_count, failed_media_count, error_code,
          (SELECT root_author_id FROM threads_posts WHERE id = threads_post_id) AS root_author_id,
@@ -224,7 +235,7 @@ export async function advanceThreadsProfileCursor(db, input) {
       `UPDATE threads_sync_jobs AS j SET
          profile_cursor = ?, status = 'resolving', updated_at = ?
        WHERE threads_post_id = ? AND generation = ? AND status = 'resolving'
-         AND profile_cursor IS ?
+         AND profile_completed = 0 AND capture_lease IS NULL AND profile_cursor IS ?
          AND EXISTS (
            SELECT 1 FROM threads_posts p
            WHERE p.id = j.threads_post_id AND p.sync_generation = j.generation
@@ -269,14 +280,17 @@ export async function markThreadsJobError(db, input) {
 }
 
 const STATE_KEYS = [
-  "status", "profile_cursor", "conversation_cursor", "pending_quote_count",
+  "status", "profile_completed", "conversation_started", "conversation_completed",
+  "capture_lease", "profile_cursor", "conversation_cursor", "pending_quote_count",
   "content_completed_at", "expected_media_count", "ready_media_count",
   "failed_media_count", "error_code",
 ];
 /** @param {any} db @param {string} postId @param {number} generation */
 async function currentState(db, postId, generation) {
   const raw = await db.prepare(
-    `SELECT j.status, j.profile_cursor, j.conversation_cursor, j.pending_quote_count,
+    `SELECT j.status, j.profile_completed, j.conversation_started,
+       j.conversation_completed, j.capture_lease, j.profile_cursor,
+       j.conversation_cursor, j.pending_quote_count,
        j.content_completed_at, j.expected_media_count, j.ready_media_count,
        j.failed_media_count, j.error_code
      FROM threads_sync_jobs j JOIN threads_posts p ON p.id = j.threads_post_id
@@ -286,6 +300,10 @@ async function currentState(db, postId, generation) {
   if (raw === null) return null;
   const row = exactRow(raw, STATE_KEYS);
   if (!JOB_STATUSES.has(row.status) ||
+    ![0, 1].includes(row.profile_completed) ||
+    ![0, 1].includes(row.conversation_started) ||
+    ![0, 1].includes(row.conversation_completed) ||
+    !(row.capture_lease === null || typeof row.capture_lease === "string") ||
     !(row.profile_cursor === null || typeof row.profile_cursor === "string") ||
     !(row.conversation_cursor === null || typeof row.conversation_cursor === "string") ||
     !(row.content_completed_at === null || Number.isSafeInteger(row.content_completed_at) &&
@@ -338,7 +356,8 @@ async function aggregateRow(db, postId, generation) {
        ON j.threads_post_id = p.id AND j.generation = ?
      WHERE p.id = ? AND p.sync_generation = ? AND p.status <> 'deleting'
        AND j.status = 'media_pending' AND j.content_completed_at IS NOT NULL
-       AND j.profile_cursor IS NULL AND j.conversation_cursor IS NULL
+       AND j.profile_completed = 1 AND j.conversation_completed = 1
+       AND j.capture_lease IS NULL
        AND j.pending_quote_count = 0`,
   ).bind(generation, postId, generation).first();
   if (row === null) return null;
@@ -384,7 +403,8 @@ export async function recalculateThreadsStatus(db, input) {
            AND EXISTS (
              SELECT 1 FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = ?
                AND status = 'media_pending' AND content_completed_at IS NOT NULL
-               AND profile_cursor IS NULL AND conversation_cursor IS NULL
+               AND profile_completed = 1 AND conversation_completed = 1
+               AND capture_lease IS NULL
                AND pending_quote_count = 0
            )`,
       ).bind(postStatus, postStatus,
@@ -395,8 +415,9 @@ export async function recalculateThreadsStatus(db, input) {
            expected_media_count = ?, ready_media_count = ?, failed_media_count = ?,
            error_code = ?, completed_at = ?, updated_at = ?
          WHERE threads_post_id = ? AND generation = ? AND status = 'media_pending'
-           AND content_completed_at IS NOT NULL AND profile_cursor IS NULL
-           AND conversation_cursor IS NULL AND pending_quote_count = 0
+           AND content_completed_at IS NOT NULL AND profile_completed = 1
+           AND conversation_completed = 1 AND capture_lease IS NULL
+           AND pending_quote_count = 0
            AND EXISTS (
              SELECT 1 FROM threads_posts WHERE id = ? AND sync_generation = ?
                AND status <> 'deleting'
@@ -420,7 +441,8 @@ function finalizationGate() {
     WHERE gate.error_code = ? AND gate.threads_post_id = ? AND gate.generation = ?
       AND gate.status = 'media_pending'
       AND gate.content_completed_at IS NOT NULL
-      AND gate.profile_cursor IS NULL AND gate.conversation_cursor IS NULL
+      AND gate.profile_completed = 1 AND gate.conversation_completed = 1
+      AND gate.capture_lease IS NULL
       AND gate.pending_quote_count = 0
       AND gate_post.sync_generation = gate.generation
       AND gate_post.status <> 'deleting'
@@ -434,7 +456,8 @@ async function pendingFinalizationRows(db, postId, generation) {
       ON post.id = job.threads_post_id
     WHERE job.threads_post_id = ? AND job.generation = ?
       AND job.status = 'media_pending' AND job.content_completed_at IS NOT NULL
-      AND job.profile_cursor IS NULL AND job.conversation_cursor IS NULL
+      AND job.profile_completed = 1 AND job.conversation_completed = 1
+      AND job.capture_lease IS NULL
       AND job.pending_quote_count = 0 AND post.sync_generation = job.generation
       AND post.status <> 'deleting'
   )`;
@@ -466,11 +489,13 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
   try {
     const state = await currentState(db, postId, generation);
     if (!state) return { status: "stale", ready: 0, failed: 0, expected: 0 };
+    if (state.capture_lease !== null)
+      return { status: "collecting", ready: 0, failed: 0, expected: 0 };
     if (["ready", "partial", "error"].includes(state.status)) {
       return { status: state.status, ready: state.ready_media_count,
         failed: state.failed_media_count, expected: state.expected_media_count };
     }
-    if (state.profile_cursor !== null || state.conversation_cursor !== null ||
+    if (state.profile_completed !== 1 || state.conversation_completed !== 1 ||
       state.pending_quote_count !== 0) {
       return { status: "collecting", ready: 0, failed: 0, expected: 0 };
     }
@@ -483,8 +508,8 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
              content_completed_at = ?, error_code = ?, updated_at = ?
            WHERE threads_post_id = ? AND generation = ?
              AND status IN ('queued','resolving','collecting')
-             AND profile_cursor IS NULL AND conversation_cursor IS NULL
-             AND pending_quote_count = 0
+             AND profile_completed = 1 AND conversation_completed = 1
+             AND capture_lease IS NULL AND pending_quote_count = 0
              AND EXISTS (
                SELECT 1 FROM threads_posts post WHERE post.id = job.threads_post_id
                  AND post.sync_generation = job.generation AND post.status <> 'deleting'
@@ -530,8 +555,9 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
                  ON p.id = j.threads_post_id
                WHERE j.threads_post_id = ? AND j.generation = ?
                  AND j.status = 'media_pending' AND j.content_completed_at IS NOT NULL
-                 AND j.profile_cursor IS NULL AND j.conversation_cursor IS NULL
-                 AND j.pending_quote_count = 0 AND p.sync_generation = j.generation
+                 AND j.profile_completed = 1 AND j.conversation_completed = 1
+                 AND j.capture_lease IS NULL AND j.pending_quote_count = 0
+                 AND p.sync_generation = j.generation
                  AND p.status <> 'deleting'
              )`,
         ).bind(now, row.media_id, postId, generation).run());
@@ -552,8 +578,9 @@ export async function finalizeThreadsContent(db, mediaQueue, input) {
                  ON p.id = j.threads_post_id
                WHERE j.threads_post_id = ? AND j.generation = ?
                  AND j.status = 'media_pending' AND j.content_completed_at IS NOT NULL
-                 AND j.profile_cursor IS NULL AND j.conversation_cursor IS NULL
-                 AND j.pending_quote_count = 0 AND p.sync_generation = j.generation
+                 AND j.profile_completed = 1 AND j.conversation_completed = 1
+                 AND j.capture_lease IS NULL AND j.pending_quote_count = 0
+                 AND p.sync_generation = j.generation
                  AND p.status <> 'deleting'
              )`,
         ).bind(now, row.author_id, postId, generation).run());

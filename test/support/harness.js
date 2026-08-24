@@ -346,7 +346,9 @@ export function providerFixture(options = {}) {
  * username: string, displayName: string, rootEntryId: string, rootText: string,
  * rootPermalink: string, rootPublishedAt: string, rootMediaType: string,
  * createdAt: number, updatedAt: number, withRoot: boolean, withJob: boolean,
- * jobStatus: string, jobErrorCode: string | null }} SeedThreadsArchive */
+ * jobStatus: string, jobErrorCode: string | null, profileCompleted: boolean,
+ * conversationStarted: boolean, conversationCompleted: boolean,
+ * captureLease: string | null }} SeedThreadsArchive */
 /** @type {Readonly<SeedThreadsArchive>} */
 const threadsArchiveDefaults = Object.freeze({
   id: "threads-post-1", shortcode: "RootShort", threadsMediaId: "root-1",
@@ -359,6 +361,8 @@ const threadsArchiveDefaults = Object.freeze({
   rootPublishedAt: "2026-08-24T00:00:00Z", rootMediaType: "TEXT_POST",
   createdAt: 1, updatedAt: 1, withRoot: true, withJob: true,
   jobStatus: "ready", jobErrorCode: null,
+  profileCompleted: true, conversationStarted: true, conversationCompleted: true,
+  captureLease: null,
 });
 
 /** @param {any} db @param {Partial<SeedThreadsArchive>} [overrides] */
@@ -399,11 +403,14 @@ export async function seedThreadsArchive(db, overrides = {}) {
   if (row.withJob) {
     await db.prepare(
       `INSERT INTO threads_sync_jobs
-         (id, threads_post_id, generation, status, error_code, queued_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (id, threads_post_id, generation, status, error_code, profile_completed,
+          conversation_started, conversation_completed, capture_lease, queued_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       `threads-job-${row.id}-${row.syncGeneration}`, row.id, row.syncGeneration,
-      row.jobStatus, row.jobErrorCode, row.createdAt, row.updatedAt,
+      row.jobStatus, row.jobErrorCode, row.profileCompleted ? 1 : 0,
+      row.conversationStarted ? 1 : 0, row.conversationCompleted ? 1 : 0,
+      row.captureLease, row.createdAt, row.updatedAt,
     ).run();
   }
   return row;

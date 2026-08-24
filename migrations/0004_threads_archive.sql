@@ -15,12 +15,15 @@ CREATE TABLE threads_authors (
   profile_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (profile_attempt_count >= 0),
   profile_upload_lease TEXT,
   profile_upload_started_at INTEGER CHECK (profile_upload_started_at IS NULL OR profile_upload_started_at >= 0),
+  profile_pending_r2_key TEXT,
   profile_cleanup_lease TEXT,
   profile_cleanup_started_at INTEGER CHECK (profile_cleanup_started_at IS NULL OR profile_cleanup_started_at >= 0),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  CHECK ((profile_upload_lease IS NULL AND profile_upload_started_at IS NULL)
-    OR (profile_upload_lease IS NOT NULL AND profile_upload_started_at IS NOT NULL)),
+  CHECK ((profile_upload_lease IS NULL AND profile_upload_started_at IS NULL
+      AND profile_pending_r2_key IS NULL)
+    OR (profile_upload_lease IS NOT NULL AND profile_upload_started_at IS NOT NULL
+      AND profile_pending_r2_key IS NOT NULL)),
   CHECK (profile_cleanup_lease IS NULL OR profile_media_status = 'deleting'),
   CHECK ((profile_cleanup_lease IS NULL AND profile_cleanup_started_at IS NULL)
     OR (profile_cleanup_lease IS NOT NULL AND profile_cleanup_started_at IS NOT NULL)),
@@ -140,9 +143,11 @@ CREATE TABLE threads_media (
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   upload_lease TEXT,
   upload_started_at INTEGER CHECK (upload_started_at IS NULL OR upload_started_at >= 0),
+  pending_r2_key TEXT,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  CHECK ((upload_lease IS NULL AND upload_started_at IS NULL)
-    OR (upload_lease IS NOT NULL AND upload_started_at IS NOT NULL)),
+  CHECK ((upload_lease IS NULL AND upload_started_at IS NULL AND pending_r2_key IS NULL)
+    OR (upload_lease IS NOT NULL AND upload_started_at IS NOT NULL
+      AND pending_r2_key IS NOT NULL)),
   UNIQUE(entry_id, source_media_id, kind, ordinal)
 );
 CREATE INDEX threads_media_entry_status_idx ON threads_media(entry_id, status, ordinal);

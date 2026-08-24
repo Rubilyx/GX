@@ -66,12 +66,14 @@ async function deletingPost(db, postId) {
 /** @param {any} db @param {string} postId */
 async function deletionRows(db, postId) {
   const media = selectRows(await db.prepare(
-    `SELECT media.source_media_id, media.kind, media.ordinal, media.r2_key
+    `SELECT media.source_media_id, media.kind, media.ordinal,
+       COALESCE(media.pending_r2_key, media.r2_key) AS r2_key
      FROM threads_media media JOIN threads_entries entry ON entry.id = media.entry_id
      JOIN threads_posts post ON post.id = entry.threads_post_id
      WHERE entry.threads_post_id = ? AND post.status = 'deleting'
-       AND media.status = 'ready' AND media.r2_key IS NOT NULL
-     ORDER BY media.r2_key`,
+       AND (media.pending_r2_key IS NOT NULL
+         OR (media.status = 'ready' AND media.r2_key IS NOT NULL))
+     ORDER BY r2_key`,
   ).bind(postId).all(), ["source_media_id", "kind", "ordinal", "r2_key"]);
   for (const row of media) {
     if (typeof row.source_media_id !== "string" || !row.source_media_id ||
@@ -101,9 +103,12 @@ async function cascadeArchive(db, postId, authors) {
     const placeholders = authors.map(() => "?").join(",");
     statements.push(db.prepare(
       `UPDATE threads_authors SET profile_media_status = 'deleting',
+         profile_r2_key = COALESCE(profile_pending_r2_key, profile_r2_key),
          profile_upload_lease = NULL, profile_upload_started_at = NULL,
+         profile_pending_r2_key = NULL,
          profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
-       WHERE threads_user_id IN (${placeholders}) AND profile_r2_key IS NOT NULL
+       WHERE threads_user_id IN (${placeholders})
+         AND (profile_r2_key IS NOT NULL OR profile_pending_r2_key IS NOT NULL)
          AND NOT EXISTS (
            SELECT 1 FROM threads_entries
            WHERE author_id = threads_authors.threads_user_id
@@ -112,6 +117,7 @@ async function cascadeArchive(db, postId, authors) {
     statements.push(db.prepare(
       `DELETE FROM threads_authors
        WHERE threads_user_id IN (${placeholders}) AND profile_r2_key IS NULL
+         AND profile_pending_r2_key IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM threads_entries
            WHERE author_id = threads_authors.threads_user_id
@@ -131,7 +137,7 @@ async function claimProfileCleanup(db, authorId, key, priorLease, priorStarted, 
   const changes = mutationChanges(await db.prepare(
     `UPDATE threads_authors SET profile_cleanup_lease = ?, profile_cleanup_started_at = ?
      WHERE threads_user_id = ? AND profile_media_status = 'deleting'
-       AND profile_upload_lease IS NULL
+       AND profile_upload_lease IS NULL AND profile_pending_r2_key IS NULL
        AND ((? IS NULL AND profile_cleanup_lease IS NULL
            AND profile_cleanup_started_at IS NULL)
          OR (profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
@@ -193,6 +199,7 @@ export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = t
            profile_r2_key = NULL, profile_content_type = NULL, profile_bytes = NULL,
            profile_etag = NULL, profile_error_code = NULL, profile_refreshed_at = NULL,
            profile_upload_lease = NULL, profile_upload_started_at = NULL,
+           profile_pending_r2_key = NULL,
            profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
            AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?

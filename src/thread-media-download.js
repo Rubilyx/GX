@@ -15,6 +15,14 @@ export class ThreadsMediaWriteError extends AppError {
   }
 }
 
+export class ThreadsMediaPutUncertainError extends AppError {
+  /** @param {string} key */
+  constructor(key) {
+    super("media_storage_unavailable", 503);
+    this.key = key;
+  }
+}
+
 /** @param {unknown} value */
 export function validateStoredEtag(value) {
   if (typeof value !== "string" || !/^"[\x21\x23-\x7e]*"$/.test(value))
@@ -158,26 +166,37 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     controller.close();
   } });
   let count = 0;
+  /** @type {AppError | null} */
+  let countedError = null;
   const counted = source.pipeThrough(new TransformStream({
     transform(chunk, controller) {
-      if (!(chunk instanceof Uint8Array))
-        throw new AppError("invalid_media_stream", 400);
-      count += chunk.byteLength;
-      if (count > input.maximumBytes) throw new AppError("media_too_large", 413);
-      controller.enqueue(chunk);
+      try {
+        if (!(chunk instanceof Uint8Array))
+          throw new AppError("invalid_media_stream", 400);
+        count += chunk.byteLength;
+        if (count > input.maximumBytes) throw new AppError("media_too_large", 413);
+        controller.enqueue(chunk);
+      } catch (error) {
+        countedError = error instanceof AppError ? error :
+          new AppError("invalid_media_stream", 400);
+        throw countedError;
+      }
     },
   }));
-  let result;
+  let rawResult;
   try {
-    result = putResult(await bucket.put(input.key, counted, {
+    rawResult = await bucket.put(input.key, counted, {
       httpMetadata: { contentType },
       onlyIf: { etagDoesNotMatch: "*" },
-    }));
+    });
   } catch (error) {
     cancelUnused(counted);
-    throw error instanceof AppError ? error :
-      new AppError("media_storage_unavailable", 503);
+    if (countedError !== null) throw countedError;
+    throw new ThreadsMediaPutUncertainError(input.key);
   }
+  let result;
+  try { result = putResult(rawResult); }
+  catch { throw new ThreadsMediaPutUncertainError(input.key); }
   const written = { key: result.key, size: result.size,
     httpEtag: result.httpEtag, contentType };
   if (result.key !== input.key || result.size !== count)

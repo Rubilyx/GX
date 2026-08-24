@@ -464,18 +464,26 @@ test("capture renders pending state, progresses through polling, and stops at re
   expect(polls).toBe(stoppedAt);
 });
 
-test("plain reply expansion loads complete quoted provenance while modified click stays native", async ({ page, context, harness }) => {
+test("plain reply expansion loads complete quoted provenance while modified click stays native", async ({ page, harness }) => {
   await seedArchive(harness, { quotedReply: true });
   await login(page);
   await page.goto("/threads");
   const link = page.locator("[data-thread-all-replies]");
   await expect(link).toHaveText("작성자 답글 12개 모두 보기");
-  const popupPromise = context.waitForEvent("page");
-  await link.click({ button: "middle" });
-  const popup = await popupPromise;
-  await popup.waitForLoadState();
-  await expect(popup).toHaveURL(new RegExp(`/threads/${POST_ID}#author-replies$`));
-  await popup.close();
+  await expect(link).toHaveAttribute("href", `/threads/${POST_ID}#author-replies`);
+  const prevented = await link.evaluate((anchor) => {
+    const panel = anchor.closest("thread-panel");
+    let defaultPrevented = true;
+    panel?.addEventListener("click", (event) => {
+      defaultPrevented = event.defaultPrevented;
+      event.preventDefault();
+    }, { once: true });
+    anchor.dispatchEvent(new MouseEvent("click", {
+      bubbles: true, cancelable: true, button: 0, ctrlKey: true,
+    }));
+    return defaultPrevented;
+  });
+  expect(prevented).toBe(false);
 
   await link.click();
   const card = page.locator("[data-thread-archive]");

@@ -29,6 +29,31 @@ const GATES = [
   "types", "css", "sourcePolicy", "unit", "integration", "browser",
   "accessibility", "noJavaScript",
 ];
+const THREADS_APP_ID = "123456789012345";
+const THREADS_SECRETS = [
+  "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
+  "PROD_SESSION_KEY", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY",
+];
+const THREADS_QUEUE_VARS = {
+  THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+  THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+  THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+  THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+};
+const THREADS_R2 = [{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }];
+const THREADS_QUEUES = {
+  producers: [
+    { binding: "THREADS_CAPTURE_QUEUE", queue: "gx-threads-capture" },
+    { binding: "THREADS_MEDIA_QUEUE", queue: "gx-threads-media" },
+  ],
+  consumers: [
+    { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
+    { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
+    { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+    { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+  ],
+};
+const THREADS_TRIGGERS = { crons: ["0 3 * * *"] };
 
 /** @param {Buffer} tar @param {string} wanted */
 function tarMode(tar, wanted) {
@@ -120,21 +145,28 @@ async function releaseRepository(context, wranglerOverrides = {}) {
       main: "src/openai.js",
       workers_dev: true,
       preview_urls: true,
-      secrets: { required: [
-        "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY",
-        "PREVIEW_PIN_SALT", "PREVIEW_PIN_DIGEST", "PREVIEW_IP_HMAC_KEY", "PREVIEW_SESSION_KEY",
-        "OPENAI_API_KEY",
-      ] },
+      secrets: { required: THREADS_SECRETS },
       d1_databases: [
         { binding: "PROD_DB", database_name: "production" },
         { binding: "PREVIEW_DB", database_name: "preview" },
       ],
       route: "legacy.example/*",
       routes: [{ pattern: "legacy.example", custom_domain: true }],
-      vars: { OLD: "value" },
+      r2_buckets: THREADS_R2,
+      queues: THREADS_QUEUES,
+      triggers: THREADS_TRIGGERS,
+      vars: THREADS_QUEUE_VARS,
       env: {
         test: {
           name: "release-fixture-test",
+          vars: {
+            THREADS_APP_ID: "test-threads-app",
+            THREADS_CAPTURE_QUEUE_NAME: "repo-atlas-test-threads-capture",
+            THREADS_MEDIA_QUEUE_NAME: "repo-atlas-test-threads-media",
+            THREADS_CAPTURE_DLQ_NAME: "repo-atlas-test-threads-capture-dlq",
+            THREADS_MEDIA_DLQ_NAME: "repo-atlas-test-threads-media-dlq",
+          },
+          secrets: { required: THREADS_SECRETS },
           d1_databases: [{
             binding: "PROD_DB",
             database_name: "release-fixture-test",
@@ -145,6 +177,23 @@ async function releaseRepository(context, wranglerOverrides = {}) {
             namespace_id: "1001",
             simple: { limit: 60, period: 60 },
           }],
+          r2_buckets: [{
+            binding: "THREADS_MEDIA",
+            bucket_name: "repo-atlas-test-threads-media",
+          }],
+          queues: {
+            producers: [
+              { binding: "THREADS_CAPTURE_QUEUE", queue: "repo-atlas-test-threads-capture" },
+              { binding: "THREADS_MEDIA_QUEUE", queue: "repo-atlas-test-threads-media" },
+            ],
+            consumers: [
+              { queue: "repo-atlas-test-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-capture-dlq" },
+              { queue: "repo-atlas-test-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-media-dlq" },
+              { queue: "repo-atlas-test-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+              { queue: "repo-atlas-test-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+            ],
+          },
+          triggers: { crons: ["0 3 * * *"] },
           services: [{ binding: "PROVIDER_FIXTURE", service: "provider-fixture" }],
         },
       },
@@ -213,6 +262,7 @@ function createOptions(parent, overrides = {}) {
     openAiModel: "gpt-5.6-terra-2026-08-01",
     temporaryRelaxation: false,
     trustedTypesMode: "report-only",
+    threadsAppId: THREADS_APP_ID,
     testSummary: join(parent, "summary.json"),
     ...overrides,
   };
@@ -664,6 +714,58 @@ test("createRelease rejects unsupported top-level production binding sections", 
   }
 });
 
+test("createRelease preserves only the exact production Threads resource graph", async (context) => {
+  const repository = await releaseRepository(context);
+  const nodeVersion = Object.getOwnPropertyDescriptor(process.versions, "node");
+  if (!nodeVersion) throw new Error("missing_node_version_descriptor");
+  Object.defineProperty(process.versions, "node", { value: "24.18.0" });
+  context.after(() => Object.defineProperty(process.versions, "node", nodeVersion));
+  const created = await createRelease(createOptions(repository.root, {
+    root: repository.root,
+    out: join(repository.root, ".release-threads"),
+    releaseId: repository.head,
+    testSummary: repository.summary,
+  }));
+  const config = JSON.parse(await readFile(join(created.payload, "wrangler.jsonc"), "utf8"));
+  assert.deepEqual(config.r2_buckets, THREADS_R2);
+  assert.deepEqual(config.queues, THREADS_QUEUES);
+  assert.deepEqual(config.triggers, THREADS_TRIGGERS);
+  assert.equal(config.env, undefined);
+  assert.deepEqual(config.secrets.required, THREADS_SECRETS);
+  assert.deepEqual(config.vars, {
+    ENVIRONMENT: "deployed",
+    PRODUCTION_HOST: "gx.zra.workers.dev",
+    OPENAI_MODEL: "gpt-5.6-terra-2026-08-01",
+    RELEASE_ID: repository.head,
+    TRUSTED_TYPES_MODE: "report-only",
+    THREADS_APP_ID,
+    ...THREADS_QUEUE_VARS,
+  });
+});
+
+test("createRelease rejects incomplete or internally inconsistent Threads resources", async (context) => {
+  /** @type {Array<[string, Record<string, any>]>} */
+  const cases = [
+    ["missing app secret", { secrets: { required: THREADS_SECRETS.filter((name) => name !== "THREADS_APP_SECRET") } }],
+    ["missing token key", { secrets: { required: THREADS_SECRETS.filter((name) => name !== "THREADS_TOKEN_KEY") } }],
+    ["queue var mismatch", { vars: { ...THREADS_QUEUE_VARS, THREADS_MEDIA_DLQ_NAME: "gx-threads-wrong-dlq" } }],
+    ["extra bucket", { r2_buckets: [...THREADS_R2, { binding: "EXTRA", bucket_name: "gx-extra" }] }],
+    ["extra producer", { queues: { ...THREADS_QUEUES, producers: [...THREADS_QUEUES.producers, { binding: "EXTRA", queue: "gx-extra" }] } }],
+    ["extra cron", { triggers: { crons: ["0 3 * * *", "0 4 * * *"] } }],
+  ];
+  for (const [name, overrides] of cases) {
+    await context.test(name, async (testContext) => {
+      const repository = await releaseRepository(testContext, overrides);
+      await assert.rejects(createRelease(createOptions(repository.root, {
+        root: repository.root,
+        out: join(repository.root, `.release-${name.replaceAll(" ", "-")}`),
+        releaseId: repository.head,
+        testSummary: repository.summary,
+      })), /invalid_wrangler_config/);
+    });
+  }
+});
+
 test("createRelease rejects a mutable model alias before creating output", async (context) => {
   const parent = await mkdtemp(join(tmpdir(), "repo-atlas-release-create-invalid-"));
   context.after(() => rm(parent, { recursive: true, force: true }));
@@ -896,29 +998,21 @@ test("createRelease allows default and outside-root outputs with repeatable arch
   assert.equal(Object.hasOwn(config, "route"), false);
   assert.equal(Object.hasOwn(config, "routes"), false);
   assert.deepEqual(config.secrets, { required: [
-    "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY",
+    ...THREADS_SECRETS,
   ] });
   assert.deepEqual(config.d1_databases, [{ binding: "PROD_DB", database_name: "production" }]);
-  assert.deepEqual(config.env.test, {
-    name: "release-fixture-test",
-    d1_databases: [{
-      binding: "PROD_DB",
-      database_name: "release-fixture-test",
-      database_id: "00000000-0000-0000-0000-000000000001",
-    }],
-    ratelimits: [{
-      name: "REPORT_RATE_LIMITER",
-      namespace_id: "1001",
-      simple: { limit: 60, period: 60 },
-    }],
-    services: [{ binding: "PROVIDER_FIXTURE", service: "provider-fixture" }],
-  });
+  assert.equal(config.env, undefined);
+  assert.deepEqual(config.r2_buckets, THREADS_R2);
+  assert.deepEqual(config.queues, THREADS_QUEUES);
+  assert.deepEqual(config.triggers, THREADS_TRIGGERS);
   assert.deepEqual(config.vars, {
     ENVIRONMENT: "deployed",
     PRODUCTION_HOST: "gx.zra.workers.dev",
     OPENAI_MODEL: "gpt-5.6-terra-2026-08-01",
     RELEASE_ID: repository.head,
     TRUSTED_TYPES_MODE: "report-only",
+    THREADS_APP_ID,
+    ...THREADS_QUEUE_VARS,
   });
   const licenses = JSON.parse(await readFile(join(first.payload, "licenses.json"), "utf8"));
   assert.deepEqual(licenses, [
@@ -1110,4 +1204,26 @@ test("release create rejects the removed staging host option", async () => {
     (error) => error instanceof Error && /** @type {any} */ (error).code === 2 &&
       /Usage:/.test(/** @type {any} */ (error).stderr),
   );
+});
+
+test("release create requires one canonical bounded decimal Threads app ID", async (context) => {
+  const script = join(process.cwd(), "scripts", "release.mjs");
+  for (const value of [undefined, "", "0", "01", "abc", "1.2", "1".repeat(33)]) {
+    await context.test(value === undefined ? "missing" : JSON.stringify(value), async () => {
+      const args = [
+        script, "create", "--release-id", RELEASE_ID,
+        "--out", join(tmpdir(), "repo-atlas-release-cli"),
+        "--production-host", "gx.zra.workers.dev",
+        "--openai-model", "gpt-5.6-terra-2026-08-01",
+        "--trusted-types-mode", "report-only",
+        "--test-summary", join(tmpdir(), "repo-atlas-release-summary.json"),
+      ];
+      if (value !== undefined) args.push("--threads-app-id", value);
+      await assert.rejects(
+        execFile(process.execPath, args, { cwd: process.cwd(), encoding: "utf8" }),
+        (error) => error instanceof Error && /** @type {any} */ (error).code === 2 &&
+          /Usage:/.test(/** @type {any} */ (error).stderr),
+      );
+    });
+  }
 });

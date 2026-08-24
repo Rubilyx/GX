@@ -94,8 +94,48 @@ const OPTIONAL_DIRECTORIES = [".github", "docs/operations"];
 const OPTIONAL_FILES = ["README.md"];
 const RELEASE_WRANGLER_SECTIONS = new Set([
   "$schema", "assets", "compatibility_date", "d1_databases", "dev", "env", "main", "name",
-  "observability", "preview_urls", "ratelimits", "route", "routes", "secrets", "vars", "workers_dev",
+  "observability", "preview_urls", "queues", "r2_buckets", "ratelimits", "route", "routes",
+  "secrets", "triggers", "vars", "workers_dev",
 ]);
+const RELEASE_SECRETS = [
+  "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
+  "PROD_SESSION_KEY", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY",
+];
+const THREADS_QUEUE_VARS = {
+  THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+  THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+  THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+  THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+};
+const THREADS_R2_BUCKETS = [{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }];
+const THREADS_QUEUES = {
+  producers: [
+    { binding: "THREADS_CAPTURE_QUEUE", queue: "gx-threads-capture" },
+    { binding: "THREADS_MEDIA_QUEUE", queue: "gx-threads-media" },
+  ],
+  consumers: [
+    { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
+    { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
+    { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+    { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+  ],
+};
+const THREADS_TRIGGERS = { crons: ["0 3 * * *"] };
+
+/** @param {unknown} left @param {unknown} right */
+const sameJson = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+
+/** @param {unknown} config */
+function validThreadsWrangler(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const value = /** @type {Record<string, any>} */ (config);
+  const secrets = Array.isArray(value.secrets?.required) ? [...value.secrets.required].sort() : [];
+  return sameJson(secrets, [...RELEASE_SECRETS].sort()) &&
+    sameJson(value.vars, THREADS_QUEUE_VARS) &&
+    sameJson(value.r2_buckets, THREADS_R2_BUCKETS) &&
+    sameJson(value.queues, THREADS_QUEUES) &&
+    sameJson(value.triggers, THREADS_TRIGGERS);
+}
 
 /** @param {unknown} value */
 function evidenceUrl(value) {
@@ -547,7 +587,7 @@ export async function verifyRelease(directory, options = {}) {
   return metadata;
 }
 
-/** @param {{ root?: string, out: string, releaseId: string, productionHost: string, openAiModel: string, temporaryRelaxation: boolean, trustedTypesMode: string, testSummary: string }} options */
+/** @param {{ root?: string, out: string, releaseId: string, productionHost: string, openAiModel: string, temporaryRelaxation: boolean, trustedTypesMode: string, threadsAppId: string, testSummary: string }} options */
 export async function createRelease(options) {
   if (typeof options.releaseId !== "string" || !RELEASE_PATTERN.test(options.releaseId))
     throw new Error("invalid_release_id");
@@ -556,6 +596,8 @@ export async function createRelease(options) {
   if (options.productionHost !== "gx.zra.workers.dev") throw new Error("invalid_hosts");
   if (options.trustedTypesMode !== "report-only" && options.trustedTypesMode !== "enforce")
     throw new Error("invalid_trusted_types_mode");
+  if (typeof options.threadsAppId !== "string" || !/^[1-9][0-9]{0,31}$/.test(options.threadsAppId))
+    throw new Error("invalid_threads_app_id");
   const root = resolve(options.root ?? process.cwd());
   if (typeof options.out !== "string" || !options.out ||
     typeof options.testSummary !== "string" || !options.testSummary)
@@ -625,24 +667,26 @@ export async function createRelease(options) {
   const unsupportedSection = Object.keys(config)
     .find((section) => !RELEASE_WRANGLER_SECTIONS.has(section));
   if (unsupportedSection) throw new Error(`unsupported_wrangler_binding:${unsupportedSection}`);
+  if (!validThreadsWrangler(config)) throw new Error("invalid_wrangler_config");
   config.workers_dev = true;
   config.preview_urls = false;
   delete config.route;
   delete config.routes;
+  delete config.env;
   const databases = Array.isArray(config.d1_databases)
     ? /** @type {any[]} */ (config.d1_databases) : [];
   const productionDatabase = databases.find((database) => database?.binding === "PROD_DB");
   if (!productionDatabase) throw new Error("invalid_wrangler_config");
   config.d1_databases = [productionDatabase];
-  config.secrets = { required: [
-    "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY",
-  ] };
+  config.secrets = { required: RELEASE_SECRETS };
   config.vars = {
     ENVIRONMENT: "deployed",
     PRODUCTION_HOST: options.productionHost,
     OPENAI_MODEL: options.openAiModel,
     RELEASE_ID: options.releaseId,
     TRUSTED_TYPES_MODE: options.trustedTypesMode,
+    THREADS_APP_ID: options.threadsAppId,
+    ...THREADS_QUEUE_VARS,
   };
   await writeFile(configPath, json(config));
 
@@ -881,12 +925,14 @@ async function runCli(argv) {
       "openai-model": { type: "string" },
       "temporary-relaxation": { type: "boolean" },
       "trusted-types-mode": { type: "string" },
+      "threads-app-id": { type: "string" },
       "test-summary": { type: "string" },
     });
     const required = requireStrings(values, [
       "release-id", "out", "production-host", "openai-model",
-      "trusted-types-mode", "test-summary",
+      "trusted-types-mode", "threads-app-id", "test-summary",
     ]);
+    if (!/^[1-9][0-9]{0,31}$/.test(required["threads-app-id"])) throw usageError();
     await createRelease({
       root: process.cwd(),
       out: required.out,
@@ -895,6 +941,7 @@ async function runCli(argv) {
       openAiModel: required["openai-model"],
       temporaryRelaxation: values["temporary-relaxation"] === true,
       trustedTypesMode: required["trusted-types-mode"],
+      threadsAppId: required["threads-app-id"],
       testSummary: required["test-summary"],
     });
     return;

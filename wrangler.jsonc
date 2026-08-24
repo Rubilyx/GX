@@ -18,9 +18,32 @@
   },
   "secrets": {
     "required": [
-      "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY"
+      "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
+      "PROD_SESSION_KEY", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY"
     ]
   },
+  "vars": {
+    "THREADS_CAPTURE_QUEUE_NAME": "gx-threads-capture",
+    "THREADS_MEDIA_QUEUE_NAME": "gx-threads-media",
+    "THREADS_CAPTURE_DLQ_NAME": "gx-threads-capture-dlq",
+    "THREADS_MEDIA_DLQ_NAME": "gx-threads-media-dlq"
+  },
+  "r2_buckets": [
+    { "binding": "THREADS_MEDIA", "bucket_name": "gx-threads-media" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "THREADS_CAPTURE_QUEUE", "queue": "gx-threads-capture" },
+      { "binding": "THREADS_MEDIA_QUEUE", "queue": "gx-threads-media" }
+    ],
+    "consumers": [
+      { "queue": "gx-threads-capture", "max_batch_size": 10, "max_retries": 3, "dead_letter_queue": "gx-threads-capture-dlq" },
+      { "queue": "gx-threads-media", "max_batch_size": 1, "max_retries": 3, "dead_letter_queue": "gx-threads-media-dlq" },
+      { "queue": "gx-threads-capture-dlq", "max_batch_size": 10, "max_retries": 0 },
+      { "queue": "gx-threads-media-dlq", "max_batch_size": 1, "max_retries": 0 }
+    ]
+  },
+  "triggers": { "crons": ["0 3 * * *"] },
   "env": {
     "test": {
       "name": "repo-atlas-test",
@@ -30,11 +53,17 @@
         "PRODUCTION_HOST": "production.repo-atlas.test",
         "OPENAI_MODEL": "test-snapshot",
         "RELEASE_ID": "test-release",
-        "TRUSTED_TYPES_MODE": "report-only"
+        "TRUSTED_TYPES_MODE": "report-only",
+        "THREADS_APP_ID": "test-threads-app",
+        "THREADS_CAPTURE_QUEUE_NAME": "repo-atlas-test-threads-capture",
+        "THREADS_MEDIA_QUEUE_NAME": "repo-atlas-test-threads-media",
+        "THREADS_CAPTURE_DLQ_NAME": "repo-atlas-test-threads-capture-dlq",
+        "THREADS_MEDIA_DLQ_NAME": "repo-atlas-test-threads-media-dlq"
       },
       "secrets": {
         "required": [
-          "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY", "OPENAI_API_KEY"
+          "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
+          "PROD_SESSION_KEY", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY"
         ]
       },
       "d1_databases": [
@@ -52,6 +81,22 @@
           "simple": { "limit": 60, "period": 60 }
         }
       ],
+      "r2_buckets": [
+        { "binding": "THREADS_MEDIA", "bucket_name": "repo-atlas-test-threads-media" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "THREADS_CAPTURE_QUEUE", "queue": "repo-atlas-test-threads-capture" },
+          { "binding": "THREADS_MEDIA_QUEUE", "queue": "repo-atlas-test-threads-media" }
+        ],
+        "consumers": [
+          { "queue": "repo-atlas-test-threads-capture", "max_batch_size": 10, "max_retries": 3, "dead_letter_queue": "repo-atlas-test-threads-capture-dlq" },
+          { "queue": "repo-atlas-test-threads-media", "max_batch_size": 1, "max_retries": 3, "dead_letter_queue": "repo-atlas-test-threads-media-dlq" },
+          { "queue": "repo-atlas-test-threads-capture-dlq", "max_batch_size": 10, "max_retries": 0 },
+          { "queue": "repo-atlas-test-threads-media-dlq", "max_batch_size": 1, "max_retries": 0 }
+        ]
+      },
+      "triggers": { "crons": ["0 3 * * *"] },
       "services": [{ "binding": "PROVIDER_FIXTURE", "service": "provider-fixture" }]
     }
   },

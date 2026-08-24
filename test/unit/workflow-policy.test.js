@@ -24,9 +24,17 @@ const allowedActions = new Set([
   "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
 ]);
 const expectedSecrets = [
-  "PROD_PIN_SALT", "PROD_PIN_DIGEST", "PROD_IP_HMAC_KEY", "PROD_SESSION_KEY",
-  "OPENAI_API_KEY",
+  "OPENAI_API_KEY", "PROD_IP_HMAC_KEY", "PROD_PIN_DIGEST", "PROD_PIN_SALT",
+  "PROD_SESSION_KEY", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY",
 ];
+const productionResources = {
+  r2: "gx-threads-media",
+  capture: "gx-threads-capture",
+  media: "gx-threads-media",
+  captureDlq: "gx-threads-capture-dlq",
+  mediaDlq: "gx-threads-media-dlq",
+  cron: "0 3 * * *",
+};
 
 /** @param {string} source */
 function runBodies(source) {
@@ -155,6 +163,52 @@ test("Cloudflare resources use the approved GX naming contract", async () => {
   assert.equal(config.env.test.name, "repo-atlas-test");
   assert.equal(config.env.test.d1_databases[0].database_name, "repo-atlas-test-production");
   assert.equal(config.env.test.d1_databases.length, 1);
+  assert.deepEqual(config.r2_buckets, [
+    { binding: "THREADS_MEDIA", bucket_name: productionResources.r2 },
+  ]);
+  assert.deepEqual(config.queues.producers, [
+    { binding: "THREADS_CAPTURE_QUEUE", queue: productionResources.capture },
+    { binding: "THREADS_MEDIA_QUEUE", queue: productionResources.media },
+  ]);
+  assert.deepEqual(config.queues.consumers, [
+    { queue: productionResources.capture, max_batch_size: 10, max_retries: 3, dead_letter_queue: productionResources.captureDlq },
+    { queue: productionResources.media, max_batch_size: 1, max_retries: 3, dead_letter_queue: productionResources.mediaDlq },
+    { queue: productionResources.captureDlq, max_batch_size: 10, max_retries: 0 },
+    { queue: productionResources.mediaDlq, max_batch_size: 1, max_retries: 0 },
+  ]);
+  assert.deepEqual(config.triggers, { crons: [productionResources.cron] });
+  assert.deepEqual(config.vars, {
+    THREADS_CAPTURE_QUEUE_NAME: productionResources.capture,
+    THREADS_MEDIA_QUEUE_NAME: productionResources.media,
+    THREADS_CAPTURE_DLQ_NAME: productionResources.captureDlq,
+    THREADS_MEDIA_DLQ_NAME: productionResources.mediaDlq,
+  });
+  assert.equal(config.vars.THREADS_APP_ID, undefined);
+  const testConfig = config.env.test;
+  assert.equal(testConfig.vars.THREADS_APP_ID, "test-threads-app");
+  assert.deepEqual(testConfig.r2_buckets, [
+    { binding: "THREADS_MEDIA", bucket_name: "repo-atlas-test-threads-media" },
+  ]);
+  assert.deepEqual(testConfig.queues.producers, [
+    { binding: "THREADS_CAPTURE_QUEUE", queue: "repo-atlas-test-threads-capture" },
+    { binding: "THREADS_MEDIA_QUEUE", queue: "repo-atlas-test-threads-media" },
+  ]);
+  assert.deepEqual(testConfig.queues.consumers, [
+    { queue: "repo-atlas-test-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-capture-dlq" },
+    { queue: "repo-atlas-test-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "repo-atlas-test-threads-media-dlq" },
+    { queue: "repo-atlas-test-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+    { queue: "repo-atlas-test-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+  ]);
+  assert.deepEqual(testConfig.triggers, { crons: [productionResources.cron] });
+  assert.deepEqual(testConfig.secrets.required, expectedSecrets);
+  const serializedTest = JSON.stringify(testConfig);
+  assert.doesNotMatch(serializedTest, /gx-threads-|gx-production|5e031f7f-52cc-495a-9cd9-e080bd0090ac|"2001"/);
+  for (const value of [
+    testConfig.d1_databases[0].database_name,
+    testConfig.r2_buckets[0].bucket_name,
+    ...testConfig.queues.producers.map((/** @type {{ queue: string }} */ row) => row.queue),
+    ...testConfig.queues.consumers.map((/** @type {{ queue: string }} */ row) => row.queue),
+  ]) assert.match(value, /^repo-atlas-test-/);
   assert.equal(JSON.parse(packageText).name, "repo-atlas");
   assert.match(release, /\["PROD_DB", "gx-production"\]/);
   for (const source of [release, rollback]) {
@@ -184,6 +238,16 @@ test("runbook documents only the steady-state production release contract", asyn
   assert.match(runbook, /previews_enabled: false/);
   assert.match(runbook, /`Release` workflow/);
   assert.match(runbook, /`Rollback` workflow/);
+  for (const value of Object.values(productionResources))
+    assert.ok(runbook.includes(value), value);
+  for (const value of [
+    "THREADS_APP_ID", "THREADS_APP_SECRET", "THREADS_TOKEN_KEY",
+    "threads_basic", "threads_profile_discovery", "threads_read_replies",
+    "0002", "0003", "0004",
+    "private", "DLQ", "reconnect",
+  ]) assert.match(runbook, new RegExp(value, "i"));
+  assert.match(runbook, /backup[\s\S]*0002[\s\S]*0003[\s\S]*0004/i);
+  assert.match(runbook, /do not (?:run|use)[^\n]*wrangler[^\n]*deploy/i);
   assert.doesNotMatch(runbook, /STAGING_|PREVIEW_|staging-gx|gx-preview|dual-runtime|Post-success|versions secret delete|d1 delete|environments\/preview|final-github-decommission|```bash/);
 });
 
@@ -195,7 +259,7 @@ test("candidate proves private subdomain state before uploading a version", asyn
   assert.match(release.slice(0, upload), /body\.result\?\.enabled !== true \|\|\s*body\.result\?\.previews_enabled !== false/);
 });
 
-test("candidate preflight binds exact five secrets to authenticated latest-version detail before upload", async () => {
+test("candidate preflight binds exact seven secrets to authenticated latest-version detail before upload", async () => {
   const release = await workflow("release");
   const list = release.indexOf("/workers/scripts/gx/versions?deployable=true&per_page=100");
   const detail = release.indexOf("/workers/scripts/gx/versions/${encodeURIComponent(latestVersionId)}");
@@ -214,8 +278,42 @@ test("candidate preflight binds exact five secrets to authenticated latest-versi
   assert.match(preflight, /resources\?\.bindings/);
   assert.match(preflight, /binding\.type === "secret_text"/);
   assert.match(preflight, /latest-version-secrets\.json/);
-  assert.match(preflight, /const required = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"\]/);
+  assert.match(preflight, /const required = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"\]/);
   assert.doesNotMatch(release, /wrangler (?:versions )?secret list|Secret Name:/);
+});
+
+test("release and rollback verify version-bound and script-level Threads resources separately", async () => {
+  const [release, rollback] = await Promise.all([workflow("release"), workflow("rollback")]);
+  for (const source of [release, rollback]) {
+    assert.match(source, /new Set\(\["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"\]\)/);
+    assert.match(source, /binding\.type === "r2_bucket"/);
+    assert.match(source, /\.bucket_name/);
+    assert.match(source, /binding\.type === "queue"/);
+    assert.match(source, /\.queue_name/);
+    assert.match(source, /workers\/scripts\/gx\/schedules/);
+    assert.match(source, /schedules\[0\]\.cron !== "0 3 \* \* \*"/);
+    assert.match(source, /\/queues\?name=/);
+    assert.match(source, /\/queues\/\$\{encodeURIComponent\(queue\.queue_id\)\}\/consumers/);
+    assert.match(source, /consumer\.script !== "gx"/);
+    assert.match(source, /consumer\.settings\?\.max_retries/);
+    assert.match(source, /consumer\.settings\?\.batch_size/);
+  }
+  for (const queue of [
+    productionResources.capture, productionResources.media,
+    productionResources.captureDlq, productionResources.mediaDlq,
+  ]) {
+    assert.ok(occurrences(release, queue) >= 2, queue);
+    assert.ok(occurrences(rollback, queue) >= 2, queue);
+  }
+  assert.match(release, /--threads-app-id "\$THREADS_APP_ID"/);
+  assert.match(release, /THREADS_APP_ID: \$\{\{ vars\.THREADS_APP_ID \}\}/);
+  assert.match(rollback, /THREADS_APP_ID: \$\{\{ vars\.THREADS_APP_ID \}\}/);
+  const releaseUpload = release.indexOf("npx wrangler versions upload --tag");
+  assert.ok(release.indexOf("latest_threads_resources_invalid") < releaseUpload);
+  assert.ok(release.lastIndexOf("production_threads_resources_invalid") > release.indexOf("npx wrangler versions deploy"));
+  const rollbackDeploy = rollback.indexOf('npx wrangler versions deploy "$WORKER_VERSION_ID@100%"');
+  assert.ok(rollback.indexOf("target_threads_resources_invalid") < rollbackDeploy);
+  assert.ok(rollback.indexOf("active_threads_resources_invalid") < rollbackDeploy);
 });
 
 test("release binds active and candidate PROD_DB before backup and immediately before mutation", async () => {
@@ -293,6 +391,10 @@ test("release validates the production-only artifact before candidate upload", a
   assert.match(guard, /config\.secrets\.required/);
   assert.match(guard, /Object\.keys\(config\.vars\)/);
   assert.match(guard, /metadata\.schema !== 2/);
+  assert.match(guard, /JSON\.stringify\(config\.r2_buckets\)/);
+  assert.match(guard, /JSON\.stringify\(config\.queues\)/);
+  assert.match(guard, /JSON\.stringify\(config\.triggers\)/);
+  assert.match(guard, /THREADS_APP_ID/);
 });
 
 test("workflows pin only the approved actions and avoid privileged triggers and runners", async () => {
@@ -349,6 +451,12 @@ test("CI has read-only permissions and records all eight gates only after the fu
   assert.match(ci, /commit:process\.env\.COMMIT/);
   for (const gate of ["types", "css", "sourcePolicy", "unit", "integration", "browser", "accessibility", "noJavaScript"])
     assert.match(ci, new RegExp(`${gate}:'passed'`));
+  const config = ci.indexOf("name: Verify exact Threads configuration");
+  const record = ci.indexOf("name: Record passed gates");
+  assert.ok(config !== -1 && config < record);
+  assert.match(ci.slice(config, record), /wrangler types worker-configuration\.d\.ts --env test --check/);
+  assert.match(ci.slice(config, record), /THREADS_CAPTURE_QUEUE_NAME/);
+  assert.match(ci.slice(config, record), /repo-atlas-test-threads-media-dlq/);
   assert.ok(ci.indexOf("Record passed gates") > ci.indexOf("npm run test:e2e"));
   assert.match(ci, /if: always\(\)[\s\S]*retention-days: 30/);
 });
@@ -556,7 +664,7 @@ test("rollback binds a newest-five immutable release to every identity before mu
   assert.doesNotMatch(rollback, /D1 remains unchanged/);
   assert.match(rollback, /metadata\.schema !== 2/);
   assert.match(rollback, /d1\.length !== 1/);
-  assert.match(rollback, /requiredSecrets = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"\]/);
+  assert.match(rollback, /requiredSecrets = \["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"\]/);
   assert.match(rollback, /expectedVars\.size/);
   assert.ok(rollback.indexOf("metadata.schema !== 2") < rollback.indexOf("npx wrangler versions deploy"));
   assert.match(rollback, /\["archiveSha256","iosEvidenceUrl","recordedAt","releaseId","safariEvidenceUrl","sourceAttestationId","temporaryRelaxation","workerVersionId"\]/);
@@ -603,11 +711,16 @@ test("runtime release gates are project-selectable and Wrangler names only known
       simple: { limit: 60, period: 60 },
     },
   ]);
-  assert.equal(config.vars, undefined);
+  assert.deepEqual(config.vars, {
+    THREADS_CAPTURE_QUEUE_NAME: productionResources.capture,
+    THREADS_MEDIA_QUEUE_NAME: productionResources.media,
+    THREADS_CAPTURE_DLQ_NAME: productionResources.captureDlq,
+    THREADS_MEDIA_DLQ_NAME: productionResources.mediaDlq,
+  });
   assert.equal(config.routes, undefined);
   assert.equal(config.route, undefined);
   assert.equal(config.hosts, undefined);
   assert.equal(config.host, undefined);
-  for (const name of ["PRODUCTION_HOST", "OPENAI_MODEL", "RELEASE_ID", "TRUSTED_TYPES_MODE"])
+  for (const name of ["PRODUCTION_HOST", "OPENAI_MODEL", "RELEASE_ID", "TRUSTED_TYPES_MODE", "THREADS_APP_ID"])
     assert.equal(config.vars?.[name], undefined);
 });

@@ -581,6 +581,10 @@ export async function startHarness() {
   };
   /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
   const outboundFetch = (input, init) => providerFixture(providerMode)(input, init);
+  const providerService = /** @type {Fetcher} */ ({
+    fetch: outboundFetch,
+    connect() { throw new Error("provider_fixture_socket_unsupported"); },
+  });
   globalThis.fetch = outboundFetch;
   /** @type {{ reject?: boolean }} */
   let assetMode = {};
@@ -598,7 +602,7 @@ export async function startHarness() {
       const { PROVIDER_FIXTURE: unusedProviderFixture, ...runtimeEnv } =
         /** @type {Env & { PROVIDER_FIXTURE?: unknown }} */ (await remoteWorker.getEnv());
       void unusedProviderFixture;
-      return runtimeEnv;
+      return { ...runtimeEnv, PROVIDER_FIXTURE: providerService };
     },
     applyD1Migrations: (name) => remoteWorker.applyD1Migrations(name),
     async fetch(input, init) {
@@ -607,7 +611,7 @@ export async function startHarness() {
         /** @type {Env & { PROVIDER_FIXTURE?: unknown }} */ (await remoteWorker.getEnv());
       void unusedProviderFixture;
       const env = {
-        ...runtimeEnv, ASSETS: assets,
+        ...runtimeEnv, ASSETS: assets, PROVIDER_FIXTURE: providerService,
         THREADS_MEDIA: mediaBucket,
         THREADS_CAPTURE_QUEUE: captureQueue,
         THREADS_MEDIA_QUEUE: mediaQueue,

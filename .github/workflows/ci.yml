@@ -27,6 +27,44 @@ jobs:
       - run: npm run test:integration
       - run: npx playwright install --with-deps chromium firefox webkit chrome msedge
       - run: npm run test:e2e
+      - name: Verify exact Threads configuration
+        run: |
+          npx wrangler types worker-configuration.d.ts --env test --check
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+          const secrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
+          const vars = {
+            THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+            THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+            THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+            THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+          };
+          const queues = {
+            producers: [
+              { binding: "THREADS_CAPTURE_QUEUE", queue: "gx-threads-capture" },
+              { binding: "THREADS_MEDIA_QUEUE", queue: "gx-threads-media" },
+            ],
+            consumers: [
+              { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
+              { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
+              { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+              { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+            ],
+          };
+          const testConfig = config.env?.test;
+          const testText = JSON.stringify(testConfig);
+          if (JSON.stringify(config.secrets?.required) !== JSON.stringify(secrets) ||
+              JSON.stringify(config.vars) !== JSON.stringify(vars) ||
+              JSON.stringify(config.r2_buckets) !== JSON.stringify([{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }]) ||
+              JSON.stringify(config.queues) !== JSON.stringify(queues) ||
+              JSON.stringify(config.triggers) !== JSON.stringify({ crons: ["0 3 * * *"] }) ||
+              testConfig?.vars?.THREADS_APP_ID !== "test-threads-app" ||
+              testConfig?.vars?.THREADS_CAPTURE_QUEUE_NAME !== "repo-atlas-test-threads-capture" ||
+              testConfig?.vars?.THREADS_MEDIA_DLQ_NAME !== "repo-atlas-test-threads-media-dlq" ||
+              /gx-threads-|gx-production/.test(testText))
+            throw new Error("threads_configuration_invalid");
+          NODE
       - name: Record passed gates
         env:
           COMMIT: ${{ github.sha }}

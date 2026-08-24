@@ -44,6 +44,11 @@ jobs:
       PRODUCTION_HOST: ${{ vars.PRODUCTION_HOST }}
       OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
       TRUSTED_TYPES_MODE: ${{ vars.TRUSTED_TYPES_MODE }}
+      THREADS_APP_ID: ${{ vars.THREADS_APP_ID }}
+      THREADS_CAPTURE_QUEUE_NAME: ${{ vars.THREADS_CAPTURE_QUEUE_NAME }}
+      THREADS_MEDIA_QUEUE_NAME: ${{ vars.THREADS_MEDIA_QUEUE_NAME }}
+      THREADS_CAPTURE_DLQ_NAME: ${{ vars.THREADS_CAPTURE_DLQ_NAME }}
+      THREADS_MEDIA_DLQ_NAME: ${{ vars.THREADS_MEDIA_DLQ_NAME }}
       SAFARI_EVIDENCE_URL: ${{ inputs.safari_evidence_url }}
       IOS_EVIDENCE_URL: ${{ inputs.ios_evidence_url }}
       TEMPORARY_RELAXATION: ${{ inputs.temporary_relaxation }}
@@ -70,7 +75,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
-          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST OPENAI_MODEL TRUSTED_TYPES_MODE OPENAI_API_KEY; do
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST OPENAI_MODEL TRUSTED_TYPES_MODE OPENAI_API_KEY THREADS_APP_ID THREADS_CAPTURE_QUEUE_NAME THREADS_MEDIA_QUEUE_NAME THREADS_CAPTURE_DLQ_NAME THREADS_MEDIA_DLQ_NAME; do
             [[ -n "${!name:-}" ]] || { echo "missing_external_prerequisite:$name" >&2; exit 1; }
           done
           [[ "$TEMPORARY_RELAXATION" = true || "$TEMPORARY_RELAXATION" = false ]] || { echo invalid_temporary_relaxation >&2; exit 1; }
@@ -95,6 +100,15 @@ jobs:
           }
           if (!["report-only", "enforce"].includes(process.env.TRUSTED_TYPES_MODE))
             throw new Error("invalid_trusted_types_mode");
+          if (!/^[1-9][0-9]{0,31}$/.test(process.env.THREADS_APP_ID)) throw new Error("invalid_threads_app_id");
+          const queues = {
+            THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+            THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+            THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+            THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+          };
+          if (Object.entries(queues).some(([name, value]) => process.env[name] !== value))
+            throw new Error("invalid_threads_queue_vars");
           NODE
       - name: Validate real production bindings
         shell: bash
@@ -120,6 +134,32 @@ jobs:
               !/^[1-9][0-9]*$/.test(limits[0].namespace_id) || limits[0].namespace_id === testNamespace ||
               limits[0].simple?.limit !== 60 || limits[0].simple?.period !== 60)
             throw new Error("missing_production_rate_limit");
+          const expectedR2 = [{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }];
+          const expectedQueues = {
+            producers: [
+              { binding: "THREADS_CAPTURE_QUEUE", queue: "gx-threads-capture" },
+              { binding: "THREADS_MEDIA_QUEUE", queue: "gx-threads-media" },
+            ],
+            consumers: [
+              { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
+              { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
+              { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+              { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+            ],
+          };
+          const expectedVars = {
+            THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+            THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+            THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+            THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+          };
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
+          if (JSON.stringify(config.r2_buckets) !== JSON.stringify(expectedR2) ||
+              JSON.stringify(config.queues) !== JSON.stringify(expectedQueues) ||
+              JSON.stringify(config.triggers) !== JSON.stringify({ crons: ["0 3 * * *"] }) ||
+              JSON.stringify(config.vars) !== JSON.stringify(expectedVars) ||
+              JSON.stringify([...(config.secrets?.required ?? [])].sort()) !== JSON.stringify(requiredSecrets))
+            throw new Error("invalid_threads_resources");
           NODE
       - run: npm ci
       - name: Verify approved model exists
@@ -163,8 +203,8 @@ jobs:
           mkdir -p artifacts
           npx wrangler d1 info PROD_DB --json --env="" --config wrangler.jsonc > artifacts/prod-db.json
           node --input-type=module <<'NODE'
-          import { writeFile } from "node:fs/promises";
-          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          import { readFile, writeFile } from "node:fs/promises";
+          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
           const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
           const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
           const versionsUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/gx/versions?deployable=true&per_page=100`;
@@ -194,12 +234,75 @@ jobs:
           const names = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding?.name).sort();
           if (new Set(names).size !== names.length || JSON.stringify(names) !== JSON.stringify(required))
             throw new Error("latest_version_secret_set_invalid");
+          const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
+          if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
+            throw new Error("unsupported_worker_binding_type");
+          const assets = bindings.filter((binding) => binding.type === "assets");
+          const d1 = bindings.filter((binding) => binding.type === "d1");
+          const limiters = bindings.filter((binding) => binding.type === "ratelimit");
+          const r2 = bindings.filter((binding) => binding.type === "r2_bucket");
+          const queues = bindings.filter((binding) => binding.type === "queue");
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
+          const expectedD1 = config.d1_databases[0];
+          const expectedLimiter = config.ratelimits[0];
+          const expectedVars = new Map(Object.entries({
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
+          }));
+          if (assets.length !== 1 || assets[0].name !== "ASSETS" ||
+              d1.length !== 1 || d1[0].name !== "PROD_DB" || d1[0].id !== expectedD1.database_id ||
+              limiters.length !== 1 || limiters[0].name !== expectedLimiter.name ||
+              limiters[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiters[0].simple?.limit !== 60 || limiters[0].simple?.period !== 60 ||
+              r2.length !== 1 || r2[0].name !== "THREADS_MEDIA" || r2[0].bucket_name !== "gx-threads-media" ||
+              queues.length !== 2 ||
+              queues.some((binding) => ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name) ||
+              variables.length !== 10 || expectedVars.size !== 5 ||
+              variables.some((binding) => expectedVars.has(binding.name) && expectedVars.get(binding.name) !== binding.text) ||
+              [...expectedVars].some(([name]) => !variables.some((binding) => binding.name === name)) ||
+              new Set(variables.map((binding) => binding.name)).size !== variables.length ||
+              !variables.some((binding) => binding.name === "ENVIRONMENT" && binding.text === "deployed") ||
+              !variables.some((binding) => binding.name === "PRODUCTION_HOST" && binding.text === "gx.zra.workers.dev") ||
+              !variables.some((binding) => binding.name === "RELEASE_ID" && /^[0-9a-f]{40}$/.test(binding.text)) ||
+              !variables.some((binding) => binding.name === "OPENAI_MODEL" && /^gpt-5\.6-terra(?:-[a-z0-9._-]*[a-z0-9])?$/.test(binding.text)) ||
+              !variables.some((binding) => binding.name === "TRUSTED_TYPES_MODE" && ["report-only", "enforce"].includes(binding.text)))
+            throw new Error("latest_threads_resources_invalid");
+          const api = async (path) => {
+            const readback = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}${path}`, { headers });
+            let payload;
+            try { payload = await readback.json(); } catch { payload = null; }
+            if (readback.status !== 200 || payload?.success !== true || !Array.isArray(payload.errors) || payload.errors.length)
+              throw new Error("latest_threads_resources_invalid");
+            return payload.result;
+          };
+          const scheduleResult = await api("/workers/scripts/gx/schedules");
+          const schedules = scheduleResult?.schedules;
+          if (!Array.isArray(schedules) || schedules.length !== 1 || schedules[0].cron !== "0 3 * * *")
+            throw new Error("latest_threads_resources_invalid");
+          for (const expected of config.queues.consumers) {
+            const queueRows = await api(`/queues?name=${encodeURIComponent(expected.queue)}`);
+            if (!Array.isArray(queueRows) || queueRows.length !== 1 || queueRows[0].queue_name !== expected.queue ||
+                !/^[0-9a-f-]{32,36}$/.test(queueRows[0].queue_id)) throw new Error("latest_threads_resources_invalid");
+            const queue = queueRows[0];
+            const consumerRows = await api(`/queues/${encodeURIComponent(queue.queue_id)}/consumers`);
+            if (!Array.isArray(consumerRows) || consumerRows.length !== 1) throw new Error("latest_threads_resources_invalid");
+            const consumer = consumerRows[0];
+            if (consumer.type !== "worker" || consumer.script !== "gx" ||
+                (consumer.dead_letter_queue ?? null) !== (expected.dead_letter_queue ?? null) ||
+                consumer.settings?.max_retries !== expected.max_retries ||
+                consumer.settings?.batch_size !== expected.max_batch_size)
+              throw new Error("latest_threads_resources_invalid");
+          }
           await writeFile("artifacts/latest-version-secrets.json", `${JSON.stringify({ versionId: latestVersionId, secrets: names }, null, 2)}\n`);
           NODE
           npx wrangler versions upload --dry-run --strict --experimental-provision=false --experimental-auto-create=false --env="" --config wrangler.jsonc
           node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
-          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const required = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
           const [config, production, inventory] = await Promise.all([
             readFile("wrangler.jsonc", "utf8").then(JSON.parse),
             readFile("artifacts/prod-db.json", "utf8").then(JSON.parse),
@@ -221,7 +324,7 @@ jobs:
           node -e "const fs=require('node:fs');fs.mkdirSync('artifacts',{recursive:true});fs.writeFileSync('artifacts/test-summary.json',JSON.stringify({commit:process.env.GITHUB_SHA,gates:{types:'passed',css:'passed',sourcePolicy:'passed',unit:'passed',integration:'passed',browser:'passed',accessibility:'passed',noJavaScript:'passed'}},null,2)+'\n')"
           create_args=()
           [[ "$TEMPORARY_RELAXATION" = true ]] && create_args+=(--temporary-relaxation)
-          node scripts/release.mjs create --release-id "$GITHUB_SHA" --out .release --production-host "$PRODUCTION_HOST" --openai-model "$OPENAI_MODEL" --trusted-types-mode "$TRUSTED_TYPES_MODE" --test-summary artifacts/test-summary.json "${create_args[@]}"
+          node scripts/release.mjs create --release-id "$GITHUB_SHA" --out .release --production-host "$PRODUCTION_HOST" --openai-model "$OPENAI_MODEL" --trusted-types-mode "$TRUSTED_TYPES_MODE" --threads-app-id "$THREADS_APP_ID" --test-summary artifacts/test-summary.json "${create_args[@]}"
           node scripts/release.mjs verify --dir .release/payload
           node --input-type=module <<'NODE'
           import { readFile } from "node:fs/promises";
@@ -230,14 +333,36 @@ jobs:
             readFile(".release/payload/release-metadata.json", "utf8").then(JSON.parse),
           ]);
           const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
-          const secrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
-          const vars = ["ENVIRONMENT","OPENAI_MODEL","PRODUCTION_HOST","RELEASE_ID","TRUSTED_TYPES_MODE"];
+          const secrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
+          const vars = ["ENVIRONMENT","OPENAI_MODEL","PRODUCTION_HOST","RELEASE_ID","THREADS_APP_ID","THREADS_CAPTURE_DLQ_NAME","THREADS_CAPTURE_QUEUE_NAME","THREADS_MEDIA_DLQ_NAME","THREADS_MEDIA_QUEUE_NAME","TRUSTED_TYPES_MODE"];
+          const expectedR2 = [{ binding: "THREADS_MEDIA", bucket_name: "gx-threads-media" }];
+          const expectedQueues = {
+            producers: [
+              { binding: "THREADS_CAPTURE_QUEUE", queue: "gx-threads-capture" },
+              { binding: "THREADS_MEDIA_QUEUE", queue: "gx-threads-media" },
+            ],
+            consumers: [
+              { queue: "gx-threads-capture", max_batch_size: 10, max_retries: 3, dead_letter_queue: "gx-threads-capture-dlq" },
+              { queue: "gx-threads-media", max_batch_size: 1, max_retries: 3, dead_letter_queue: "gx-threads-media-dlq" },
+              { queue: "gx-threads-capture-dlq", max_batch_size: 10, max_retries: 0 },
+              { queue: "gx-threads-media-dlq", max_batch_size: 1, max_retries: 0 },
+            ],
+          };
           if (metadata.schema !== 2 || config.name !== "gx" || config.workers_dev !== true || config.preview_urls !== false ||
               JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
               !Array.isArray(config.d1_databases) || config.d1_databases.length !== 1 ||
               config.d1_databases[0]?.binding !== "PROD_DB" ||
               JSON.stringify([...config.secrets.required].sort()) !== JSON.stringify(secrets) ||
               JSON.stringify(Object.keys(config.vars).sort()) !== JSON.stringify(vars) ||
+              config.vars.THREADS_APP_ID !== process.env.THREADS_APP_ID ||
+              config.vars.THREADS_CAPTURE_QUEUE_NAME !== process.env.THREADS_CAPTURE_QUEUE_NAME ||
+              config.vars.THREADS_MEDIA_QUEUE_NAME !== process.env.THREADS_MEDIA_QUEUE_NAME ||
+              config.vars.THREADS_CAPTURE_DLQ_NAME !== process.env.THREADS_CAPTURE_DLQ_NAME ||
+              config.vars.THREADS_MEDIA_DLQ_NAME !== process.env.THREADS_MEDIA_DLQ_NAME ||
+              JSON.stringify(config.r2_buckets) !== JSON.stringify(expectedR2) ||
+              JSON.stringify(config.queues) !== JSON.stringify(expectedQueues) ||
+              JSON.stringify(config.triggers) !== JSON.stringify({ crons: ["0 3 * * *"] }) ||
+              Object.hasOwn(config, "env") ||
               Object.hasOwn(config, "route") || Object.hasOwn(config, "routes"))
             throw new Error("generated_worker_subdomain_config_invalid");
           NODE
@@ -314,7 +439,7 @@ jobs:
           if (version.id !== process.env.WORKER_VERSION_ID ||
               version.annotations?.["workers/tag"] !== process.env.GITHUB_SHA || !Array.isArray(bindings))
             throw new Error("candidate_version_binding_mismatch");
-          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
           if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
             throw new Error("unsupported_worker_binding_type");
           const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
@@ -332,7 +457,13 @@ jobs:
               limiters[0].namespace_id !== expectedLimiter.namespace_id ||
               limiters[0].simple?.limit !== 60 || limiters[0].simple?.period !== 60)
             throw new Error("candidate_version_binding_mismatch");
-          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY"];
+          const r2 = bindings.filter((binding) => binding.type === "r2_bucket");
+          const queues = bindings.filter((binding) => binding.type === "queue");
+          if (r2.length !== 1 || r2[0].name !== "THREADS_MEDIA" || r2[0].bucket_name !== "gx-threads-media" ||
+              queues.length !== 2 || queues.some((binding) =>
+                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name))
+            throw new Error("candidate_version_binding_mismatch");
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
           const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
           if (JSON.stringify(secrets) !== JSON.stringify(requiredSecrets))
             throw new Error("candidate_version_binding_mismatch");
@@ -342,9 +473,16 @@ jobs:
             PRODUCTION_HOST: process.env.PRODUCTION_HOST,
             RELEASE_ID: process.env.GITHUB_SHA,
             TRUSTED_TYPES_MODE: process.env.TRUSTED_TYPES_MODE,
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
           }));
           const variables = bindings.filter((binding) => binding.type === "plain_text");
-          if (variables.length !== expectedVars.size || variables.some((binding) => expectedVars.get(binding.name) !== binding.text))
+          if (expectedVars.size !== 10 || variables.length !== expectedVars.size ||
+              variables.some((binding) => expectedVars.get(binding.name) !== binding.text) ||
+              new Set(variables.map((binding) => binding.name)).size !== variables.length)
             throw new Error("candidate_version_binding_mismatch");
           NODE
       - name: Bind immutable deployment record
@@ -425,6 +563,11 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       PRODUCTION_HOST: ${{ vars.PRODUCTION_HOST }}
+      THREADS_APP_ID: ${{ vars.THREADS_APP_ID }}
+      THREADS_CAPTURE_QUEUE_NAME: ${{ vars.THREADS_CAPTURE_QUEUE_NAME }}
+      THREADS_MEDIA_QUEUE_NAME: ${{ vars.THREADS_MEDIA_QUEUE_NAME }}
+      THREADS_CAPTURE_DLQ_NAME: ${{ vars.THREADS_CAPTURE_DLQ_NAME }}
+      THREADS_MEDIA_DLQ_NAME: ${{ vars.THREADS_MEDIA_DLQ_NAME }}
       TEMPORARY_RELAXATION: ${{ inputs.temporary_relaxation }}
       ARCHIVE_SHA256: ${{ needs.candidate.outputs.archive_sha256 }}
       RECORD_ATTESTATION_ID: ${{ needs.candidate.outputs.record_attestation_id }}
@@ -452,7 +595,7 @@ jobs:
           if [[ -n "${CLOUDFLARE_ENV:-}" ]]; then exit 1; fi
           test "$GITHUB_REF" = "refs/heads/main"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST PRODUCTION_SMOKE_PIN D1_BACKUP_ENCRYPTION_KEY ARCHIVE_SHA256 RECORD_ATTESTATION_ID SOURCE_ATTESTATION_ID WORKER_VERSION_ID; do
+          for name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN PRODUCTION_HOST PRODUCTION_SMOKE_PIN D1_BACKUP_ENCRYPTION_KEY ARCHIVE_SHA256 RECORD_ATTESTATION_ID SOURCE_ATTESTATION_ID WORKER_VERSION_ID THREADS_APP_ID THREADS_CAPTURE_QUEUE_NAME THREADS_MEDIA_QUEUE_NAME THREADS_CAPTURE_DLQ_NAME THREADS_MEDIA_DLQ_NAME; do
             [[ -n "${!name:-}" ]] || { echo "missing_external_prerequisite:$name" >&2; exit 1; }
           done
           [[ "$PRODUCTION_SMOKE_PIN" =~ ^[0-9]{6}$ ]] || { echo invalid_production_smoke_pin >&2; exit 1; }
@@ -465,6 +608,15 @@ jobs:
           const decoded = /^[A-Za-z0-9+/]{43}=$/.test(value) ? Buffer.from(value, "base64") : null;
           if (!decoded || decoded.length !== 32 || decoded.toString("base64") !== value)
             throw new Error("backup_encryption_key_invalid");
+          if (!/^[1-9][0-9]{0,31}$/.test(process.env.THREADS_APP_ID)) throw new Error("invalid_threads_app_id");
+          const queues = {
+            THREADS_CAPTURE_QUEUE_NAME: "gx-threads-capture",
+            THREADS_MEDIA_QUEUE_NAME: "gx-threads-media",
+            THREADS_CAPTURE_DLQ_NAME: "gx-threads-capture-dlq",
+            THREADS_MEDIA_DLQ_NAME: "gx-threads-media-dlq",
+          };
+          if (Object.entries(queues).some(([name, queue]) => process.env[name] !== queue))
+            throw new Error("invalid_threads_queue_vars");
           NODE
           test "$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
           node --input-type=module <<'NODE'
@@ -498,12 +650,18 @@ jobs:
           import { readFile } from "node:fs/promises";
           const record = JSON.parse(await readFile(".release/deployment-record.json", "utf8"));
           const metadata = JSON.parse(await readFile(".release/payload/release-metadata.json", "utf8"));
+          const config = JSON.parse(await readFile(".release/payload/wrangler.jsonc", "utf8"));
           if (record.releaseId !== process.env.GITHUB_SHA || metadata.releaseId !== process.env.GITHUB_SHA ||
               metadata.productionHost !== process.env.PRODUCTION_HOST ||
               metadata.schema !== 2 ||
               record.archiveSha256 !== process.env.ARCHIVE_SHA256 ||
               record.sourceAttestationId !== process.env.SOURCE_ATTESTATION_ID ||
-              record.workerVersionId !== process.env.WORKER_VERSION_ID ||
+               record.workerVersionId !== process.env.WORKER_VERSION_ID ||
+              config.vars?.THREADS_APP_ID !== process.env.THREADS_APP_ID ||
+              config.vars?.THREADS_CAPTURE_QUEUE_NAME !== process.env.THREADS_CAPTURE_QUEUE_NAME ||
+              config.vars?.THREADS_MEDIA_QUEUE_NAME !== process.env.THREADS_MEDIA_QUEUE_NAME ||
+              config.vars?.THREADS_CAPTURE_DLQ_NAME !== process.env.THREADS_CAPTURE_DLQ_NAME ||
+              config.vars?.THREADS_MEDIA_DLQ_NAME !== process.env.THREADS_MEDIA_DLQ_NAME ||
               record.temporaryRelaxation !== metadata.temporaryRelaxation ||
               record.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true") ||
               metadata.temporaryRelaxation !== (process.env.TEMPORARY_RELAXATION === "true"))
@@ -520,6 +678,41 @@ jobs:
           let body;
           try { body = await response.json(); } catch { body = null; }
           if (response.status !== 200 || body?.enabled !== true) throw new Error("immutable_releases_disabled");
+          NODE
+      - name: Verify active Threads script resources
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const config = JSON.parse(await readFile(".release/verify/wrangler.jsonc", "utf8"));
+          const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
+          const api = async (path) => {
+            const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}${path}`, { headers });
+            let body;
+            try { body = await response.json(); } catch { body = null; }
+            if (response.status !== 200 || body?.success !== true || !Array.isArray(body.errors) || body.errors.length)
+              throw new Error("active_threads_resources_invalid");
+            return body.result;
+          };
+          const scheduleResult = await api("/workers/scripts/gx/schedules");
+          const schedules = scheduleResult?.schedules;
+          if (!Array.isArray(schedules) || schedules.length !== 1 || schedules[0].cron !== "0 3 * * *")
+            throw new Error("active_threads_resources_invalid");
+          for (const expected of config.queues.consumers) {
+            const rows = await api(`/queues?name=${encodeURIComponent(expected.queue)}`);
+            if (!Array.isArray(rows) || rows.length !== 1 || rows[0].queue_name !== expected.queue ||
+                !/^[0-9a-f-]{32,36}$/.test(rows[0].queue_id)) throw new Error("active_threads_resources_invalid");
+            const queue = rows[0];
+            const consumers = await api(`/queues/${encodeURIComponent(queue.queue_id)}/consumers`);
+            if (!Array.isArray(consumers) || consumers.length !== 1) throw new Error("active_threads_resources_invalid");
+            const consumer = consumers[0];
+            if (consumer.type !== "worker" || consumer.script !== "gx" ||
+                (consumer.dead_letter_queue ?? null) !== (expected.dead_letter_queue ?? null) ||
+                consumer.settings?.max_retries !== expected.max_retries ||
+                consumer.settings?.batch_size !== expected.max_batch_size)
+              throw new Error("active_threads_resources_invalid");
+          }
           NODE
       - id: previous
         name: Verify previous known-good or first release
@@ -568,16 +761,43 @@ jobs:
           if (version.id !== process.env.ACTIVE_WORKER_VERSION_ID) throw new Error("active_predecessor_version_mismatch");
           const bindings = version.resources?.bindings;
           if (!Array.isArray(bindings)) throw new Error("active_prod_db_binding_mismatch");
-          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
           if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
             throw new Error("unsupported_worker_binding_type");
           const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
           const assets = bindings.filter((binding) => binding.type === "assets");
           const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
           const candidateProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          const limiters = bindings.filter((binding) => binding.type === "ratelimit");
+          const expectedLimiter = config.ratelimits[0];
+          const r2 = bindings.filter((binding) => binding.type === "r2_bucket");
+          const queues = bindings.filter((binding) => binding.type === "queue");
+          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
+          const threadVars = new Map(Object.entries({
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
+          }));
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
           if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
               assets.length !== 1 || assets[0].name !== expectedAssets.binding ||
-              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id)
+              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id ||
+              limiters.length !== 1 || limiters[0].name !== expectedLimiter.name ||
+              limiters[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiters[0].simple?.limit !== 60 || limiters[0].simple?.period !== 60 ||
+              r2.length !== 1 || r2[0].name !== "THREADS_MEDIA" || r2[0].bucket_name !== "gx-threads-media" ||
+              queues.length !== 2 || queues.some((binding) =>
+                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name) ||
+              JSON.stringify(secrets) !== JSON.stringify(requiredSecrets) ||
+              variables.length !== 10 || variables.some((binding) => threadVars.has(binding.name) && threadVars.get(binding.name) !== binding.text) ||
+              [...threadVars].some(([name]) => !variables.some((binding) => binding.name === name)) ||
+              new Set(variables.map((binding) => binding.name)).size !== variables.length ||
+              !variables.some((binding) => binding.name === "ENVIRONMENT" && binding.text === "deployed") ||
+              !variables.some((binding) => binding.name === "PRODUCTION_HOST" && binding.text === "gx.zra.workers.dev") ||
+              !variables.some((binding) => binding.name === "RELEASE_ID" && /^[0-9a-f]{40}$/.test(binding.text)))
             throw new Error("active_prod_db_binding_mismatch");
           if (ids.length === 0) process.exit(0);
           const id = version.annotations?.["workers/tag"];
@@ -767,16 +987,40 @@ jobs:
           const bindings = version.resources?.bindings;
           if (version.id !== process.env.ACTIVE_WORKER_VERSION_ID || !Array.isArray(bindings))
             throw new Error("active_prod_db_binding_changed");
-          const allowedTypes = new Set(["assets","d1","ratelimit","secret_text","plain_text"]);
+          const allowedTypes = new Set(["assets","d1","queue","r2_bucket","ratelimit","secret_text","plain_text"]);
           if (bindings.some((binding) => !allowedTypes.has(binding?.type)))
             throw new Error("unsupported_worker_binding_type");
           const expectedAssets = { binding: "ASSETS", directory: "./public", run_worker_first: true };
           const assets = bindings.filter((binding) => binding.type === "assets");
           const activeProd = bindings.filter((binding) => binding.type === "d1" && binding.name === "PROD_DB");
           const candidateProd = config.d1_databases?.filter((binding) => binding.binding === "PROD_DB");
+          const limiters = bindings.filter((binding) => binding.type === "ratelimit");
+          const expectedLimiter = config.ratelimits[0];
+          const r2 = bindings.filter((binding) => binding.type === "r2_bucket");
+          const queues = bindings.filter((binding) => binding.type === "queue");
+          const requiredSecrets = ["OPENAI_API_KEY","PROD_IP_HMAC_KEY","PROD_PIN_DIGEST","PROD_PIN_SALT","PROD_SESSION_KEY","THREADS_APP_SECRET","THREADS_TOKEN_KEY"];
+          const secrets = bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort();
+          const expectedVars = new Map(Object.entries({
+            THREADS_APP_ID: process.env.THREADS_APP_ID,
+            THREADS_CAPTURE_QUEUE_NAME: process.env.THREADS_CAPTURE_QUEUE_NAME,
+            THREADS_MEDIA_QUEUE_NAME: process.env.THREADS_MEDIA_QUEUE_NAME,
+            THREADS_CAPTURE_DLQ_NAME: process.env.THREADS_CAPTURE_DLQ_NAME,
+            THREADS_MEDIA_DLQ_NAME: process.env.THREADS_MEDIA_DLQ_NAME,
+          }));
+          const variables = bindings.filter((binding) => binding.type === "plain_text");
           if (JSON.stringify(config.assets) !== JSON.stringify(expectedAssets) ||
               assets.length !== 1 || assets[0].name !== expectedAssets.binding ||
-              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id)
+              candidateProd?.length !== 1 || activeProd.length !== 1 || activeProd[0].id !== candidateProd[0].database_id ||
+              limiters.length !== 1 || limiters[0].name !== expectedLimiter.name ||
+              limiters[0].namespace_id !== expectedLimiter.namespace_id ||
+              limiters[0].simple?.limit !== 60 || limiters[0].simple?.period !== 60 ||
+              r2.length !== 1 || r2[0].name !== "THREADS_MEDIA" || r2[0].bucket_name !== "gx-threads-media" ||
+              queues.length !== 2 || queues.some((binding) =>
+                ({ THREADS_CAPTURE_QUEUE: "gx-threads-capture", THREADS_MEDIA_QUEUE: "gx-threads-media" })[binding.name] !== binding.queue_name) ||
+              JSON.stringify(secrets) !== JSON.stringify(requiredSecrets) ||
+              variables.length !== 10 || variables.some((binding) => expectedVars.has(binding.name) && expectedVars.get(binding.name) !== binding.text) ||
+              [...expectedVars].some(([name]) => !variables.some((binding) => binding.name === name)) ||
+              new Set(variables.map((binding) => binding.name)).size !== variables.length)
             throw new Error("active_prod_db_binding_changed");
           NODE
       - name: Apply expand-contract migrations
@@ -809,6 +1053,37 @@ jobs:
         run: |
           npx wrangler deployments status --json --env="" --config .release/deploy.jsonc > .release/promotion-status.json
           node -e "const p=require('./.release/promotion-status.json');if(p?.versions?.length!==1||p.versions[0].version_id!==process.env.WORKER_VERSION_ID||p.versions[0].percentage!==100)throw Error('promotion_version_mismatch')"
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const config = JSON.parse(await readFile(".release/verify/wrangler.jsonc", "utf8"));
+          const headers = { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` };
+          const api = async (path) => {
+            const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(process.env.CLOUDFLARE_ACCOUNT_ID)}${path}`, { headers });
+            let body;
+            try { body = await response.json(); } catch { body = null; }
+            if (response.status !== 200 || body?.success !== true || !Array.isArray(body.errors) || body.errors.length)
+              throw new Error("production_threads_resources_invalid");
+            return body.result;
+          };
+          const scheduleResult = await api("/workers/scripts/gx/schedules");
+          const schedules = scheduleResult?.schedules;
+          if (!Array.isArray(schedules) || schedules.length !== 1 || schedules[0].cron !== "0 3 * * *")
+            throw new Error("production_threads_resources_invalid");
+          for (const expected of config.queues.consumers) {
+            const rows = await api(`/queues?name=${encodeURIComponent(expected.queue)}`);
+            if (!Array.isArray(rows) || rows.length !== 1 || rows[0].queue_name !== expected.queue ||
+                !/^[0-9a-f-]{32,36}$/.test(rows[0].queue_id)) throw new Error("production_threads_resources_invalid");
+            const queue = rows[0];
+            const consumers = await api(`/queues/${encodeURIComponent(queue.queue_id)}/consumers`);
+            if (!Array.isArray(consumers) || consumers.length !== 1) throw new Error("production_threads_resources_invalid");
+            const consumer = consumers[0];
+            if (consumer.type !== "worker" || consumer.script !== "gx" ||
+                (consumer.dead_letter_queue ?? null) !== (expected.dead_letter_queue ?? null) ||
+                consumer.settings?.max_retries !== expected.max_retries ||
+                consumer.settings?.batch_size !== expected.max_batch_size)
+              throw new Error("production_threads_resources_invalid");
+          }
+          NODE
           [[ "$PROMOTE_OUTCOME" = success ]] || { echo promotion_command_failed >&2; exit 1; }
       - id: production_data
         name: Resolve production detail requirement

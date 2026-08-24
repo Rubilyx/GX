@@ -298,6 +298,54 @@ test("second activation cancels a loading reply expansion without restarting it"
   await expect(link).toBeFocused();
 });
 
+test("cancelling an expanded reply refresh preserves its nodes and collapse label", async ({ page, harness }) => {
+  await seedArchive(harness, { status: "collecting" });
+  await login(page);
+  let pageRequests = 0;
+  /** @type {() => void} */
+  let refreshStartedResolve = () => {};
+  /** @type {Promise<void>} */
+  const refreshStarted = new Promise((resolve) => { refreshStartedResolve = resolve; });
+  /** @type {() => void} */
+  let releaseRefreshResolve = () => {};
+  /** @type {Promise<void>} */
+  const releaseRefresh = new Promise((resolve) => { releaseRefreshResolve = resolve; });
+  await page.route(new RegExp(`/threads/${POST_ID}\\?repliesPage=1$`), async (route) => {
+    pageRequests += 1;
+    if (pageRequests === 1) return route.fallback();
+    refreshStartedResolve();
+    await releaseRefresh;
+    await route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify(detail(POST_ID, "ready", 12)),
+    });
+  });
+  await page.route(new RegExp(`/threads/${POST_ID}$`), async (route, request) => {
+    if (!request.headers().accept?.includes("application/json")) return route.fallback();
+    await route.fulfill({
+      status: 200, contentType: "application/json", headers: { ETag: '"terminal"' },
+      body: JSON.stringify(detail(POST_ID, "ready", 12)),
+    });
+  });
+  await page.goto("/threads");
+  const card = page.locator("[data-thread-archive]");
+  const link = card.locator("[data-thread-all-replies]");
+  await link.click();
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(12);
+  await expect(link).toHaveText("작성자 답글 12개 접기");
+  await refreshStarted;
+  await link.click();
+  releaseRefreshResolve();
+  await page.waitForTimeout(300);
+  expect(pageRequests).toBe(2);
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(12);
+  await expect(link).toHaveText("작성자 답글 12개 접기");
+  await expect(link).toBeFocused();
+  await link.click();
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(3);
+  await expect(link).toHaveText("작성자 답글 12개 모두 보기");
+});
+
 test("sync invalidates a delayed old-generation poll before scheduling the new generation", async ({ page, harness }) => {
   await seedArchive(harness, { status: "pending", replies: 0 });
   await login(page);

@@ -532,7 +532,8 @@ class ThreadPanel extends HTMLElement {
       state.expansionController = null;
       state.loading = false;
       link.removeAttribute("aria-busy");
-      link.textContent = `작성자 답글 ${link.dataset.threadTotal ?? ""}개 모두 보기`;
+      link.textContent = `작성자 답글 ${link.dataset.threadTotal ?? ""}개 ${
+        state.expanded ? "접기" : "모두 보기"}`;
       return;
     }
     if (state.expanded) {

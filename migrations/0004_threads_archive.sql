@@ -5,7 +5,7 @@ CREATE TABLE threads_authors (
   username TEXT NOT NULL,
   display_name TEXT NOT NULL,
   profile_media_status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (profile_media_status IN ('pending', 'ready', 'error')),
+    CHECK (profile_media_status IN ('pending', 'ready', 'error', 'deleting')),
   profile_r2_key TEXT,
   profile_content_type TEXT,
   profile_etag TEXT,

@@ -355,7 +355,8 @@ async function aggregateRow(db, postId, generation) {
      FROM threads_posts p JOIN threads_sync_jobs j
        ON j.threads_post_id = p.id AND j.generation = ?
      WHERE p.id = ? AND p.sync_generation = ? AND p.status <> 'deleting'
-       AND j.status = 'media_pending' AND j.content_completed_at IS NOT NULL
+       AND j.status IN ('media_pending','ready','partial','error')
+       AND j.content_completed_at IS NOT NULL
        AND j.profile_completed = 1 AND j.conversation_completed = 1
        AND j.capture_lease IS NULL
        AND j.pending_quote_count = 0`,
@@ -402,7 +403,8 @@ export async function recalculateThreadsStatus(db, input) {
          WHERE id = ? AND sync_generation = ? AND status <> 'deleting'
            AND EXISTS (
              SELECT 1 FROM threads_sync_jobs WHERE threads_post_id = ? AND generation = ?
-               AND status = 'media_pending' AND content_completed_at IS NOT NULL
+               AND status IN ('media_pending','ready','partial','error')
+               AND content_completed_at IS NOT NULL
                AND profile_completed = 1 AND conversation_completed = 1
                AND capture_lease IS NULL
                AND pending_quote_count = 0
@@ -414,7 +416,8 @@ export async function recalculateThreadsStatus(db, input) {
         `UPDATE threads_sync_jobs SET status = ?, expected_entry_count = ?,
            expected_media_count = ?, ready_media_count = ?, failed_media_count = ?,
            error_code = ?, completed_at = ?, updated_at = ?
-         WHERE threads_post_id = ? AND generation = ? AND status = 'media_pending'
+         WHERE threads_post_id = ? AND generation = ?
+           AND status IN ('media_pending','ready','partial','error')
            AND content_completed_at IS NOT NULL AND profile_completed = 1
            AND conversation_completed = 1 AND capture_lease IS NULL
            AND pending_quote_count = 0

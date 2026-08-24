@@ -1,5 +1,9 @@
 import { createTestHarness } from "wrangler";
 import { handleThreadsCaptureMessage } from "../../src/threads-capture.js";
+import {
+  deleteThreadsArchive, handleThreadsMediaMessage,
+} from "../../src/thread-media.js";
+import { recalculateThreadsStatus } from "../../src/threads.js";
 import { handleRequest } from "../../src/worker.js";
 import { validateCaptureMessage, validateMediaMessage } from "../../src/threads-domain.js";
 
@@ -204,7 +208,7 @@ export async function seedNamedRepositories(db, count, options = {}) {
   }
 }
 
-/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number | number[]>, threadsRetryAfter?: string, threadsDebug?: Record<string, any>, mediaBodies?: Record<string, BodyInit>, calls?: Array<{ method: string, path: string }> }} [options] */
+/** @param {{ metadata?: Record<string, any>, analysis?: typeof analysisFixture, metadataStatus?: number, metadataRetryAfter?: string, openAiStatus?: number, readmeStatus?: number, beforeOpenAi?: () => unknown, openAiGate?: Promise<unknown>, threadsProfilePages?: unknown, threadsConversationPages?: unknown, threadsMedia?: Record<string, any>, threadsStatus?: number | Record<string, number | number[]>, threadsRetryAfter?: string, threadsDebug?: Record<string, any>, mediaBodies?: Record<string, BodyInit | { body: BodyInit, status?: number, headers?: HeadersInit }>, calls?: Array<{ method: string, path: string }> }} [options] */
 export function providerFixture(options = {}) {
   const {
   metadata = metadataFixture,
@@ -330,11 +334,21 @@ export function providerFixture(options = {}) {
       calls?.push({ method, path });
       return statusResponse("conversation") ?? Response.json(page);
     }
-    if (url.origin === "https://scontent.cdninstagram.com" && method === "GET" && !url.search && /^\/[^/]+$/.test(url.pathname) && !request.headers.get("authorization")) {
+    if (["cdninstagram.com", "fbcdn.net"].some((host) =>
+      url.hostname === host || url.hostname.endsWith(`.${host}`)) &&
+      method === "GET" && !url.port && !url.search && /^\/[^/]+$/.test(url.pathname) &&
+      !request.headers.get("authorization")) {
       const object = decodeURIComponent(url.pathname.slice(1));
       if (!(object in mediaBodies)) return unexpected();
       calls?.push({ method, path });
-      return new Response(mediaBodies[object]);
+      const value = mediaBodies[object];
+      if (value && typeof value === "object" && !(value instanceof Blob) &&
+        !(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value) &&
+        !(value instanceof ReadableStream) && Object.hasOwn(value, "body")) {
+        const spec = /** @type {{ body: BodyInit, status?: number, headers?: HeadersInit }} */ (value);
+        return new Response(spec.body, { status: spec.status, headers: spec.headers });
+      }
+      return new Response(/** @type {BodyInit} */ (value));
     }
     return unexpected();
   };
@@ -497,6 +511,66 @@ export async function startHarness() {
   });
   const captureQueue = queue(captureMessages, validateCaptureMessage, "captureReject");
   const mediaQueue = queue(mediaMessages, validateMediaMessage, "mediaReject");
+  /** @type {Map<string, { key: string, bytes: Uint8Array, size: number,
+   * httpEtag: string, etag: string, httpMetadata: { contentType?: string } }>} */
+  const r2Objects = new Map();
+  let r2Mode = { putReject: false, getReject: false, deleteReject: false };
+  const mediaBucket = {
+    /** @param {string} key @param {ReadableStream<Uint8Array>} body
+     * @param {{ httpMetadata?: { contentType?: string } }} [options] */
+    async put(key, body, options = {}) {
+      if (r2Mode.putReject) throw new Error("test_r2_put_rejection");
+      if (!(body instanceof ReadableStream)) throw new Error("test_r2_stream_required");
+      const reader = body.getReader();
+      /** @type {Uint8Array[]} */
+      const chunks = [];
+      let size = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!(value instanceof Uint8Array)) throw new Error("test_r2_byte_chunk_required");
+        chunks.push(value); size += value.byteLength;
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      const httpEtag = `"r2-${size}"`;
+      const object = {
+        key, bytes, size, httpEtag, etag: `r2-${size}`,
+        httpMetadata: { ...options.httpMetadata },
+      };
+      r2Objects.set(key, object);
+      return { ...object, bytes: undefined };
+    },
+    /** @param {string} key @param {{ range?: { offset: number, length: number } }} [options] */
+    async get(key, options = {}) {
+      if (r2Mode.getReject) throw new Error("test_r2_get_rejection");
+      const object = r2Objects.get(key);
+      if (!object) return null;
+      const offset = options.range?.offset ?? 0;
+      const length = options.range?.length ?? object.size;
+      const selected = object.bytes.slice(offset, offset + length);
+      return {
+        key: object.key, size: object.size, etag: object.etag,
+        httpEtag: object.httpEtag, httpMetadata: { ...object.httpMetadata },
+        range: options.range ? { offset, length: selected.byteLength } : undefined,
+        body: new Blob([selected]).stream(),
+      };
+    },
+    /** @param {string} key */
+    async head(key) {
+      const object = r2Objects.get(key);
+      return object ? {
+        key: object.key, size: object.size, etag: object.etag,
+        httpEtag: object.httpEtag, httpMetadata: { ...object.httpMetadata },
+      } : null;
+    },
+    /** @param {string | string[]} keys */
+    async delete(keys) {
+      if (r2Mode.deleteReject) throw new Error("test_r2_delete_rejection");
+      for (const key of Array.isArray(keys) ? keys : [keys]) r2Objects.delete(key);
+    },
+  };
   /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
   const outboundFetch = (input, init) => providerFixture(providerMode)(input, init);
   globalThis.fetch = outboundFetch;
@@ -537,6 +611,22 @@ export async function startHarness() {
       mediaReject: options.mediaReject === true,
     };
   }
+  /** @param {{ putReject?: boolean, getReject?: boolean, deleteReject?: boolean }} options */
+  async function setR2Mode(options) {
+    r2Mode = {
+      putReject: options.putReject === true,
+      getReject: options.getReject === true,
+      deleteReject: options.deleteReject === true,
+    };
+  }
+  function mediaObjects() {
+    return [...r2Objects.values()].sort((left, right) => left.key.localeCompare(right.key))
+      .map((object) => ({
+        key: object.key, bytes: new Uint8Array(object.bytes), size: object.size,
+        httpEtag: object.httpEtag, etag: object.etag,
+        httpMetadata: { ...object.httpMetadata },
+      }));
+  }
   /** @param {{ reject?: boolean }} options */
   async function setAssetMode(options) { assetMode = { ...options }; }
   /** @param {{ getAccessToken?: () => Promise<Record<string, unknown>>, nowSeconds?: number, signal?: AbortSignal, deleteArchive?: (message: Record<string, unknown>) => Promise<unknown> }} [options] */
@@ -551,13 +641,39 @@ export async function startHarness() {
         db: env.PROD_DB, captureQueue, mediaQueue, fetcher: outboundFetch,
         getAccessToken: options.getAccessToken ?? (async () => ({ accessToken: "long-token" })),
         nowSeconds: options.nowSeconds ?? 4_000, signal: options.signal,
-        deleteArchive: options.deleteArchive ?? (async () => ({ action: "ack" })),
+        deleteArchive: options.deleteArchive ?? ((message) => deleteThreadsArchive(message, {
+          db: env.PROD_DB, bucket: mediaBucket,
+        })),
       });
       processed += 1;
       if (result.action === "retry") {
         retries += 1;
         captureMessages.push(validateCaptureMessage(structuredClone(message)));
       } else if (result.action !== "ack") throw new Error("test_invalid_capture_action");
+    }
+    return { processed, retries };
+  }
+  /** @param {{ getAccessToken?: () => Promise<Record<string, unknown>>,
+   * nowSeconds?: number, signal?: AbortSignal, maximumBytes?: number }} [options] */
+  async function drainMediaQueue(options = {}) {
+    const env = await worker.getEnv();
+    let processed = 0;
+    let retries = 0;
+    while (mediaMessages.length) {
+      if (processed >= 500) throw new Error("test_media_queue_did_not_quiesce");
+      const message = mediaMessages.shift();
+      const result = await handleThreadsMediaMessage(message, {
+        db: env.PROD_DB, bucket: mediaBucket, fetcher: outboundFetch,
+        getAccessToken: options.getAccessToken ?? (async () => ({ accessToken: "long-token" })),
+        recalculateStatus: recalculateThreadsStatus,
+        nowSeconds: options.nowSeconds ?? 4_000, signal: options.signal,
+        maximumBytes: options.maximumBytes,
+      });
+      processed += 1;
+      if (result.action === "retry") {
+        retries += 1;
+        mediaMessages.push(validateMediaMessage(structuredClone(message)));
+      } else if (result.action !== "ack") throw new Error("test_invalid_media_action");
     }
     return { processed, retries };
   }
@@ -572,6 +688,8 @@ export async function startHarness() {
     captureMessages.length = 0;
     mediaMessages.length = 0;
     queueMode = { captureReject: false, mediaReject: false };
+    r2Objects.clear();
+    r2Mode = { putReject: false, getReject: false, deleteReject: false };
     assetMode = {};
     await remoteWorker.applyD1Migrations("PROD_DB");
     const env = await worker.getEnv();
@@ -585,8 +703,9 @@ export async function startHarness() {
   }
   return {
     get url() { return url; },
-    server, worker, captureQueue, mediaQueue, captureMessages, mediaMessages,
-    setProviderMode, setQueueMode, setAssetMode, drainCaptureQueue,
+    server, worker, captureQueue, mediaQueue, captureMessages, mediaMessages, mediaBucket,
+    setProviderMode, setQueueMode, setR2Mode, setAssetMode,
+    drainCaptureQueue, drainMediaQueue, mediaObjects,
     providerCalls, reset, close,
   };
 }

@@ -606,7 +606,16 @@ export async function startHarness() {
       const { PROVIDER_FIXTURE: unusedProviderFixture, ...runtimeEnv } =
         /** @type {Env & { PROVIDER_FIXTURE?: unknown }} */ (await remoteWorker.getEnv());
       void unusedProviderFixture;
-      const env = { ...runtimeEnv, ASSETS: assets };
+      const env = {
+        ...runtimeEnv, ASSETS: assets,
+        THREADS_MEDIA: mediaBucket,
+        THREADS_CAPTURE_QUEUE: captureQueue,
+        THREADS_MEDIA_QUEUE: mediaQueue,
+        THREADS_CAPTURE_QUEUE_NAME: "repo-atlas-test-threads-capture",
+        THREADS_MEDIA_QUEUE_NAME: "repo-atlas-test-threads-media",
+        THREADS_CAPTURE_DLQ_NAME: "repo-atlas-test-threads-capture-dlq",
+        THREADS_MEDIA_DLQ_NAME: "repo-atlas-test-threads-media-dlq",
+      };
       return handleRequest(request, env, { waitUntil() {} }, providerFixture(providerMode));
     },
   };

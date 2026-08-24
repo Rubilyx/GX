@@ -20,6 +20,9 @@ test("accepts only exact bucketed RUM payloads", () => {
     valueBucket: "300-999", dimension: "none",
   });
   assert.equal(parseTelemetry({
+    eventType: "navigation", metricName: "navigation_duration", value: 321,
+  }, "/threads/:id", "release-1").routeTemplate, "/threads/:id");
+  assert.equal(parseTelemetry({
     eventType: "web_vital", metricName: "LCP", value: 4_001,
   }, "/", "release-1").valueBucket, "poor");
   assert.equal(parseTelemetry({
@@ -125,6 +128,13 @@ test("reduces legacy and Reporting API CSP reports without returning private URL
       "document-uri": "https://production.repo-atlas.test/",
     },
   }, "/", "release-1").dimension, "img-src:self");
+  assert.equal(parseCspReport({
+    "csp-report": {
+      "violated-directive": "media-src",
+      "blocked-uri": "https://production.repo-atlas.test/threads/private/media/private",
+      "document-uri": "https://production.repo-atlas.test/threads/private",
+    },
+  }, "/threads/:id", "release-1").dimension, "media-src:self");
   assert.equal(parseCspReport({
     "csp-report": {
       "violated-directive": "connect-src",

@@ -2,10 +2,13 @@ import { AppError } from "./domain.js";
 
 const ROUTES = new Set([
   "/login", "/", "/repositories/:id", "/repositories/:id/notes", "/health",
+  "/threads", "/threads/:id", "/threads/:id/sync", "/threads/:id/delete",
+  "/threads/:id/media/:mediaId", "/threads/:id/media/:mediaId/retry",
+  "/threads/connect", "/threads/oauth/callback", "/threads/disconnect",
 ]);
 const CLIENT_CODES = new Set(["network_error", "invalid_response", "dialog_error", "other"]);
 const DIRECTIVES = new Set([
-  "script-src", "script-src-elem", "style-src", "img-src", "connect-src",
+  "script-src", "script-src-elem", "style-src", "img-src", "media-src", "connect-src",
   "form-action", "frame-ancestors", "base-uri", "require-trusted-types-for", "trusted-types",
 ]);
 const TELEMETRY_KEYS = new Set(["eventType", "metricName", "value", "code"]);

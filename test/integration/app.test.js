@@ -783,7 +783,7 @@ test("page CSP, Trusted Types rollout, and global security headers are exact", a
   const session = await login(harness.worker);
   const appPage = await harness.worker.fetch(`${origin}/`, { headers: { Cookie: session.cookie } });
   assert.equal(appPage.headers.get("content-security-policy"),
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; report-uri /csp-report");
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; report-uri /csp-report");
   assert.equal(appPage.headers.get("content-security-policy-report-only"),
     "require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
 
@@ -792,7 +792,7 @@ test("page CSP, Trusted Types rollout, and global security headers are exact", a
     headers: { Cookie: session.cookie },
   }), { ...env, TRUSTED_TYPES_MODE: "enforce" }, { waitUntil() {} }, providerFixture());
   assert.equal(enforced.headers.get("content-security-policy"),
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; require-trusted-types-for 'script'; trusted-types 'none'; report-uri /csp-report");
   assert.equal(enforced.headers.get("content-security-policy-report-only"), null);
 
   for (const response of [loginPage, appPage, enforced, await harness.worker.fetch(`${origin}/health`)]) {
@@ -1073,7 +1073,7 @@ test("global authentication locks aggregate once while public response and logs 
         Object.getPrototypeOf(record) === Object.prototype, true);
       assert.deepEqual(Object.keys(record), [
         "requestId", "routeTemplate", "status", "latencyMs",
-        "githubStatus", "openAiStatus", "errorCode",
+        "githubStatus", "openAiStatus", "threadsStatus", "errorCode",
       ]);
       assert.match(record.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
       assert.equal(new Set([
@@ -1086,6 +1086,9 @@ test("global authentication locks aggregate once while public response and logs 
         .has(record.githubStatus), true);
       assert.equal(new Set(["none", "ok", "not_found", "rate_limited", "error"])
         .has(record.openAiStatus), true);
+      assert.equal(new Set([
+        "none", "ok", "not_found", "rate_limited", "reconnect_required", "error",
+      ]).has(record.threadsStatus), true);
       assert.equal(new Set([
         "none", "bad_request", "unauthorized", "not_found", "method_not_allowed",
         "conflict", "rate_limited", "server_error",

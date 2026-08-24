@@ -6,6 +6,7 @@ import {
 import { AppError, CATEGORIES, parseListQuery, parseNotePage } from "./domain.js";
 import {
   renderIndexPage, renderLoginPage, renderRepositoryNotesPage, renderRepositoryPage,
+  renderThreadsDetailPage, renderThreadsIndexPage,
 } from "./html.js";
 import {
   createRepositoryNote, deleteRepositoryNote, getRepositoryNoteSummary,
@@ -16,14 +17,37 @@ import {
   refreshRepositoryActivity, updateRepository,
 } from "./repositories.js";
 import { parseCspReport, parseTelemetry, recordTelemetry } from "./telemetry.js";
+import {
+  createThreadsSync, getThreadsArchive, listThreadsArchives, recalculateThreadsStatus,
+  startThreadsDeletion,
+} from "./threads.js";
+import {
+  beginThreadsOAuth, clearThreadsOAuthCookie, disconnectThreads, finishThreadsOAuth,
+  getThreadsAccessToken, refreshStoredThreadsCredential,
+} from "./threads-oauth.js";
+import {
+  parseThreadsDetailQuery, parseThreadsListQuery, validateCaptureMessage,
+  validateMediaMessage,
+} from "./threads-domain.js";
+import {
+  handleThreadsCaptureDeadLetter, handleThreadsCaptureMessage,
+} from "./threads-capture.js";
+import {
+  deleteThreadsArchive, handleThreadsMediaDeadLetter, handleThreadsMediaMessage,
+  serveThreadsMedia,
+} from "./thread-media.js";
 
 const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(activity|refresh|delete))?$/;
 const REPOSITORY_NOTES_PATH =
   /^\/repositories\/([0-9a-f-]+)\/notes(?:\/([0-9a-f-]+)(?:\/(delete))?)?$/;
+const THREADS_POST_PATH = /^\/threads\/([0-9a-f-]+)(?:\/(sync|delete))?$/;
+const THREADS_MEDIA_PATH =
+  /^\/threads\/([0-9a-f-]+)\/media\/([0-9a-f-]+)(?:\/(retry))?$/;
 const ASSET_PATH = /^\/assets\/([^/]+)\/([^/]+)$/;
 const ASSETS = new Set([
   "layers.css", "tokens.css", "core.css", "login.css", "repositories.css",
-  "app.js", "dom.js", "repo-capture.js", "repo-filter.js", "repo-panel.js", "favicon.svg",
+  "threads.css", "app.js", "dom.js", "repo-capture.js", "repo-filter.js", "repo-panel.js",
+  "favicon.svg",
 ]);
 const FLASH = new Set([
   "repository_created", "repository_already_saved", "repository_updated",
@@ -31,10 +55,15 @@ const FLASH = new Set([
   "repository_activity_refreshed", "repository_refreshed", "repository_analysis_error",
   "repository_deleted",
 ]);
+const THREADS_FLASH = new Set([
+  "threads_connected", "threads_disconnected", "threads_capture_queued",
+  "threads_sync_queued", "threads_retry_queued", "threads_delete_queued",
+]);
 const COOKIE_EXPIRED = "__Host-repo_atlas_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
 const LOGIN_CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; connect-src 'none'; report-uri /csp-report";
-const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; trusted-types 'none'";
+const THREADS_DAILY_CRON = "0 3 * * *";
 
 /**
  * @typedef {object} Runtime
@@ -51,6 +80,16 @@ const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; trusted-types 'no
  * @property {string} releaseId
  * @property {string} trustedTypesMode
  * @property {RateLimit | undefined} reportRateLimiter
+ * @property {unknown} threadsMedia
+ * @property {unknown} threadsCaptureQueue
+ * @property {unknown} threadsMediaQueue
+ * @property {unknown} threadsAppId
+ * @property {unknown} threadsAppSecret
+ * @property {unknown} threadsTokenKey
+ * @property {unknown} threadsCaptureQueueName
+ * @property {unknown} threadsMediaQueueName
+ * @property {unknown} threadsCaptureDlqName
+ * @property {unknown} threadsMediaDlqName
  */
 
 /**
@@ -69,7 +108,32 @@ const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; trusted-types 'no
  * @property {RateLimit} [REPORT_RATE_LIMITER]
  * @property {string} [ENVIRONMENT]
  * @property {{ fetch(request: Request): Promise<Response> }} [PROVIDER_FIXTURE]
+ * @property {unknown} [THREADS_MEDIA]
+ * @property {unknown} [THREADS_CAPTURE_QUEUE]
+ * @property {unknown} [THREADS_MEDIA_QUEUE]
+ * @property {unknown} [THREADS_APP_ID]
+ * @property {unknown} [THREADS_APP_SECRET]
+ * @property {unknown} [THREADS_TOKEN_KEY]
+ * @property {unknown} [THREADS_CAPTURE_QUEUE_NAME]
+ * @property {unknown} [THREADS_MEDIA_QUEUE_NAME]
+ * @property {unknown} [THREADS_CAPTURE_DLQ_NAME]
+ * @property {unknown} [THREADS_MEDIA_DLQ_NAME]
  */
+
+/** @typedef {{ get(...args: any[]): any, head(...args: any[]): any, put(...args: any[]): any, delete(...args: any[]): any }} ThreadsBucket */
+/** @typedef {{ send(message: unknown, options?: unknown): Promise<unknown> | unknown }} ThreadsQueue */
+/** @typedef {Runtime & {
+ * threadsMedia: ThreadsBucket,
+ * threadsCaptureQueue: ThreadsQueue,
+ * threadsMediaQueue: ThreadsQueue,
+ * threadsAppId: string,
+ * threadsAppSecret: string,
+ * threadsTokenKey: string,
+ * threadsCaptureQueueName: string,
+ * threadsMediaQueueName: string,
+ * threadsCaptureDlqName: string,
+ * threadsMediaDlqName: string
+ * }} ThreadsRuntime */
 
 function hostError() {
   const error = new Error("host_not_allowed");
@@ -97,6 +161,16 @@ export function selectRuntime(hostname, env) {
     releaseId: env.RELEASE_ID,
     trustedTypesMode: env.TRUSTED_TYPES_MODE,
     reportRateLimiter: env.REPORT_RATE_LIMITER,
+    threadsMedia: env.THREADS_MEDIA,
+    threadsCaptureQueue: env.THREADS_CAPTURE_QUEUE,
+    threadsMediaQueue: env.THREADS_MEDIA_QUEUE,
+    threadsAppId: env.THREADS_APP_ID,
+    threadsAppSecret: env.THREADS_APP_SECRET,
+    threadsTokenKey: env.THREADS_TOKEN_KEY,
+    threadsCaptureQueueName: env.THREADS_CAPTURE_QUEUE_NAME,
+    threadsMediaQueueName: env.THREADS_MEDIA_QUEUE_NAME,
+    threadsCaptureDlqName: env.THREADS_CAPTURE_DLQ_NAME,
+    threadsMediaDlqName: env.THREADS_MEDIA_DLQ_NAME,
   };
 }
 
@@ -199,6 +273,8 @@ function safeErrorResponse(error, wantsJson, runtime, pathname) {
   const extra = {};
   if (typeof retryAfter === "number" && Number.isFinite(retryAfter) &&
     Number.isInteger(retryAfter) && retryAfter > 0) extra["Retry-After"] = String(retryAfter);
+  if (safe.details?.setCookie === clearThreadsOAuthCookie())
+    extra["Set-Cookie"] = clearThreadsOAuthCookie();
   if (wantsJson) return json({ errorCode: safe.code }, safe.status, extra);
   if (pathname === "/session")
     return html(renderLoginPage({ releaseId: runtime.releaseId, errorCode: safe.code }),
@@ -276,6 +352,9 @@ function pageRoute(raw, allowedOrigin, errorCode) {
     if (url.origin !== allowedOrigin || url.username || url.password) appError(errorCode, 400);
     if (url.pathname === "/" || url.pathname === "/login" || url.pathname === "/health")
       return url.pathname;
+    if (url.pathname === "/threads") return "/threads";
+    if (THREADS_MEDIA_PATH.test(url.pathname)) return "/threads/:id/media/:mediaId";
+    if (THREADS_POST_PATH.test(url.pathname)) return "/threads/:id";
     if (REPOSITORY_NOTES_PATH.test(url.pathname)) return "/repositories/:id/notes";
     if (/^\/repositories\/[^/]+$/.test(url.pathname)) return "/repositories/:id";
   } catch (error) {
@@ -375,6 +454,17 @@ function flashFrom(url, allowedKeys, errorCode = "invalid_list_query") {
   return flash;
 }
 
+/** @param {URL} url @param {Set<string>} allowedKeys @param {string} errorCode */
+function threadsFlashFrom(url, allowedKeys, errorCode) {
+  for (const key of url.searchParams.keys()) {
+    if (!allowedKeys.has(key) || url.searchParams.getAll(key).length !== 1)
+      appError(errorCode, 400);
+  }
+  const flash = url.searchParams.get("flash") ?? "";
+  if (flash && !THREADS_FLASH.has(flash)) appError(errorCode, 400);
+  return flash;
+}
+
 /** @param {URL} url */
 function indexQuery(url) {
   const flash = flashFrom(url, new Set(["q", "category", "tag", "page", "flash"]));
@@ -391,21 +481,139 @@ function noteQuery(url) {
   return { ...parseNotePage(clean), flash };
 }
 
+/** @param {URL} url */
+function threadsListQuery(url) {
+  const flash = threadsFlashFrom(url, new Set(["page", "flash"]), "invalid_threads_query");
+  const clean = new URL(url);
+  clean.searchParams.delete("flash");
+  return { ...parseThreadsListQuery(clean), flash };
+}
+
+/** @param {URL} url */
+function threadsDetailQuery(url) {
+  const flash = threadsFlashFrom(
+    url, new Set(["repliesPage", "flash"]), "invalid_threads_query",
+  );
+  const clean = new URL(url);
+  clean.searchParams.delete("flash");
+  return { ...parseThreadsDetailQuery(clean), flash };
+}
+
 /** @param {Runtime} runtime @param {typeof fetch} fetcher */
 function dependencies(runtime, fetcher) {
   return { fetcher, openAiApiKey: runtime.openAiApiKey, openAiModel: runtime.openAiModel };
 }
 
-/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} repositoryMatch @param {RegExpExecArray | null} notesMatch */
-function knownRoute(method, pathname, repositoryMatch, notesMatch) {
+/** @param {Runtime} runtime @returns {ThreadsRuntime} */
+function requireThreadsRuntime(runtime) {
+  const db = runtime.db;
+  const bucket = runtime.threadsMedia;
+  const captureQueue = runtime.threadsCaptureQueue;
+  const mediaQueue = runtime.threadsMediaQueue;
+  const strings = [
+    runtime.threadsAppId, runtime.threadsAppSecret, runtime.threadsTokenKey,
+    runtime.threadsCaptureQueueName, runtime.threadsMediaQueueName,
+    runtime.threadsCaptureDlqName, runtime.threadsMediaDlqName,
+  ];
+  const queueNames = strings.slice(3);
+  if (!db || typeof db !== "object" || typeof db.prepare !== "function" ||
+    typeof db.batch !== "function" || !bucket || typeof bucket !== "object" ||
+    !["get", "head", "put", "delete"].every((name) =>
+      typeof /** @type {Record<string, unknown>} */ (bucket)[name] === "function") ||
+    !captureQueue || typeof captureQueue !== "object" ||
+    typeof /** @type {Record<string, unknown>} */ (captureQueue).send !== "function" ||
+    !mediaQueue || typeof mediaQueue !== "object" ||
+    typeof /** @type {Record<string, unknown>} */ (mediaQueue).send !== "function" ||
+    strings.some((value) => typeof value !== "string" || !value) ||
+    new Set(queueNames).size !== queueNames.length) appError("threads_unavailable", 503);
+  const configured = /** @type {ThreadsRuntime} */ (runtime);
+  return configured;
+}
+
+/** @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher @param {number} nowSeconds */
+function threadsTokenInput(runtime, fetcher, nowSeconds) {
+  return {
+    appId: runtime.threadsAppId, tokenKey: runtime.threadsTokenKey,
+    nowSeconds, fetcher,
+  };
+}
+
+/** @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher @param {number} nowSeconds */
+async function threadsConnection(runtime, fetcher, nowSeconds) {
+  try {
+    await getThreadsAccessToken(runtime.db, threadsTokenInput(runtime, fetcher, nowSeconds));
+    return { connected: true, reconnectRequired: false };
+  } catch (error) {
+    if (error instanceof AppError && error.code === "threads_reconnect_required")
+      return { connected: false, reconnectRequired: true };
+    throw error;
+  }
+}
+
+/** @param {string} postId @param {any} author */
+function threadsAuthorJson(postId, author) {
+  if (!author) return null;
+  const profile = author.profileMedia ? { ...author.profileMedia } : null;
+  if (profile?.status === "ready") profile.url = `/threads/${postId}/media/${author.id}`;
+  return { ...author, profileMedia: profile };
+}
+
+/** @param {string} postId @param {any} entry @returns {any} */
+function threadsEntryJson(postId, entry) {
+  if (!entry) return null;
+  return {
+    ...entry,
+    author: threadsAuthorJson(postId, entry.author),
+    media: (entry.media ?? []).map((/** @type {any} */ item) => ({
+      ...item,
+      url: item.status === "ready" ? `/threads/${postId}/media/${item.id}` : null,
+      retryUrl: item.status === "error"
+        ? `/threads/${postId}/media/${item.id}/retry` : null,
+    })),
+    quote: threadsEntryJson(postId, entry.quote),
+  };
+}
+
+/** @param {any} archive */
+function threadsArchiveJson(archive) {
+  const postId = archive.id;
+  return {
+    ...archive,
+    author: threadsAuthorJson(postId, archive.author),
+    root: threadsEntryJson(postId, archive.root),
+    quote: threadsEntryJson(postId, archive.quote),
+    firstReplies: (archive.firstReplies ?? []).map(
+      (/** @type {any} */ entry) => threadsEntryJson(postId, entry)),
+  };
+}
+
+/** @param {string} id */
+function threadsActions(id) {
+  return {
+    detail: `/threads/${id}`, sync: `/threads/${id}/sync`, delete: `/threads/${id}/delete`,
+  };
+}
+
+/** @param {any} archive */
+function threadsEtag(archive) {
+  return `"threads-${archive.syncGeneration}-${archive.status}-${archive.updatedAt}"`;
+}
+
+/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} repositoryMatch @param {RegExpExecArray | null} notesMatch @param {RegExpExecArray | null} threadsPostMatch @param {RegExpExecArray | null} threadsMediaMatch */
+function knownRoute(method, pathname, repositoryMatch, notesMatch,
+  threadsPostMatch, threadsMediaMatch) {
   const fixed = new Map([
     ["/health", ["GET"]], ["/login", ["GET"]], ["/session", ["POST"]],
     ["/session/logout", ["POST"]], ["/", ["GET"]], ["/repositories", ["POST"]],
     ["/telemetry", ["POST"]], ["/csp-report", ["POST"]],
+    ["/threads", ["GET", "POST"]], ["/threads/connect", ["GET"]],
+    ["/threads/oauth/callback", ["GET"]], ["/threads/disconnect", ["POST"]],
   ]);
   const allowed = fixed.get(pathname) ?? (notesMatch
     ? (notesMatch[2] ? ["POST"] : ["GET", "POST"])
-    : repositoryMatch ? (repositoryMatch[2] ? ["POST"] : ["GET", "POST"]) : null);
+    : repositoryMatch ? (repositoryMatch[2] ? ["POST"] : ["GET", "POST"])
+      : threadsMediaMatch ? (threadsMediaMatch[3] ? ["POST"] : ["GET", "HEAD"])
+        : threadsPostMatch ? (threadsPostMatch[2] ? ["POST"] : ["GET"]) : null);
   if (!allowed) return null;
   if (!allowed.includes(method)) return empty(405, { Allow: allowed.join(", ") });
   return false;
@@ -581,6 +789,128 @@ async function mutate(request, runtime, fetcher, id, action, wantsJson) {
   return wantsJson ? json({ repositoryId: id }) : redirect("/?flash=repository_deleted");
 }
 
+/** @param {Request} request @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher @param {any} session @param {boolean} wantsJson @param {URL} url */
+async function threadsListRoute(request, runtime, fetcher, session, wantsJson, url) {
+  if (request.method === "POST") {
+    const form = await parseForm(request, 16_384, new Set(["csrf", "url"]));
+    await requireAuthenticatedMutation(request, runtime, form);
+    const result = await createThreadsSync(
+      runtime.db, runtime.threadsCaptureQueue, requiredString(form, "url"),
+      Math.floor(Date.now() / 1_000),
+    );
+    if (wantsJson) return json(result);
+    const flash = result.generation === 1 ? "threads_capture_queued" : "threads_sync_queued";
+    return redirect(`/threads/${result.threadsPostId}?flash=${flash}`);
+  }
+  const { page, flash } = threadsListQuery(url);
+  const result = await listThreadsArchives(runtime.db, { page });
+  const connection = await threadsConnection(runtime, fetcher, Math.floor(Date.now() / 1_000));
+  if (wantsJson) return json({
+    archives: result.archives.map(threadsArchiveJson), page: result.page,
+    totalPages: result.totalPages, total: result.total, ...connection,
+  });
+  return html(renderThreadsIndexPage({
+    releaseId: runtime.releaseId, modulePreloads,
+    csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
+    ...result, ...connection, flash,
+  }), 200, {}, "app", runtime.trustedTypesMode);
+}
+
+/** @param {URL} url @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher @param {any} session @param {string} id @param {boolean} wantsJson @param {Request} request */
+async function threadsDetailRoute(url, runtime, fetcher, session, id, wantsJson, request) {
+  const { repliesPage, flash } = threadsDetailQuery(url);
+  const result = await getThreadsArchive(runtime.db, id, { repliesPage });
+  if (!result) appError("threads_archive_not_found", 404);
+  if (wantsJson) {
+    const etag = threadsEtag(result.archive);
+    if (request.headers.get("If-None-Match") === etag)
+      return empty(304, { ETag: etag });
+    return json({
+      archive: threadsArchiveJson(result.archive),
+      replies: result.replies.map((entry) => threadsEntryJson(id, entry)),
+      repliesPage: result.repliesPage, totalReplyPages: result.totalReplyPages,
+      totalReplies: result.totalReplies, actions: threadsActions(id),
+    }, 200, { ETag: etag });
+  }
+  const connection = await threadsConnection(runtime, fetcher, Math.floor(Date.now() / 1_000));
+  return html(renderThreadsDetailPage({
+    releaseId: runtime.releaseId, modulePreloads,
+    csrfToken: await createCsrfToken(session, runtime.sessionSigningKey),
+    ...result, ...connection, flash,
+  }), 200, {}, "app", runtime.trustedTypesMode);
+}
+
+/** @param {any} entry @param {string} mediaId @returns {boolean} */
+function failedMediaInEntry(entry, mediaId) {
+  if (!entry) return false;
+  return (entry.media ?? []).some((/** @type {any} */ item) =>
+    item.id === mediaId && item.status === "error") ||
+    failedMediaInEntry(entry.quote, mediaId);
+}
+
+/** @param {ThreadsRuntime} runtime @param {string} postId @param {string} mediaId */
+async function failedMedia(runtime, postId, mediaId) {
+  let page = 1;
+  while (true) {
+    const detail = await getThreadsArchive(runtime.db, postId, { repliesPage: page });
+    if (!detail) return null;
+    if (failedMediaInEntry(detail.archive.root, mediaId) ||
+      detail.replies.some((entry) => failedMediaInEntry(entry, mediaId)))
+      return detail.archive;
+    if (page >= detail.totalReplyPages) return null;
+    page += 1;
+  }
+}
+
+/** @param {Request} request @param {ThreadsRuntime} runtime @param {string} postId @param {string} action @param {boolean} wantsJson */
+async function threadsMutationRoute(request, runtime, postId, action, wantsJson) {
+  const deleting = action === "delete";
+  const form = await parseForm(request, 16_384,
+    deleting ? new Set(["csrf", "confirm"]) : new Set(["csrf"]));
+  await requireAuthenticatedMutation(request, runtime, form);
+  if (deleting && requiredString(form, "confirm") !== "yes")
+    appError("confirmation_required", 400);
+  const now = Math.floor(Date.now() / 1_000);
+  if (deleting) {
+    const result = await startThreadsDeletion(runtime.db, runtime.threadsCaptureQueue, postId, now);
+    return wantsJson ? json(result) : redirect("/threads?flash=threads_delete_queued");
+  }
+  const detail = await getThreadsArchive(runtime.db, postId, { repliesPage: 1 });
+  if (!detail) appError("threads_archive_not_found", 404);
+  if (!detail.archive.canonicalUrl) appError("threads_post_unavailable", 409);
+  const result = await createThreadsSync(
+    runtime.db, runtime.threadsCaptureQueue, detail.archive.canonicalUrl, now,
+  );
+  return wantsJson ? json(result)
+    : redirect(`/threads/${postId}?flash=threads_sync_queued`);
+}
+
+/** @param {Request} request @param {ThreadsRuntime} runtime @param {string} postId @param {string} mediaId @param {boolean} wantsJson */
+async function threadsRetryRoute(request, runtime, postId, mediaId, wantsJson) {
+  const form = await parseForm(request, 16_384, new Set(["csrf"]));
+  await requireAuthenticatedMutation(request, runtime, form);
+  const archive = await failedMedia(runtime, postId, mediaId);
+  if (!archive) appError("threads_media_not_found", 404);
+  try {
+    await runtime.threadsMediaQueue.send({
+      version: 1, type: "retry-media", postId,
+      generation: archive.syncGeneration, mediaId,
+    });
+  } catch { appError("queue_unavailable", 503); }
+  const result = { threadsPostId: postId, mediaId, status: "queued" };
+  return wantsJson ? json(result)
+    : redirect(`/threads/${postId}?flash=threads_retry_queued`);
+}
+
+/** @param {Response} response */
+function secureMediaResponse(response) {
+  const secured = new Response(response.body, response);
+  for (const [name, value] of securityHeaders()) {
+    if (!secured.headers.has(name)) secured.headers.set(name, value);
+  }
+  return secured;
+}
+
 /**
  * @param {Request} request
  * @param {RuntimeEnv} env
@@ -605,14 +935,21 @@ async function dispatchRequest(request, env, context, fetcher) {
   }
   const repositoryMatch = REPOSITORY_PATH.exec(url.pathname);
   const notesMatch = REPOSITORY_NOTES_PATH.exec(url.pathname);
-  const methodResult = knownRoute(request.method, url.pathname, repositoryMatch, notesMatch);
+  const threadsPostMatch = THREADS_POST_PATH.exec(url.pathname);
+  const threadsMediaMatch = THREADS_MEDIA_PATH.exec(url.pathname);
+  const methodResult = knownRoute(
+    request.method, url.pathname, repositoryMatch, notesMatch,
+    threadsPostMatch, threadsMediaMatch,
+  );
   if (methodResult) return methodResult;
   if (methodResult === null) return plain(404, "Not Found");
 
   try {
     const queryRoute = request.method === "GET" &&
       (url.pathname === "/" || (repositoryMatch && !repositoryMatch[2]) ||
-        (notesMatch && !notesMatch[2]));
+        (notesMatch && !notesMatch[2]) || url.pathname === "/threads" ||
+        (threadsPostMatch && !threadsPostMatch[2]) ||
+        url.pathname === "/threads/oauth/callback");
     if (url.search && !queryRoute) appError("invalid_query", 400);
     if (request.method === "GET" && url.pathname === "/health")
       return json({ status: "ok", releaseId: runtime.releaseId });
@@ -627,6 +964,25 @@ async function dispatchRequest(request, env, context, fetcher) {
     if (request.method === "POST" && url.pathname === "/csp-report")
       return await cspReportRoute(request, runtime);
 
+    const isThreadsPath = url.pathname === "/threads" ||
+      url.pathname === "/threads/connect" || url.pathname === "/threads/disconnect" ||
+      url.pathname === "/threads/oauth/callback" || Boolean(threadsPostMatch) ||
+      Boolean(threadsMediaMatch);
+    const threadsRuntime = isThreadsPath ? requireThreadsRuntime(runtime) : null;
+    if (url.pathname === "/threads/oauth/callback") {
+      const nowSeconds = Math.floor(Date.now() / 1_000);
+      const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
+      const result = await finishThreadsOAuth(configured.db, {
+        appId: configured.threadsAppId,
+        appSecret: configured.threadsAppSecret,
+        redirectUri: `${runtime.allowedOrigin}/threads/oauth/callback`, callbackUrl: request.url,
+        cookieHeader: request.headers.get("Cookie"),
+        tokenKey: configured.threadsTokenKey,
+        nowSeconds, fetcher,
+      });
+      return redirect("/threads?flash=threads_connected", { "Set-Cookie": result.setCookie });
+    }
+
     const session = await sessionFor(request, runtime);
     if (!session) {
       if (wantsJson) return json({ errorCode: "session_expired" }, 401);
@@ -634,6 +990,27 @@ async function dispatchRequest(request, env, context, fetcher) {
       appError("session_expired", 401);
     }
     if (request.method === "GET" && url.pathname === "/") return await renderIndex(url, runtime, session);
+    if (request.method === "GET" && url.pathname === "/threads/connect") {
+      const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
+      const result = await beginThreadsOAuth({
+        appId: configured.threadsAppId,
+        redirectUri: `${runtime.allowedOrigin}/threads/oauth/callback`,
+        sessionNonce: session.nonce, tokenKey: configured.threadsTokenKey,
+        nowSeconds: Math.floor(Date.now() / 1_000),
+      });
+      return redirect(result.location, { "Set-Cookie": result.setCookie });
+    }
+    if (request.method === "POST" && url.pathname === "/threads/disconnect") {
+      const form = await parseForm(request, 16_384, new Set(["csrf"]));
+      await requireAuthenticatedMutation(request, runtime, form);
+      const disconnected = await disconnectThreads(runtime.db);
+      return wantsJson ? json({ disconnected })
+        : redirect("/threads?flash=threads_disconnected");
+    }
+    if (url.pathname === "/threads") return await threadsListRoute(
+      request, /** @type {ThreadsRuntime} */ (threadsRuntime),
+      fetcher, session, wantsJson, url,
+    );
     if (request.method === "POST" && url.pathname === "/session/logout") {
       const form = await parseForm(request, 16_384, new Set(["csrf"]));
       await requireAuthenticatedMutation(request, runtime, form);
@@ -649,6 +1026,23 @@ async function dispatchRequest(request, env, context, fetcher) {
       const flash = result.duplicate ? "repository_already_saved"
         : result.analysisStatus === "error" ? "repository_analysis_error" : "repository_created";
       return redirect(`/repositories/${result.repositoryId}?flash=${flash}`);
+    }
+    if (threadsMediaMatch) {
+      const [, postId, mediaId, action] = threadsMediaMatch;
+      const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
+      if (action === "retry")
+        return await threadsRetryRoute(request, configured, postId, mediaId, wantsJson);
+      return secureMediaResponse(await serveThreadsMedia(request, {
+        db: configured.db, bucket: configured.threadsMedia,
+      }));
+    }
+    if (threadsPostMatch) {
+      const [, postId, action] = threadsPostMatch;
+      const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
+      if (request.method === "GET")
+        return await threadsDetailRoute(url, configured, fetcher, session, postId, wantsJson, request);
+      return await threadsMutationRoute(request, configured, postId,
+        /** @type {string} */ (action), wantsJson);
     }
     if (notesMatch) {
       const [, repositoryId, noteId, action] = notesMatch;
@@ -671,11 +1065,18 @@ async function dispatchRequest(request, env, context, fetcher) {
 function safeRouteTemplate(pathname) {
   if (ASSET_PATH.test(pathname)) return "/assets/:release/:file";
   if (REPOSITORY_NOTES_PATH.test(pathname)) return "/repositories/:id/notes";
+  const threadsMedia = THREADS_MEDIA_PATH.exec(pathname);
+  if (threadsMedia) return threadsMedia[3]
+    ? "/threads/:id/media/:mediaId/retry" : "/threads/:id/media/:mediaId";
+  const threadsPost = THREADS_POST_PATH.exec(pathname);
+  if (threadsPost) return threadsPost[2]
+    ? `/threads/:id/${threadsPost[2]}` : "/threads/:id";
   const repository = REPOSITORY_PATH.exec(pathname);
   if (repository) return repository[2] ? `/repositories/:id/${repository[2]}` : "/repositories/:id";
   if (new Set([
     "/health", "/login", "/session", "/session/logout", "/", "/repositories",
-    "/telemetry", "/csp-report",
+    "/telemetry", "/csp-report", "/threads", "/threads/connect",
+    "/threads/oauth/callback", "/threads/disconnect",
   ]).has(pathname)) return pathname;
   return "unmatched";
 }
@@ -702,21 +1103,28 @@ function safeProviderStatus(status) {
 
 /**
  * @param {typeof fetch} fetcher
- * @param {{ githubStatus: string, openAiStatus: string }} state
+ * @param {{ githubStatus: string, openAiStatus: string, threadsStatus: string }} state
  */
 function observedFetcher(fetcher, state) {
   /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
   return async (input, init) => {
-    /** @type {"" | "githubStatus" | "openAiStatus"} */
+    /** @type {"" | "githubStatus" | "openAiStatus" | "threadsStatus"} */
     let field = "";
     try {
       const hostname = new URL(input instanceof Request ? input.url : String(input)).hostname;
       if (hostname === "api.github.com") field = "githubStatus";
       if (hostname === "api.openai.com") field = "openAiStatus";
+      if (hostname === "graph.threads.net" || hostname === "threads.net" ||
+        hostname === "www.threads.net" || hostname === "threads.com" ||
+        hostname === "www.threads.com" || hostname === "cdninstagram.com" ||
+        hostname.endsWith(".cdninstagram.com") || hostname === "fbcdn.net" ||
+        hostname.endsWith(".fbcdn.net")) field = "threadsStatus";
     } catch {}
     try {
       const response = await fetcher(input, init);
-      if (field) state[field] = safeProviderStatus(response.status);
+      if (field) state[field] = field === "threadsStatus" &&
+        (response.status === 401 || response.status === 403)
+        ? "reconnect_required" : safeProviderStatus(response.status);
       return response;
     } catch (error) {
       if (field) state[field] = "error";
@@ -733,7 +1141,7 @@ function observedFetcher(fetcher, state) {
  */
 export async function handleRequest(request, env, context, fetcher = globalThis.fetch) {
   const startedAt = Date.now();
-  const state = { githubStatus: "none", openAiStatus: "none" };
+  const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
   let response;
   try { response = await dispatchRequest(request, env, context, observedFetcher(fetcher, state)); }
   catch { response = plain(500, "internal_error"); }
@@ -744,10 +1152,112 @@ export async function handleRequest(request, env, context, fetcher = globalThis.
     latencyMs: Math.max(0, Date.now() - startedAt),
     githubStatus: state.githubStatus,
     openAiStatus: state.openAiStatus,
+    threadsStatus: state.threadsStatus,
     errorCode: safeHttpStatus(response.status),
   };
   try { console.log(record); } catch {}
   return response;
+}
+
+/** @param {RuntimeEnv} env */
+function threadsEventRuntime(env) {
+  let runtime;
+  try { runtime = selectRuntime(env.PRODUCTION_HOST, env); }
+  catch { appError("threads_unavailable", 503); }
+  return requireThreadsRuntime(runtime);
+}
+
+/** @param {unknown} message @param {"capture" | "media"} kind */
+function validQueueBody(message, kind) {
+  try {
+    return kind === "capture" ? validateCaptureMessage(message) : validateMediaMessage(message);
+  } catch { return null; }
+}
+
+/**
+ * @param {any} batch
+ * @param {RuntimeEnv} env
+ * @param {unknown} context
+ * @param {typeof fetch} fetcher
+ */
+export async function handleThreadsQueue(batch, env, context, fetcher = globalThis.fetch) {
+  const runtime = threadsEventRuntime(env);
+  if (!batch || typeof batch !== "object" || typeof batch.queue !== "string" ||
+    !Array.isArray(batch.messages)) throw new Error("threads_queue_not_configured");
+  /** @type {Map<string, { kind: "capture" | "media", handler: (message: unknown, dependencies: any) => Promise<any> }>} */
+  const routes = new Map([
+    [runtime.threadsCaptureQueueName, { kind: "capture", handler: handleThreadsCaptureMessage }],
+    [runtime.threadsMediaQueueName, { kind: "media", handler: handleThreadsMediaMessage }],
+    [runtime.threadsCaptureDlqName,
+      { kind: "capture", handler: handleThreadsCaptureDeadLetter }],
+    [runtime.threadsMediaDlqName, { kind: "media", handler: handleThreadsMediaDeadLetter }],
+  ]);
+  const route = routes.get(batch.queue);
+  if (!route) throw new Error("threads_queue_not_configured");
+  void context;
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
+  const safeFetcher = observedFetcher(fetcher, state);
+  const getAccessToken = () => getThreadsAccessToken(
+    runtime.db, threadsTokenInput(runtime, safeFetcher, nowSeconds),
+  );
+  for (const item of batch.messages) {
+    if (!item || typeof item !== "object" || typeof item.ack !== "function" ||
+      typeof item.retry !== "function") continue;
+    const body = validQueueBody(item.body, route.kind);
+    if (!body) {
+      try { await item.ack(); } catch {}
+      continue;
+    }
+    let result;
+    try {
+      result = await route.handler(body, {
+        db: runtime.db, bucket: runtime.threadsMedia,
+        captureQueue: runtime.threadsCaptureQueue, mediaQueue: runtime.threadsMediaQueue,
+        fetcher: safeFetcher, getAccessToken, recalculateStatus: recalculateThreadsStatus,
+        nowSeconds,
+        deleteArchive: (/** @type {unknown} */ message) => deleteThreadsArchive(message, {
+          db: runtime.db, bucket: runtime.threadsMedia, nowSeconds,
+        }),
+      });
+    } catch { result = { action: "retry", delaySeconds: 1 }; }
+    if (result?.action === "retry") {
+      const raw = result.delaySeconds;
+      const delaySeconds = Number.isSafeInteger(raw) && raw > 0
+        ? Math.min(900, raw) : 1;
+      try { await item.retry({ delaySeconds }); } catch {}
+    } else {
+      try { await item.ack(); } catch {}
+    }
+  }
+}
+
+/**
+ * @param {RuntimeEnv} env
+ * @param {{ waitUntil(promise: Promise<unknown>): void }} context
+ * @param {typeof fetch} fetcher
+ * @param {number} nowSeconds
+ */
+export async function handleThreadsScheduled(
+  env, context, fetcher = globalThis.fetch, nowSeconds = Math.floor(Date.now() / 1_000),
+) {
+  const runtime = threadsEventRuntime(env);
+  if (!context || typeof context.waitUntil !== "function")
+    throw new Error("threads_schedule_not_configured");
+  const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
+  const promise = refreshStoredThreadsCredential(runtime.db,
+    threadsTokenInput(runtime, observedFetcher(fetcher, state), nowSeconds));
+  context.waitUntil(promise);
+  return promise;
+}
+
+/** @param {RuntimeEnv} env */
+function defaultEventFetcher(env) {
+  const fixture = env.ENVIRONMENT === "test" ? env.PROVIDER_FIXTURE : undefined;
+  if (env.ENVIRONMENT === "test" && (!fixture || typeof fixture.fetch !== "function"))
+    throw new Error("threads_provider_not_configured");
+  return /** @type {typeof globalThis.fetch} */ (fixture && typeof fixture.fetch === "function"
+    ? fixture.fetch.bind(fixture) : globalThis.fetch);
 }
 
 export default {
@@ -759,5 +1269,18 @@ export default {
     const fetcher = /** @type {typeof globalThis.fetch} */ (fixture && typeof fixture.fetch === "function"
       ? fixture.fetch.bind(fixture) : globalThis.fetch);
     return handleRequest(request, env, context, fetcher);
+  },
+  /** @param {any} batch @param {RuntimeEnv} env @param {unknown} context */
+  queue(batch, env, context) {
+    return handleThreadsQueue(batch, env, context, defaultEventFetcher(env));
+  },
+  /** @param {{ cron?: string, scheduledTime?: number }} controller @param {RuntimeEnv} env @param {{ waitUntil(promise: Promise<unknown>): void }} context */
+  scheduled(controller, env, context) {
+    if (controller?.cron !== THREADS_DAILY_CRON)
+      throw new Error("threads_schedule_not_configured");
+    const nowSeconds = Number.isFinite(controller.scheduledTime)
+      ? Math.floor(/** @type {number} */ (controller.scheduledTime) / 1_000)
+      : Math.floor(Date.now() / 1_000);
+    return handleThreadsScheduled(env, context, defaultEventFetcher(env), nowSeconds);
   },
 };

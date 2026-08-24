@@ -126,7 +126,7 @@ async function archiveEntry(options = {}) {
       kind: "image", ordinal: 0, status: "pending", r2_key: null,
       content_type: null, bytes: null, etag: null, error_code: null,
       attempt_count: 0, upload_lease: null, upload_started_at: null,
-      pending_r2_key: null,
+      pending_r2_key: null, upload_recovering: 0,
     }), bucket, fetcher, getAccessToken: async () => ({ accessToken: "token" }),
     recalculateStatus: async (/** @type {unknown} */ db,
       /** @type {unknown} */ input) => { recalculations.push({ db, input }); },

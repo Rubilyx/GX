@@ -8,11 +8,11 @@ import {
   MEDIA_ACK, claimEntryUpload, claimEntryUploadRecovery, claimProfileUpload,
   claimProfileUploadRecovery,
   deleteUncommittedUpload, entryKey, failEntryUpload, failProfileUpload,
-  finishEntryUploadRecovery,
+  finishEntryUploadRecovery, finishProfileUploadRecovery,
   mediaRetryResult, ownsEntryUpload, ownsProfileUpload,
-  profileKey, readEntryMedia, readProfileMedia, readyEntryUpload, readyProfileUpload,
+  profileKey, readEntryMedia, readGlobalProfileMedia, readProfileMedia,
+  readyEntryUpload, readyProfileUpload,
   recalculateMediaStatus, releaseEntryUpload, releaseProfileUpload,
-  restoreEntryUploadRecovery, restoreProfileUploadRecovery,
   terminalMediaCode, terminalizeEntryDeadLetter, terminalizeProfileDeadLetter,
 } from "./thread-media-store.js";
 import { fetchThreadsMedia, fetchThreadsProfile } from "./threads-api.js";
@@ -53,15 +53,18 @@ async function reconcileEntryPut(message, dependencies, key) {
 
 /** @param {Record<string, any>} message @param {any} dependencies @param {string} key */
 async function reconcileProfilePut(message, dependencies, key) {
-  const current = await readProfileMedia(dependencies.db, message);
-  if (current?.status === "ready") {
-    if (current.r2_key !== key)
-      await deleteUncommittedUpload(dependencies.bucket, key);
-    await recalculateMediaStatus(dependencies, message);
+  const current = await readGlobalProfileMedia(dependencies.db, message.authorId);
+  const ready = current?.status === "ready";
+  if (ready && current.r2_key === key) {
+    if (await readProfileMedia(dependencies.db, message))
+      await recalculateMediaStatus(dependencies, message);
     return true;
   }
   if (current?.pending_r2_key === key) return false;
+  if (current?.r2_key === key) return true;
   await deleteUncommittedUpload(dependencies.bucket, key);
+  if (ready && await readProfileMedia(dependencies.db, message))
+    await recalculateMediaStatus(dependencies, message);
   return true;
 }
 
@@ -114,18 +117,18 @@ async function archiveEntry(message, dependencies) {
     await recalculateMediaStatus(dependencies, message); return;
   }
   if (row.upload_lease !== null) {
-    if (message.type !== "retry-media")
-      throw new AppError("media_upload_in_progress", 503);
-    const recoveryLease = crypto.randomUUID();
-    if (!await claimEntryUploadRecovery(dependencies.db, message, row, now,
-      recoveryLease))
-      throw new AppError("media_upload_in_progress", 503);
-    try { await deleteUncommittedUpload(dependencies.bucket, row.pending_r2_key); }
-    catch (error) {
-      await restoreEntryUploadRecovery(dependencies.db, message, row, recoveryLease, now);
-      throw error;
+    let recoveringRow = row;
+    if (row.upload_recovering === 0) {
+      if (message.type !== "retry-media")
+        throw new AppError("media_upload_in_progress", 503);
+      const recoveryLease = crypto.randomUUID();
+      if (!await claimEntryUploadRecovery(dependencies.db, message, row, now,
+        recoveryLease)) throw new AppError("media_upload_in_progress", 503);
+      recoveringRow = { ...row, upload_lease: recoveryLease,
+        upload_started_at: now, upload_recovering: 1 };
     }
-    if (!await finishEntryUploadRecovery(dependencies.db, message, row, recoveryLease, now))
+    await deleteUncommittedUpload(dependencies.bucket, recoveringRow.pending_r2_key);
+    if (!await finishEntryUploadRecovery(dependencies.db, message, recoveringRow, now))
       throw new AppError("media_upload_in_progress", 503);
     row = await readEntryMedia(dependencies.db, message);
     if (!row || row.status === "ready") {
@@ -139,7 +142,7 @@ async function archiveEntry(message, dependencies) {
   if (!await claimEntryUpload(dependencies.db, message, row, now, lease, pendingKey))
     throw new AppError("media_upload_in_progress", 503);
   row = { ...row, upload_lease: lease, upload_started_at: now,
-    pending_r2_key: pendingKey };
+    pending_r2_key: pendingKey, upload_recovering: 0 };
   let object;
   try {
     const token = accessToken(await dependencies.getAccessToken());
@@ -209,13 +212,24 @@ async function archiveProfile(message, dependencies) {
     if (row.status === "deleting")
       throw new AppError("media_upload_in_progress", 503);
   }
-  if (row.upload_lease !== null) throw new AppError("media_upload_in_progress", 503);
+  if (row.upload_lease !== null) {
+    if (row.upload_recovering === 0)
+      throw new AppError("media_upload_in_progress", 503);
+    await deleteUncommittedUpload(dependencies.bucket, row.pending_r2_key);
+    if (!await finishProfileUploadRecovery(dependencies.db, message, row, now))
+      throw new AppError("media_upload_in_progress", 503);
+    row = await readProfileMedia(dependencies.db, message);
+    if (!row) return;
+    if (row.status === "ready") {
+      await recalculateMediaStatus(dependencies, message); return;
+    }
+  }
   const lease = crypto.randomUUID();
   const pendingKey = profileKey(row.author_id, lease);
   if (!await claimProfileUpload(dependencies.db, message, row, now, lease, pendingKey))
     throw new AppError("media_upload_in_progress", 503);
   row = { ...row, upload_lease: lease, upload_started_at: now,
-    pending_r2_key: pendingKey };
+    pending_r2_key: pendingKey, upload_recovering: 0 };
   let object;
   try {
     const token = accessToken(await dependencies.getAccessToken());
@@ -273,17 +287,16 @@ async function deadEntry(message, dependencies) {
     await terminalizeEntryDeadLetter(message, dependencies); return;
   }
   const now = inputTimestamp(dependencies.nowSeconds);
-  const recoveryLease = crypto.randomUUID();
-  if (!await claimEntryUploadRecovery(dependencies.db, message, row, now,
-    recoveryLease))
-    throw new AppError("media_upload_in_progress", 503);
-  try { await deleteUncommittedUpload(dependencies.bucket, row.pending_r2_key); }
-  catch (error) {
-    await restoreEntryUploadRecovery(dependencies.db, message, row, recoveryLease, now);
-    throw error;
+  let recoveringRow = row;
+  if (row.upload_recovering === 0) {
+    const recoveryLease = crypto.randomUUID();
+    if (!await claimEntryUploadRecovery(dependencies.db, message, row, now,
+      recoveryLease)) throw new AppError("media_upload_in_progress", 503);
+    recoveringRow = { ...row, upload_lease: recoveryLease,
+      upload_started_at: now, upload_recovering: 1 };
   }
-  await terminalizeEntryDeadLetter(message, dependencies,
-    { ...row, upload_lease: recoveryLease, upload_started_at: now });
+  await deleteUncommittedUpload(dependencies.bucket, recoveringRow.pending_r2_key);
+  await terminalizeEntryDeadLetter(message, dependencies, recoveringRow);
 }
 
 /** @param {Record<string, any>} message @param {any} dependencies */
@@ -294,17 +307,16 @@ async function deadProfile(message, dependencies) {
     await terminalizeProfileDeadLetter(message, dependencies); return;
   }
   const now = inputTimestamp(dependencies.nowSeconds);
-  const recoveryLease = crypto.randomUUID();
-  if (!await claimProfileUploadRecovery(dependencies.db, message, row, now,
-    recoveryLease))
-    throw new AppError("media_upload_in_progress", 503);
-  try { await deleteUncommittedUpload(dependencies.bucket, row.pending_r2_key); }
-  catch (error) {
-    await restoreProfileUploadRecovery(dependencies.db, message, row, recoveryLease, now);
-    throw error;
+  let recoveringRow = row;
+  if (row.upload_recovering === 0) {
+    const recoveryLease = crypto.randomUUID();
+    if (!await claimProfileUploadRecovery(dependencies.db, message, row, now,
+      recoveryLease)) throw new AppError("media_upload_in_progress", 503);
+    recoveringRow = { ...row, upload_lease: recoveryLease,
+      upload_started_at: now, upload_recovering: 1 };
   }
-  await terminalizeProfileDeadLetter(message, dependencies,
-    { ...row, upload_lease: recoveryLease, upload_started_at: now });
+  await deleteUncommittedUpload(dependencies.bucket, recoveringRow.pending_r2_key);
+  await terminalizeProfileDeadLetter(message, dependencies, recoveringRow);
 }
 
 /** @param {unknown} rawMessage @param {any} dependencies */

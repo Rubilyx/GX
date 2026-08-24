@@ -105,7 +105,7 @@ async function cascadeArchive(db, postId, authors) {
       `UPDATE threads_authors SET profile_media_status = 'deleting',
          profile_r2_key = COALESCE(profile_pending_r2_key, profile_r2_key),
          profile_upload_lease = NULL, profile_upload_started_at = NULL,
-         profile_pending_r2_key = NULL,
+         profile_pending_r2_key = NULL, profile_upload_recovering = 0,
          profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
        WHERE threads_user_id IN (${placeholders})
          AND (profile_r2_key IS NOT NULL OR profile_pending_r2_key IS NOT NULL)
@@ -138,6 +138,7 @@ async function claimProfileCleanup(db, authorId, key, priorLease, priorStarted, 
     `UPDATE threads_authors SET profile_cleanup_lease = ?, profile_cleanup_started_at = ?
      WHERE threads_user_id = ? AND profile_media_status = 'deleting'
        AND profile_upload_lease IS NULL AND profile_pending_r2_key IS NULL
+       AND profile_upload_recovering = 0
        AND ((? IS NULL AND profile_cleanup_lease IS NULL
            AND profile_cleanup_started_at IS NULL)
          OR (profile_cleanup_lease = ? AND profile_cleanup_started_at = ?
@@ -199,7 +200,7 @@ export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = t
            profile_r2_key = NULL, profile_content_type = NULL, profile_bytes = NULL,
            profile_etag = NULL, profile_error_code = NULL, profile_refreshed_at = NULL,
            profile_upload_lease = NULL, profile_upload_started_at = NULL,
-           profile_pending_r2_key = NULL,
+           profile_pending_r2_key = NULL, profile_upload_recovering = 0,
            profile_cleanup_lease = NULL, profile_cleanup_started_at = NULL
          WHERE threads_user_id = ? AND profile_media_status = 'deleting'
            AND profile_cleanup_lease = ? AND profile_cleanup_started_at = ?

@@ -16,6 +16,8 @@ CREATE TABLE threads_authors (
   profile_upload_lease TEXT,
   profile_upload_started_at INTEGER CHECK (profile_upload_started_at IS NULL OR profile_upload_started_at >= 0),
   profile_pending_r2_key TEXT,
+  profile_upload_recovering INTEGER NOT NULL DEFAULT 0
+    CHECK (profile_upload_recovering IN (0,1)),
   profile_cleanup_lease TEXT,
   profile_cleanup_started_at INTEGER CHECK (profile_cleanup_started_at IS NULL OR profile_cleanup_started_at >= 0),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -24,6 +26,8 @@ CREATE TABLE threads_authors (
       AND profile_pending_r2_key IS NULL)
     OR (profile_upload_lease IS NOT NULL AND profile_upload_started_at IS NOT NULL
       AND profile_pending_r2_key IS NOT NULL)),
+  CHECK (profile_upload_recovering = 0 OR (profile_upload_lease IS NOT NULL
+    AND profile_upload_started_at IS NOT NULL AND profile_pending_r2_key IS NOT NULL)),
   CHECK (profile_cleanup_lease IS NULL OR profile_media_status = 'deleting'),
   CHECK ((profile_cleanup_lease IS NULL AND profile_cleanup_started_at IS NULL)
     OR (profile_cleanup_lease IS NOT NULL AND profile_cleanup_started_at IS NOT NULL)),
@@ -144,10 +148,13 @@ CREATE TABLE threads_media (
   upload_lease TEXT,
   upload_started_at INTEGER CHECK (upload_started_at IS NULL OR upload_started_at >= 0),
   pending_r2_key TEXT,
+  upload_recovering INTEGER NOT NULL DEFAULT 0 CHECK (upload_recovering IN (0,1)),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
   CHECK ((upload_lease IS NULL AND upload_started_at IS NULL AND pending_r2_key IS NULL)
     OR (upload_lease IS NOT NULL AND upload_started_at IS NOT NULL
       AND pending_r2_key IS NOT NULL)),
+  CHECK (upload_recovering = 0 OR (upload_lease IS NOT NULL
+    AND upload_started_at IS NOT NULL AND pending_r2_key IS NOT NULL)),
   UNIQUE(entry_id, source_media_id, kind, ordinal)
 );
 CREATE INDEX threads_media_entry_status_idx ON threads_media(entry_id, status, ordinal);

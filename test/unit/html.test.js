@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assetHref, htmlAttr, htmlText, renderIndexPage, renderLoginPage, renderRepositoryNotesPage,
-  renderRepositoryPage, repositoryActivity,
+  renderRepositoryPage, renderThreadsDetailPage, renderThreadsIndexPage, repositoryActivity,
 } from "../../src/html.js";
 
 const repository = {
@@ -19,6 +19,42 @@ const repository = {
   analysisModel: `model<script>`, promptVersion: `v1<&`, analysisStartedAt: null,
   analyzedAt: 2, noteCount: 3, latestNote: `</textarea><script>alert("note")</script>`,
   analysisGeneration: 1, createdAt: 1, updatedAt: 2, tags: [`tag"><script>`],
+};
+
+const threadEntry = {
+  id: "entry-1", sourceMediaId: "source-1", kind: "root", parentEntryId: null,
+  author: {
+    id: "author-1", username: "author<script>", displayName: "작성자 <script>",
+    profileMedia: { status: "ready", contentType: "image/jpeg", etag: "etag", bytes: 12, errorCode: null },
+  },
+  text: "본문 <script> https://safe.example/path", permalink: "https://www.threads.net/@author/post/post-1",
+  publishedAt: "2026-08-23T15:30:00.000Z", mediaType: "CAROUSEL_ALBUM", altText: null,
+  nestedQuotePermalink: null,
+  links: [{ url: "https://safe.example/path", source: "body", ordinal: 0 }],
+  media: [
+    { id: "image-1", sourceMediaId: "image-source", kind: "image", ordinal: 0, altText: "저장된 이미지", status: "ready" },
+    { id: "video-1", sourceMediaId: "video-source", kind: "video", ordinal: 1, altText: null, status: "ready" },
+    { id: "thumbnail-1", sourceMediaId: "video-source", kind: "video_thumbnail", ordinal: 2, altText: null, status: "ready" },
+    { id: "failed-1", sourceMediaId: "failed-source", kind: "image", ordinal: 3, altText: null, status: "error" },
+  ],
+  quote: null,
+};
+
+const threadArchive = {
+  id: "post-1", canonicalUrl: "https://www.threads.net/@author/post/post-1", status: "partial",
+  errorCode: "threads_provider_unavailable", author: threadEntry.author, root: threadEntry,
+  quote: {
+    ...threadEntry, id: "quote-1", sourceMediaId: "quote-source", kind: "quote",
+    parentEntryId: "entry-1", text: "인용 <b>본문</b>", media: [], links: [],
+    author: { ...threadEntry.author, id: "quote-author", username: "quoted", displayName: "인용 작성자" },
+  },
+  firstReplies: Array.from({ length: 3 }, (_, index) => ({
+    ...threadEntry, id: `reply-${index + 1}`, sourceMediaId: `reply-source-${index + 1}`,
+    kind: "author_reply", parentEntryId: null, text: `답글 ${index + 1}`,
+    publishedAt: `2026-08-23T15:3${index + 1}:00.000Z`, media: [], links: [], quote: null,
+  })),
+  replyCount: 12, mediaProgress: { expected: 4, ready: 3, failed: 1, pending: 0 },
+  syncGeneration: 2, createdAt: 1, updatedAt: 2,
 };
 
 test("escapes text and attribute contexts", () => {
@@ -476,4 +512,51 @@ test("analysis status hooks admit only fixed own values", () => {
   });
   assert.doesNotMatch(detailHtml, /data-analysis-status=|function toString|native code/);
   assert.match(detailHtml, /<dt>분석 상태<\/dt><dd><span class="analysis-badge"><span class="status-marker" aria-hidden="true"><\/span>상태 확인 필요<\/span><\/dd>/);
+});
+
+test("Threads index renders semantic archived cards, native controls, and safe media", () => {
+  const html = renderThreadsIndexPage({
+    releaseId: "abc123", csrfToken: `csrf"x`, connected: true,
+    archives: [threadArchive], page: 1, totalPages: 2, flash: "threads_capture_queued",
+  });
+  assert.match(html, /<nav aria-label="주요 메뉴">[\s\S]*Repository[\s\S]*Threads[\s\S]*<\/nav>/);
+  assert.match(html, /<a href="\/threads" aria-current="page">Threads<\/a>/);
+  assert.match(html, /<form method="post" action="\/threads\/disconnect">[\s\S]*Threads 연결 해제/);
+  assert.match(html, /<form method="post" action="\/threads">[\s\S]*name="url" type="url"/);
+  assert.match(html, /<article data-thread-archive data-thread-status="partial">/);
+  assert.match(html, /data-thread-progress>미디어 3\/4 준비 · 실패 1/);
+  assert.match(html, /<img data-thread-author-image src="\/threads\/post-1\/media\/author-1" alt=""/);
+  assert.match(html, /data-thread-author-name>작성자 &lt;script&gt;<\/strong>/);
+  assert.match(html, /data-thread-author-username>@author&lt;script&gt;<\/span>/);
+  assert.match(html, /<time data-thread-published-at datetime="2026-08-23T15:30:00\.000Z">2026\.08\.24<\/time>/);
+  assert.match(html, /<p data-thread-text>본문 &lt;script&gt; <a href="https:\/\/safe\.example\/path" rel="noreferrer">https:\/\/safe\.example\/path<\/a><\/p>/);
+  assert.match(html, /<img src="\/threads\/post-1\/media\/image-1" alt="저장된 이미지"/);
+  assert.match(html, /<video controls preload="metadata" poster="\/threads\/post-1\/media\/thumbnail-1"><source src="\/threads\/post-1\/media\/video-1"><\/video>/);
+  assert.match(html, /<section data-thread-quote><p data-thread-text>인용 &lt;b&gt;본문&lt;\/b&gt;<\/p><\/section>/);
+  assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 3);
+  assert.match(html, /href="\/threads\/post-1#author-replies">작성자 답글 12개 모두 보기<\/a>/);
+  assert.match(html, /<form method="post" action="\/threads\/post-1\/sync" data-thread-sync-form>/);
+  assert.match(html, /<form method="post" action="\/threads\/post-1\/media\/failed-1\/retry" data-thread-retry-form>/);
+  assert.match(html, /<details data-thread-delete>[\s\S]*action="\/threads\/post-1\/delete"[\s\S]*name="confirm" value="yes"/);
+  assert.match(html, /Threads 가져오기를 대기열에 추가했습니다/);
+  assert.doesNotMatch(html, /threads\.net\/embed|cdninstagram\.com|<script[^>]+src="https:|profile_r2_key|https:\/\/www\.threads\.net\/@author/);
+});
+
+test("Threads detail paginates twenty chronological replies and retains shared Repository navigation", () => {
+  const replies = Array.from({ length: 20 }, (_, index) => ({
+    ...threadEntry, id: `detail-reply-${index + 1}`, sourceMediaId: `detail-source-${index + 1}`,
+    kind: "author_reply", parentEntryId: null, text: `상세 답글 ${index + 1}`,
+    publishedAt: `2026-08-23T15:${String(index).padStart(2, "0")}:00.000Z`, media: [], links: [], quote: null,
+  }));
+  const html = renderThreadsDetailPage({
+    releaseId: "abc123", csrfToken: "csrf", connected: false, archive: threadArchive,
+    replies, repliesPage: 2, totalReplyPages: 3, totalReplies: 45, flash: "threads_disconnected",
+  });
+  assert.match(html, /<a href="\/">Repository<\/a>/);
+  assert.match(html, /<a href="\/threads" aria-current="page">Threads<\/a>/);
+  assert.match(html, /<a href="\/threads\/connect">Threads 연결하기<\/a>/);
+  assert.equal((html.match(/data-thread-author-reply/g) ?? []).length, 20);
+  assert.match(html, /<nav class="thread-reply-pagination" aria-label="작성자 답글 페이지">[\s\S]*repliesPage=1[\s\S]*repliesPage=2" aria-current="page"[\s\S]*repliesPage=3/);
+  assert.match(html, /Threads 연결을 해제했습니다/);
+  assert.doesNotMatch(html, /<script|threads\.net\/embed|cdninstagram\.com/);
 });

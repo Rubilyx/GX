@@ -25,6 +25,12 @@ const MESSAGE = Object.freeze({
   analysis_invalid_output: "AI 분석 결과를 확인할 수 없습니다. 다시 시도하세요.",
   github_rate_limited: "GitHub 요청이 제한되었습니다. 잠시 후 다시 시도하세요.",
   github_unavailable: "GitHub 정보를 불러오지 못했습니다. 다시 시도하세요.",
+  threads_connected: "Threads를 연결했습니다.",
+  threads_disconnected: "Threads 연결을 해제했습니다.",
+  threads_capture_queued: "Threads 가져오기를 대기열에 추가했습니다.",
+  threads_sync_queued: "Threads 동기화를 대기열에 추가했습니다.",
+  threads_retry_queued: "Threads 미디어 재시도를 대기열에 추가했습니다.",
+  threads_delete_queued: "Threads 삭제를 대기열에 추가했습니다.",
 });
 const GENERIC_MESSAGE = "요청을 처리하지 못했습니다. 다시 시도하세요.";
 
@@ -107,6 +113,11 @@ function options(values, selected, emptyLabel) {
 /** @param {string} csrfToken */
 function logoutForm(csrfToken) {
   return `<form method="post" action="/session/logout">${csrf(csrfToken)}<button type="submit">로그아웃</button></form>`;
+}
+
+/** @param {"repository" | "threads"} active */
+function appNavigation(active) {
+  return `<nav aria-label="주요 메뉴"><a href="/"${active === "repository" ? ' aria-current="page"' : ""}>Repository</a><a href="/threads"${active === "threads" ? ' aria-current="page"' : ""}>Threads</a></nav>`;
 }
 
 /** @param {{ releaseId: string, errorCode?: string }} view */
@@ -225,7 +236,7 @@ export function renderIndexPage(view) {
   return document({
     releaseId: view.releaseId, page: "repositories.css", title: "Repo Atlas",
     app: true, modulePreloads: view.modulePreloads,
-    body: `<main id="main"><header class="index-header"><h1><a href="/">Repo Atlas</a></h1>${filterForm}${logoutForm(view.csrfToken)}</header>${errorStatus(view.flash)}<repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-panel>${categoryFilter(view.categories ?? CATEGORIES, filter, view.repositoryCounts)}${list}${pagination}${repositoryDialog}${noteDeleteDialog}${deleteDialog}</repo-panel></main>`,
+    body: `<main id="main"><header class="index-header"><h1><a href="/">Repo Atlas</a></h1>${filterForm}${logoutForm(view.csrfToken)}</header>${appNavigation("repository")}${errorStatus(view.flash)}<repo-capture><form method="post" action="/repositories">${csrf(view.csrfToken)}<label for="repository-url">GitHub 저장소 URL</label><input id="repository-url" name="url" type="url" inputmode="url" required autocomplete="off" placeholder="https://github.com/owner/repository"><button type="submit">저장</button><p data-capture-status role="status" aria-live="polite"><span data-capture-message></span></p></form></repo-capture><repo-panel>${categoryFilter(view.categories ?? CATEGORIES, filter, view.repositoryCounts)}${list}${pagination}${repositoryDialog}${noteDeleteDialog}${deleteDialog}</repo-panel></main>`,
   });
 }
 
@@ -280,7 +291,7 @@ export function renderRepositoryNotesPage(view) {
     releaseId: view.releaseId, page: "repositories.css",
     title: `${repository.owner}/${repository.name} Note - Repo Atlas`, app: true,
     modulePreloads: view.modulePreloads,
-    body: `<main id="main"><p><a href="${htmlAttr(repositoryPath)}">저장소 상세</a></p><h1 data-repository-notes-heading>${htmlText(repository.owner)}/${htmlText(repository.name)} Note</h1><p data-repository-notes-summary>${htmlText(repository.summary ?? "요약이 아직 없습니다.")}</p><form method="post" action="${htmlAttr(`${repositoryPath}/notes`)}" data-repository-note-create-form>${csrf(view.csrfToken)}<label for="new-note">새 Note</label><textarea id="new-note" name="body" data-repository-note-create maxlength="4000" required></textarea><button type="submit" data-repository-note-create-save>저장</button></form><p data-repository-note-status role="status" aria-live="polite">${view.flash ? `${statusMarker}${messageFor(view.flash)}` : ""}</p>${noteListMarkup(view)}${logoutForm(view.csrfToken)}</main>`,
+    body: `<main id="main">${appNavigation("repository")}<p><a href="${htmlAttr(repositoryPath)}">저장소 상세</a></p><h1 data-repository-notes-heading>${htmlText(repository.owner)}/${htmlText(repository.name)} Note</h1><p data-repository-notes-summary>${htmlText(repository.summary ?? "요약이 아직 없습니다.")}</p><form method="post" action="${htmlAttr(`${repositoryPath}/notes`)}" data-repository-note-create-form>${csrf(view.csrfToken)}<label for="new-note">새 Note</label><textarea id="new-note" name="body" data-repository-note-create maxlength="4000" required></textarea><button type="submit" data-repository-note-create-save>저장</button></form><p data-repository-note-status role="status" aria-live="polite">${view.flash ? `${statusMarker}${messageFor(view.flash)}` : ""}</p>${noteListMarkup(view)}${logoutForm(view.csrfToken)}</main>`,
   });
 }
 
@@ -325,6 +336,173 @@ export function renderRepositoryPage(view) {
     releaseId: view.releaseId, page: "repositories.css",
     title: `${repository.owner}/${repository.name} - Repo Atlas`, app: true,
     modulePreloads: view.modulePreloads,
-  body: `<main id="main"><p><a href="/">저장소 목록</a></p><h1>${htmlText(repository.owner)}/${htmlText(repository.name)}</h1>${errorStatus(view.flash)}<p><a href="${htmlAttr(github)}" rel="noreferrer">GitHub에서 열기</a></p><p><a href="${htmlAttr(`${path}/notes`)}">Note 관리</a></p>${detail(repository)}<section aria-labelledby="edit-heading"><h2 id="edit-heading">분류 편집</h2><form method="post" action="${path}">${csrf(view.csrfToken)}<label for="primary-category">주 분류</label><select id="primary-category" name="primaryCategory" required>${options(view.categories ?? CATEGORIES, repository.primaryCategory, "분류 선택")}</select><label for="tags">태그 (쉼표로 구분)</label><input id="tags" name="tags" type="text" value="${htmlAttr(repository.tags?.join(", ") ?? "")}"><button type="submit">변경 저장</button></form></section><section aria-labelledby="refresh-heading"><h2 id="refresh-heading">다시 분석</h2><form method="post" action="${path}/refresh">${csrf(view.csrfToken)}<label><input type="checkbox" name="confirm" value="yes" required> AI 요약, 주 분류와 태그가 새 분석 결과로 교체됨을 확인합니다.</label><button type="submit">GitHub 정보와 분석 새로고침</button></form></section><section aria-labelledby="delete-heading"><h2 id="delete-heading">저장소 삭제</h2><form method="post" action="${path}/delete">${csrf(view.csrfToken)}<label><input type="checkbox" name="confirm" value="yes" required> 이 저장소와 모든 Note를 영구 삭제함을 확인합니다.</label><button type="submit" class="button-danger">저장소 삭제</button></form></section>${logoutForm(view.csrfToken)}</main>`,
+  body: `<main id="main">${appNavigation("repository")}<p><a href="/">저장소 목록</a></p><h1>${htmlText(repository.owner)}/${htmlText(repository.name)}</h1>${errorStatus(view.flash)}<p><a href="${htmlAttr(github)}" rel="noreferrer">GitHub에서 열기</a></p><p><a href="${htmlAttr(`${path}/notes`)}">Note 관리</a></p>${detail(repository)}<section aria-labelledby="edit-heading"><h2 id="edit-heading">분류 편집</h2><form method="post" action="${path}">${csrf(view.csrfToken)}<label for="primary-category">주 분류</label><select id="primary-category" name="primaryCategory" required>${options(view.categories ?? CATEGORIES, repository.primaryCategory, "분류 선택")}</select><label for="tags">태그 (쉼표로 구분)</label><input id="tags" name="tags" type="text" value="${htmlAttr(repository.tags?.join(", ") ?? "")}"><button type="submit">변경 저장</button></form></section><section aria-labelledby="refresh-heading"><h2 id="refresh-heading">다시 분석</h2><form method="post" action="${path}/refresh">${csrf(view.csrfToken)}<label><input type="checkbox" name="confirm" value="yes" required> AI 요약, 주 분류와 태그가 새 분석 결과로 교체됨을 확인합니다.</label><button type="submit">GitHub 정보와 분석 새로고침</button></form></section><section aria-labelledby="delete-heading"><h2 id="delete-heading">저장소 삭제</h2><form method="post" action="${path}/delete">${csrf(view.csrfToken)}<label><input type="checkbox" name="confirm" value="yes" required> 이 저장소와 모든 Note를 영구 삭제함을 확인합니다.</label><button type="submit" class="button-danger">저장소 삭제</button></form></section>${logoutForm(view.csrfToken)}</main>`,
+  });
+}
+
+const THREAD_STATUS = Object.freeze({
+  pending: "대기 중", collecting: "수집 중", ready: "보관 완료", partial: "일부 보관됨",
+  error: "보관 오류", deleting: "삭제 중",
+});
+
+/** @param {unknown} value */
+function threadsStatusKey(value) {
+  return typeof value === "string" && Object.hasOwn(THREAD_STATUS, value)
+    ? /** @type {keyof typeof THREAD_STATUS} */ (value) : null;
+}
+
+/** @param {unknown} value */
+function threadsStatusText(value) {
+  const key = threadsStatusKey(value);
+  return key ? THREAD_STATUS[key] : "상태 확인 필요";
+}
+
+/** @param {unknown} value */
+function seoulDate(value) {
+  const date = new Date(String(value ?? ""));
+  if (Number.isNaN(date.getTime())) return "날짜 확인 필요";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(date);
+  /** @param {Intl.DateTimeFormatPartTypes} type */
+  const part = (type) => parts.find((item) => item.type === type)?.value ?? "00";
+  return `${part("year")}.${part("month")}.${part("day")}`;
+}
+
+/** @param {unknown} value */
+function safeStoredHref(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch { return null; }
+}
+
+/** @param {unknown} text @param {any[]} links */
+function threadText(text, links = []) {
+  const source = String(text ?? "");
+  const matches = [];
+  for (const link of links) {
+    const href = safeStoredHref(link?.url);
+    if (!href) continue;
+    let start = source.indexOf(link.url);
+    while (start >= 0) {
+      matches.push({ start, end: start + link.url.length, href, label: link.url });
+      start = source.indexOf(link.url, start + link.url.length);
+    }
+  }
+  matches.sort((left, right) => left.start - right.start || right.end - left.end);
+  let offset = 0;
+  let output = "";
+  for (const match of matches) {
+    if (match.start < offset) continue;
+    output += htmlText(source.slice(offset, match.start));
+    output += `<a href="${htmlAttr(match.href)}" rel="noreferrer">${htmlText(match.label)}</a>`;
+    offset = match.end;
+  }
+  return `${output}${htmlText(source.slice(offset))}`;
+}
+
+/** @param {string} postId @param {any} author */
+function threadAuthor(postId, author) {
+  const profile = author?.profileMedia;
+  const image = profile?.status === "ready" && author?.id
+    ? `<img data-thread-author-image src="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(author.id)}" alt="" width="44" height="44" loading="lazy" decoding="async">` : "";
+  return `<header class="thread-author">${image}<strong data-thread-author-name>${htmlText(author?.displayName ?? "알 수 없는 작성자")}</strong><span data-thread-author-username>@${htmlText(author?.username ?? "unknown")}</span></header>`;
+}
+
+/** @param {string} postId @param {any[]} media */
+function threadMedia(postId, media = []) {
+  const ready = media.filter((item) => item?.status === "ready");
+  const items = ready.filter((item) => item.kind === "image" || item.kind === "video").map((item) => {
+    const href = `/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}`;
+    if (item.kind === "image")
+      return `<img src="${htmlAttr(href)}" alt="${htmlAttr(item.altText || "보관된 Threads 이미지")}" loading="lazy" decoding="async">`;
+    const thumbnail = ready.find((candidate) => candidate.kind === "video_thumbnail" &&
+      candidate.sourceMediaId === item.sourceMediaId);
+    const poster = thumbnail ? ` poster="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(thumbnail.id)}"` : "";
+    return `<video controls preload="metadata"${poster}><source src="${htmlAttr(href)}"></video>`;
+  }).join("");
+  const retries = media.filter((item) => item?.status === "error").map((item) =>
+    `<form method="post" action="/threads/${encodeURIComponent(postId)}/media/${encodeURIComponent(item.id)}/retry" data-thread-retry-form><button type="submit">미디어 재시도</button></form>`).join("");
+  return `<div data-thread-media>${items ? `<div class="thread-media">${items}</div>` : ""}${retries}</div>`;
+}
+
+/** @param {string} postId @param {any} entry @param {boolean} reply */
+function threadEntry(postId, entry, reply = false) {
+  if (!entry) return "";
+  const replyAttribute = reply ? " data-thread-author-reply" : "";
+  return `<article${replyAttribute}>${threadAuthor(postId, entry.author)}<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media)}</div></article>`;
+}
+
+/** @param {string} postId @param {any} entry */
+function threadRoot(postId, entry) {
+  if (!entry) return '<div data-thread-root><p data-thread-text>보관할 본문이 없습니다.</p></div>';
+  return `<time data-thread-published-at datetime="${htmlAttr(entry.publishedAt)}">${htmlText(seoulDate(entry.publishedAt))}</time><div data-thread-root><p data-thread-text>${threadText(entry.text, entry.links)}</p>${threadMedia(postId, entry.media)}</div>`;
+}
+
+/** @param {any} archive */
+function threadProgress(archive) {
+  const progress = archive.mediaProgress ?? {};
+  const expected = Number.isSafeInteger(progress.expected) ? progress.expected : 0;
+  const ready = Number.isSafeInteger(progress.ready) ? progress.ready : 0;
+  const failed = Number.isSafeInteger(progress.failed) ? progress.failed : 0;
+  return `<p data-thread-progress>미디어 ${htmlText(ready)}/${htmlText(expected)} 준비${failed ? ` · 실패 ${htmlText(failed)}` : ""}</p>`;
+}
+
+/** @param {any} archive @param {any[]} replies @param {boolean} detail @param {string} csrfToken */
+function threadArchive(archive, replies, detail, csrfToken) {
+  const postId = String(archive.id ?? "");
+  const postPath = `/threads/${encodeURIComponent(postId)}`;
+  const status = threadsStatusKey(archive.status) ?? "error";
+  const repliesId = detail ? ' id="author-replies"' : "";
+  const quote = archive.quote
+    ? `<section data-thread-quote><p data-thread-text>${threadText(archive.quote.text, archive.quote.links)}</p></section>`
+    : '<section data-thread-quote hidden></section>';
+  const replyMarkup = replies.map((reply) => threadEntry(postId, reply, true)).join("");
+  const allReplies = archive.replyCount > replies.length && !detail
+    ? `<a data-thread-all-replies href="${htmlAttr(`${postPath}#author-replies`)}">작성자 답글 ${htmlText(archive.replyCount)}개 모두 보기</a>` : "";
+  return `<article data-thread-archive data-thread-status="${status}">${threadAuthor(postId, archive.author)}<p data-thread-status-label>${threadsStatusText(archive.status)}</p>${threadProgress(archive)}${threadRoot(postId, archive.root)}${quote}<section${repliesId} data-thread-replies>${replyMarkup}</section><div class="thread-actions"><form method="post" action="${htmlAttr(`${postPath}/sync`)}" data-thread-sync-form>${csrf(csrfToken)}<button type="submit">동기화</button></form>${allReplies}</div><details data-thread-delete><summary>보관 삭제</summary><form method="post" action="${htmlAttr(`${postPath}/delete`)}">${csrf(csrfToken)}<input type="hidden" name="confirm" value="yes"><button type="submit" class="button-danger">보관 삭제</button></form></details></article>`;
+}
+
+/** @param {boolean} connected @param {boolean} reconnectRequired @param {string} csrfToken */
+function threadsConnection(connected, reconnectRequired, csrfToken) {
+  if (connected) return `<form method="post" action="/threads/disconnect">${csrf(csrfToken)}<button type="submit">Threads 연결 해제</button></form>`;
+  return `<p data-thread-connection>${reconnectRequired ? "Threads를 다시 연결하세요." : "Threads를 연결해 보관을 시작하세요."} <a href="/threads/connect">${reconnectRequired ? "Threads 다시 연결하기" : "Threads 연결하기"}</a></p>`;
+}
+
+/** @param {number} page @param {number} totalPages */
+function threadsIndexPagination(page, totalPages) {
+  if (totalPages <= 1) return "";
+  /** @param {number} value */
+  const href = (value) => `/threads?page=${value}`;
+  return `<nav class="thread-reply-pagination" aria-label="Threads 페이지">${page > 1 ? `<a rel="prev" href="${href(page - 1)}">이전</a>` : ""}<span>${htmlText(page)} / ${htmlText(totalPages)}</span>${page < totalPages ? `<a rel="next" href="${href(page + 1)}">다음</a>` : ""}</nav>`;
+}
+
+/** @param {any} view */
+export function renderThreadsIndexPage(view) {
+  const archives = (view.archives ?? []).slice(0, 10);
+  const connection = threadsConnection(Boolean(view.connected), Boolean(view.reconnectRequired), view.csrfToken);
+  const list = archives.length ? archives.map(/** @param {any} archive */ (archive) =>
+    threadArchive(archive, (archive.firstReplies ?? []).slice(0, 3), false, view.csrfToken)).join("")
+    : '<section data-thread-empty><h2>보관한 Threads가 없습니다</h2><p>Threads URL을 추가하세요.</p></section>';
+  return document({
+    releaseId: view.releaseId, page: "threads.css", title: "Threads - Repo Atlas",
+    body: `<main id="main" class="thread-page">${appNavigation("threads")}<header><h1>Threads</h1>${connection}</header>${errorStatus(view.flash)}<section class="thread-capture"><form method="post" action="/threads">${csrf(view.csrfToken)}<label for="threads-url">Threads 게시물 URL</label><input id="threads-url" name="url" type="url" inputmode="url" required><button type="submit">보관하기</button></form></section><section data-thread-archive-list>${list}</section>${threadsIndexPagination(view.page ?? 1, view.totalPages ?? 1)}${logoutForm(view.csrfToken)}</main>`,
+  });
+}
+
+/** @param {any} view */
+export function renderThreadsDetailPage(view) {
+  const archive = view.archive;
+  const replies = (view.replies ?? []).slice(0, 20);
+  const page = view.repliesPage ?? 1;
+  const totalPages = view.totalReplyPages ?? 1;
+  const postPath = `/threads/${encodeURIComponent(archive.id)}`;
+  const numbers = totalPages > 1 ? Array.from({ length: totalPages }, (_, index) => index + 1).map((number) =>
+    `<a href="${htmlAttr(`${postPath}?repliesPage=${number}`)}"${number === page ? ' aria-current="page"' : ""}>${number}</a>`).join("") : "";
+  const pagination = numbers ? `<nav class="thread-reply-pagination" aria-label="작성자 답글 페이지">${page > 1 ? `<a rel="prev" href="${htmlAttr(`${postPath}?repliesPage=${page - 1}`)}">이전</a>` : ""}${numbers}${page < totalPages ? `<a rel="next" href="${htmlAttr(`${postPath}?repliesPage=${page + 1}`)}">다음</a>` : ""}</nav>` : "";
+  return document({
+    releaseId: view.releaseId, page: "threads.css", title: "Threads 보관 - Repo Atlas",
+    body: `<main id="main" class="thread-page">${appNavigation("threads")}<p><a href="/threads">Threads 목록</a></p>${threadsConnection(Boolean(view.connected), Boolean(view.reconnectRequired), view.csrfToken)}${errorStatus(view.flash)}${threadArchive(archive, replies, true, view.csrfToken)}${pagination}${logoutForm(view.csrfToken)}</main>`,
   });
 }

@@ -1,0 +1,195 @@
+@layer components {
+  .thread-page {
+    max-width: 100%;
+    overflow-x: clip;
+  }
+
+  :where(nav[aria-label="주요 메뉴"]),
+  .thread-actions,
+  .thread-reply-pagination {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  :where(nav[aria-label="주요 메뉴"]) > a,
+  .thread-actions > a,
+  .thread-reply-pagination > a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-block-size: 2.75rem;
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-control);
+    text-decoration: none;
+  }
+
+  :where(nav[aria-label="주요 메뉴"]) > a[aria-current="page"],
+  .thread-reply-pagination > a[aria-current="page"] {
+    color: #ffffff;
+    background: var(--color-action-primary);
+    border-color: var(--color-action-primary);
+  }
+
+  .thread-capture,
+  [data-thread-archive],
+  [data-thread-empty] {
+    display: grid;
+    gap: var(--space-4);
+    min-width: 0;
+    padding: clamp(var(--space-4), 4vw, var(--space-6));
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-panel);
+  }
+
+  [data-thread-archive-list] {
+    display: grid;
+    gap: var(--space-4);
+  }
+
+  .thread-author {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    column-gap: var(--space-3);
+    align-items: center;
+    min-width: 0;
+  }
+
+  [data-thread-author-image] {
+    grid-row: span 2;
+    display: block;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+
+  [data-thread-author-name],
+  [data-thread-author-username],
+  [data-thread-published-at],
+  [data-thread-status-label],
+  [data-thread-progress] {
+    overflow-wrap: anywhere;
+  }
+
+  [data-thread-author-username],
+  [data-thread-published-at],
+  [data-thread-status-label],
+  [data-thread-progress] {
+    color: var(--color-text-secondary);
+    font-size: var(--text-sm);
+  }
+
+  [data-thread-root],
+  [data-thread-replies],
+  [data-thread-quote] {
+    display: grid;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+
+  [data-thread-text] {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  [data-thread-archive-list] > [data-thread-archive] [data-thread-text] {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .thread-media {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+  }
+
+  .thread-media img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: var(--radius-control);
+  }
+
+  .thread-media video {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: var(--radius-control);
+  }
+
+  [data-thread-quote] {
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-bg-subtle);
+    border-inline-start: 0.25rem solid var(--color-border-default);
+    border-radius: var(--radius-control);
+  }
+
+  [data-thread-replies] > article {
+    display: grid;
+    gap: var(--space-2);
+    padding-block: var(--space-4);
+    border-top: 1px solid var(--color-border-subtle);
+  }
+
+  .thread-actions > form,
+  [data-thread-media] > form,
+  [data-thread-delete] > form {
+    display: block;
+    margin: 0;
+  }
+
+  [data-thread-media] {
+    display: grid;
+    gap: var(--space-2);
+  }
+
+  [data-thread-delete] {
+    display: grid;
+    gap: var(--space-2);
+  }
+
+  [data-thread-delete] > summary {
+    width: fit-content;
+    min-block-size: 2.75rem;
+    padding: var(--space-2) var(--space-4);
+    color: #ffffff;
+    background: var(--color-status-danger);
+    border: 1px solid var(--color-status-danger);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+
+  [data-thread-progress] {
+    min-block-size: 1.5rem;
+    transition: color 160ms ease;
+  }
+
+  [data-thread-archive][data-thread-status="partial"] [data-thread-progress] {
+    color: var(--color-status-warning);
+  }
+
+  [data-thread-archive][data-thread-status="error"] [data-thread-progress] {
+    color: var(--color-status-danger);
+  }
+
+  @media (min-width: 840px) {
+    .thread-media { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-thread-progress] { transition: none; }
+  }
+
+  @media (max-width: 359px) {
+    .thread-page { overflow-x: clip; }
+  }
+}

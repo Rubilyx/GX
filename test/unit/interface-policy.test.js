@@ -3,7 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
 const CSS_FILES = Object.freeze([
-  "core.css", "layers.css", "login.css", "repositories.css", "tokens.css",
+  "core.css", "layers.css", "login.css", "repositories.css", "threads.css", "tokens.css",
 ]);
 const ASSET_ROOT = new URL("../../public/assets/", import.meta.url);
 
@@ -324,7 +324,7 @@ test("control border policy derives contrast and token use from parsed CSS decla
     descendants(nodes).reduce((subtotal, node) => subtotal +
       [...node.declarations.values()].reduce((uses, value) =>
         uses + countVariableReferences(value, "--color-border-control"), 0), 0), 0);
-  assert.equal(usageCount, 1, "the control-border token must have one declaration use across five CSS files");
+  assert.equal(usageCount, 1, "the control-border token must have one declaration use across six CSS files");
   const control = assertOwnRule(core, "input", { "border-color": "var(--color-border-control)" });
   assert.deepEqual([...control.selectors].sort(), ["input", "select", "textarea"]);
   assertOwnRule(core, "select", { "padding-inline-end": "var(--space-8)" });
@@ -335,6 +335,44 @@ test("control border policy derives contrast and token use from parsed CSS decla
     outline: "0.1875rem solid var(--color-action-primary)",
     "outline-offset": "0.1875rem",
   });
+});
+
+test("CSS inventory includes the layered responsive Threads archive presentation", async () => {
+  const source = await asset("threads.css");
+  assert.match(source, /^@layer components \{/);
+  const threads = parseCss(source);
+  assertOwnRule(threads, ':where(nav[aria-label="주요 메뉴"]) > a', {
+    display: "inline-flex", "align-items": "center", "min-block-size": "2.75rem",
+  });
+  assertOwnRule(threads, ".thread-media", {
+    display: "grid", "grid-template-columns": "minmax(0, 1fr)", gap: "var(--space-2)",
+  });
+  assertOwnRule(threads, ".thread-media img", {
+    width: "100%", "aspect-ratio": "1 / 1", "object-fit": "cover",
+  });
+  assertOwnRule(threads, ".thread-media video", {
+    width: "100%", "aspect-ratio": "16 / 9", "object-fit": "cover",
+  });
+  assertOwnRule(threads, "[data-thread-text]", {
+    "white-space": "pre-wrap", "overflow-wrap": "anywhere",
+  });
+  assertOwnRule(threads, "[data-thread-archive-list] > [data-thread-archive] [data-thread-text]", {
+    display: "-webkit-box", "-webkit-line-clamp": "4", "-webkit-box-orient": "vertical", overflow: "hidden",
+  });
+  const desktop = descendants(threads).find((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (min-width: 840px)"));
+  assert.ok(desktop);
+  assertOwnRule(desktop.children, ".thread-media", {
+    "grid-template-columns": "repeat(2, minmax(0, 1fr))",
+  });
+  const reduced = descendants(threads).find((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (prefers-reduced-motion: reduce)"));
+  assert.ok(reduced);
+  assertOwnRule(reduced.children, "[data-thread-progress]", { transition: "none" });
+  const narrow = descendants(threads).find((node) => node.kind === "at-rule" &&
+    node.prelude === normalizeAtRule("@media (max-width: 359px)"));
+  assert.ok(narrow);
+  assertOwnRule(narrow.children, ".thread-page", { "overflow-x": "clip" });
 });
 
 test("global layout tokens implement the approved five width classes", async () => {

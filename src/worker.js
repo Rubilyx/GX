@@ -36,13 +36,13 @@ import {
   deleteThreadsArchive, handleThreadsMediaDeadLetter, handleThreadsMediaMessage,
   serveThreadsMedia,
 } from "./thread-media.js";
+import {
+  dispatchThreadsQueue, dispatchThreadsScheduled, matchThreadsRoute,
+} from "./threads-worker.js";
 
 const REPOSITORY_PATH = /^\/repositories\/([0-9a-f-]+)(?:\/(activity|refresh|delete))?$/;
 const REPOSITORY_NOTES_PATH =
   /^\/repositories\/([0-9a-f-]+)\/notes(?:\/([0-9a-f-]+)(?:\/(delete))?)?$/;
-const THREADS_POST_PATH = /^\/threads\/([0-9a-f-]+)(?:\/(sync|delete))?$/;
-const THREADS_MEDIA_PATH =
-  /^\/threads\/([0-9a-f-]+)\/media\/([0-9a-f-]+)(?:\/(retry))?$/;
 const ASSET_PATH = /^\/assets\/([^/]+)\/([^/]+)$/;
 const ASSETS = new Set([
   "layers.css", "tokens.css", "core.css", "login.css", "repositories.css",
@@ -63,7 +63,6 @@ const COOKIE_EXPIRED = "__Host-repo_atlas_session=; HttpOnly; Secure; SameSite=S
 const LOGIN_CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; connect-src 'none'; report-uri /csp-report";
 const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://github.com https://avatars.githubusercontent.com; media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; trusted-types 'none'";
-const THREADS_DAILY_CRON = "0 3 * * *";
 
 /**
  * @typedef {object} Runtime
@@ -352,9 +351,8 @@ function pageRoute(raw, allowedOrigin, errorCode) {
     if (url.origin !== allowedOrigin || url.username || url.password) appError(errorCode, 400);
     if (url.pathname === "/" || url.pathname === "/login" || url.pathname === "/health")
       return url.pathname;
-    if (url.pathname === "/threads") return "/threads";
-    if (THREADS_MEDIA_PATH.test(url.pathname)) return "/threads/:id/media/:mediaId";
-    if (THREADS_POST_PATH.test(url.pathname)) return "/threads/:id";
+    const threadsRoute = matchThreadsRoute(url.pathname);
+    if (threadsRoute) return threadsRoute.template;
     if (REPOSITORY_NOTES_PATH.test(url.pathname)) return "/repositories/:id/notes";
     if (/^\/repositories\/[^/]+$/.test(url.pathname)) return "/repositories/:id";
   } catch (error) {
@@ -599,21 +597,17 @@ function threadsEtag(archive) {
   return `"threads-${archive.syncGeneration}-${archive.status}-${archive.updatedAt}"`;
 }
 
-/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} repositoryMatch @param {RegExpExecArray | null} notesMatch @param {RegExpExecArray | null} threadsPostMatch @param {RegExpExecArray | null} threadsMediaMatch */
-function knownRoute(method, pathname, repositoryMatch, notesMatch,
-  threadsPostMatch, threadsMediaMatch) {
+/** @param {string} method @param {string} pathname @param {RegExpExecArray | null} repositoryMatch @param {RegExpExecArray | null} notesMatch @param {ReturnType<typeof matchThreadsRoute>} threadsRoute */
+function knownRoute(method, pathname, repositoryMatch, notesMatch, threadsRoute) {
   const fixed = new Map([
     ["/health", ["GET"]], ["/login", ["GET"]], ["/session", ["POST"]],
     ["/session/logout", ["POST"]], ["/", ["GET"]], ["/repositories", ["POST"]],
     ["/telemetry", ["POST"]], ["/csp-report", ["POST"]],
-    ["/threads", ["GET", "POST"]], ["/threads/connect", ["GET"]],
-    ["/threads/oauth/callback", ["GET"]], ["/threads/disconnect", ["POST"]],
   ]);
   const allowed = fixed.get(pathname) ?? (notesMatch
     ? (notesMatch[2] ? ["POST"] : ["GET", "POST"])
     : repositoryMatch ? (repositoryMatch[2] ? ["POST"] : ["GET", "POST"])
-      : threadsMediaMatch ? (threadsMediaMatch[3] ? ["POST"] : ["GET", "HEAD"])
-        : threadsPostMatch ? (threadsPostMatch[2] ? ["POST"] : ["GET"]) : null);
+      : threadsRoute?.methods ?? null);
   if (!allowed) return null;
   if (!allowed.includes(method)) return empty(405, { Allow: allowed.join(", ") });
   return false;
@@ -935,11 +929,9 @@ async function dispatchRequest(request, env, context, fetcher) {
   }
   const repositoryMatch = REPOSITORY_PATH.exec(url.pathname);
   const notesMatch = REPOSITORY_NOTES_PATH.exec(url.pathname);
-  const threadsPostMatch = THREADS_POST_PATH.exec(url.pathname);
-  const threadsMediaMatch = THREADS_MEDIA_PATH.exec(url.pathname);
+  const threadsRoute = matchThreadsRoute(url.pathname);
   const methodResult = knownRoute(
-    request.method, url.pathname, repositoryMatch, notesMatch,
-    threadsPostMatch, threadsMediaMatch,
+    request.method, url.pathname, repositoryMatch, notesMatch, threadsRoute,
   );
   if (methodResult) return methodResult;
   if (methodResult === null) return plain(404, "Not Found");
@@ -947,9 +939,7 @@ async function dispatchRequest(request, env, context, fetcher) {
   try {
     const queryRoute = request.method === "GET" &&
       (url.pathname === "/" || (repositoryMatch && !repositoryMatch[2]) ||
-        (notesMatch && !notesMatch[2]) || url.pathname === "/threads" ||
-        (threadsPostMatch && !threadsPostMatch[2]) ||
-        url.pathname === "/threads/oauth/callback");
+        (notesMatch && !notesMatch[2]) || Boolean(threadsRoute?.queryAllowed));
     if (url.search && !queryRoute) appError("invalid_query", 400);
     if (request.method === "GET" && url.pathname === "/health")
       return json({ status: "ok", releaseId: runtime.releaseId });
@@ -964,12 +954,8 @@ async function dispatchRequest(request, env, context, fetcher) {
     if (request.method === "POST" && url.pathname === "/csp-report")
       return await cspReportRoute(request, runtime);
 
-    const isThreadsPath = url.pathname === "/threads" ||
-      url.pathname === "/threads/connect" || url.pathname === "/threads/disconnect" ||
-      url.pathname === "/threads/oauth/callback" || Boolean(threadsPostMatch) ||
-      Boolean(threadsMediaMatch);
-    const threadsRuntime = isThreadsPath ? requireThreadsRuntime(runtime) : null;
-    if (url.pathname === "/threads/oauth/callback") {
+    const threadsRuntime = threadsRoute ? requireThreadsRuntime(runtime) : null;
+    if (threadsRoute?.kind === "callback") {
       const nowSeconds = Math.floor(Date.now() / 1_000);
       const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
       const result = await finishThreadsOAuth(configured.db, {
@@ -990,7 +976,7 @@ async function dispatchRequest(request, env, context, fetcher) {
       appError("session_expired", 401);
     }
     if (request.method === "GET" && url.pathname === "/") return await renderIndex(url, runtime, session);
-    if (request.method === "GET" && url.pathname === "/threads/connect") {
+    if (threadsRoute?.kind === "connect") {
       const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
       const result = await beginThreadsOAuth({
         appId: configured.threadsAppId,
@@ -1000,14 +986,14 @@ async function dispatchRequest(request, env, context, fetcher) {
       });
       return redirect(result.location, { "Set-Cookie": result.setCookie });
     }
-    if (request.method === "POST" && url.pathname === "/threads/disconnect") {
+    if (threadsRoute?.kind === "disconnect") {
       const form = await parseForm(request, 16_384, new Set(["csrf"]));
       await requireAuthenticatedMutation(request, runtime, form);
       const disconnected = await disconnectThreads(runtime.db);
       return wantsJson ? json({ disconnected })
         : redirect("/threads?flash=threads_disconnected");
     }
-    if (url.pathname === "/threads") return await threadsListRoute(
+    if (threadsRoute?.kind === "list") return await threadsListRoute(
       request, /** @type {ThreadsRuntime} */ (threadsRuntime),
       fetcher, session, wantsJson, url,
     );
@@ -1027,22 +1013,24 @@ async function dispatchRequest(request, env, context, fetcher) {
         : result.analysisStatus === "error" ? "repository_analysis_error" : "repository_created";
       return redirect(`/repositories/${result.repositoryId}?flash=${flash}`);
     }
-    if (threadsMediaMatch) {
-      const [, postId, mediaId, action] = threadsMediaMatch;
+    if (threadsRoute?.kind === "media" || threadsRoute?.kind === "retry") {
+      const postId = /** @type {string} */ (threadsRoute.postId);
+      const mediaId = /** @type {string} */ (threadsRoute.mediaId);
       const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
-      if (action === "retry")
+      if (threadsRoute.kind === "retry")
         return await threadsRetryRoute(request, configured, postId, mediaId, wantsJson);
       return secureMediaResponse(await serveThreadsMedia(request, {
         db: configured.db, bucket: configured.threadsMedia,
       }));
     }
-    if (threadsPostMatch) {
-      const [, postId, action] = threadsPostMatch;
+    if (threadsRoute && ["detail", "sync", "delete"].includes(
+      /** @type {string} */ (threadsRoute.kind))) {
+      const postId = /** @type {string} */ (threadsRoute.postId);
       const configured = /** @type {ThreadsRuntime} */ (threadsRuntime);
-      if (request.method === "GET")
+      if (threadsRoute.kind === "detail")
         return await threadsDetailRoute(url, configured, fetcher, session, postId, wantsJson, request);
       return await threadsMutationRoute(request, configured, postId,
-        /** @type {string} */ (action), wantsJson);
+        /** @type {string} */ (threadsRoute.kind), wantsJson);
     }
     if (notesMatch) {
       const [, repositoryId, noteId, action] = notesMatch;
@@ -1065,18 +1053,13 @@ async function dispatchRequest(request, env, context, fetcher) {
 function safeRouteTemplate(pathname) {
   if (ASSET_PATH.test(pathname)) return "/assets/:release/:file";
   if (REPOSITORY_NOTES_PATH.test(pathname)) return "/repositories/:id/notes";
-  const threadsMedia = THREADS_MEDIA_PATH.exec(pathname);
-  if (threadsMedia) return threadsMedia[3]
-    ? "/threads/:id/media/:mediaId/retry" : "/threads/:id/media/:mediaId";
-  const threadsPost = THREADS_POST_PATH.exec(pathname);
-  if (threadsPost) return threadsPost[2]
-    ? `/threads/:id/${threadsPost[2]}` : "/threads/:id";
+  const threadsRoute = matchThreadsRoute(pathname);
+  if (threadsRoute) return threadsRoute.template;
   const repository = REPOSITORY_PATH.exec(pathname);
   if (repository) return repository[2] ? `/repositories/:id/${repository[2]}` : "/repositories/:id";
   if (new Set([
     "/health", "/login", "/session", "/session/logout", "/", "/repositories",
-    "/telemetry", "/csp-report", "/threads", "/threads/connect",
-    "/threads/oauth/callback", "/threads/disconnect",
+    "/telemetry", "/csp-report",
   ]).has(pathname)) return pathname;
   return "unmatched";
 }
@@ -1142,9 +1125,14 @@ function observedFetcher(fetcher, state) {
 export async function handleRequest(request, env, context, fetcher = globalThis.fetch) {
   const startedAt = Date.now();
   const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
+  const callback = new URL(request.url).pathname === "/threads/oauth/callback";
   let response;
   try { response = await dispatchRequest(request, env, context, observedFetcher(fetcher, state)); }
   catch { response = plain(500, "internal_error"); }
+  if (callback) {
+    response = new Response(response.body, response);
+    response.headers.set("Set-Cookie", clearThreadsOAuthCookie());
+  }
   const record = {
     requestId: crypto.randomUUID(),
     routeTemplate: safeRouteTemplate(new URL(request.url).pathname),
@@ -1167,13 +1155,6 @@ function threadsEventRuntime(env) {
   return requireThreadsRuntime(runtime);
 }
 
-/** @param {unknown} message @param {"capture" | "media"} kind */
-function validQueueBody(message, kind) {
-  try {
-    return kind === "capture" ? validateCaptureMessage(message) : validateMediaMessage(message);
-  } catch { return null; }
-}
-
 /**
  * @param {any} batch
  * @param {RuntimeEnv} env
@@ -1182,18 +1163,6 @@ function validQueueBody(message, kind) {
  */
 export async function handleThreadsQueue(batch, env, context, fetcher = globalThis.fetch) {
   const runtime = threadsEventRuntime(env);
-  if (!batch || typeof batch !== "object" || typeof batch.queue !== "string" ||
-    !Array.isArray(batch.messages)) throw new Error("threads_queue_not_configured");
-  /** @type {Map<string, { kind: "capture" | "media", handler: (message: unknown, dependencies: any) => Promise<any> }>} */
-  const routes = new Map([
-    [runtime.threadsCaptureQueueName, { kind: "capture", handler: handleThreadsCaptureMessage }],
-    [runtime.threadsMediaQueueName, { kind: "media", handler: handleThreadsMediaMessage }],
-    [runtime.threadsCaptureDlqName,
-      { kind: "capture", handler: handleThreadsCaptureDeadLetter }],
-    [runtime.threadsMediaDlqName, { kind: "media", handler: handleThreadsMediaDeadLetter }],
-  ]);
-  const route = routes.get(batch.queue);
-  if (!route) throw new Error("threads_queue_not_configured");
   void context;
   const nowSeconds = Math.floor(Date.now() / 1_000);
   const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
@@ -1201,35 +1170,36 @@ export async function handleThreadsQueue(batch, env, context, fetcher = globalTh
   const getAccessToken = () => getThreadsAccessToken(
     runtime.db, threadsTokenInput(runtime, safeFetcher, nowSeconds),
   );
-  for (const item of batch.messages) {
-    if (!item || typeof item !== "object" || typeof item.ack !== "function" ||
-      typeof item.retry !== "function") continue;
-    const body = validQueueBody(item.body, route.kind);
-    if (!body) {
-      try { await item.ack(); } catch {}
-      continue;
-    }
-    let result;
-    try {
-      result = await route.handler(body, {
-        db: runtime.db, bucket: runtime.threadsMedia,
-        captureQueue: runtime.threadsCaptureQueue, mediaQueue: runtime.threadsMediaQueue,
-        fetcher: safeFetcher, getAccessToken, recalculateStatus: recalculateThreadsStatus,
-        nowSeconds,
-        deleteArchive: (/** @type {unknown} */ message) => deleteThreadsArchive(message, {
-          db: runtime.db, bucket: runtime.threadsMedia, nowSeconds,
-        }),
-      });
-    } catch { result = { action: "retry", delaySeconds: 1 }; }
-    if (result?.action === "retry") {
-      const raw = result.delaySeconds;
-      const delaySeconds = Number.isSafeInteger(raw) && raw > 0
-        ? Math.min(900, raw) : 1;
-      try { await item.retry({ delaySeconds }); } catch {}
-    } else {
-      try { await item.ack(); } catch {}
-    }
-  }
+  const dependencies = {
+    db: runtime.db, bucket: runtime.threadsMedia,
+    captureQueue: runtime.threadsCaptureQueue, mediaQueue: runtime.threadsMediaQueue,
+    fetcher: safeFetcher, getAccessToken, recalculateStatus: recalculateThreadsStatus,
+    nowSeconds,
+    deleteArchive: (/** @type {unknown} */ message) => deleteThreadsArchive(message, {
+      db: runtime.db, bucket: runtime.threadsMedia, nowSeconds,
+    }),
+  };
+  return dispatchThreadsQueue(batch, {
+    capture: runtime.threadsCaptureQueueName, media: runtime.threadsMediaQueueName,
+    captureDlq: runtime.threadsCaptureDlqName, mediaDlq: runtime.threadsMediaDlqName,
+  }, {
+    validateCapture: validateCaptureMessage, validateMedia: validateMediaMessage,
+    capture: (message) => handleThreadsCaptureMessage(message, dependencies),
+    media: (message) => handleThreadsMediaMessage(message, dependencies),
+    captureDlq: (message) => handleThreadsCaptureDeadLetter(message, dependencies),
+    mediaDlq: (message) => handleThreadsMediaDeadLetter(message, dependencies),
+  });
+}
+
+/** @param {ThreadsRuntime} runtime @param {typeof fetch} fetcher */
+function scheduledAdapters(runtime, fetcher) {
+  const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
+  const safeFetcher = observedFetcher(fetcher, state);
+  return {
+    refresh: (/** @type {number} */ nowSeconds) => refreshStoredThreadsCredential(
+      runtime.db, threadsTokenInput(runtime, safeFetcher, nowSeconds),
+    ),
+  };
 }
 
 /**
@@ -1242,13 +1212,9 @@ export async function handleThreadsScheduled(
   env, context, fetcher = globalThis.fetch, nowSeconds = Math.floor(Date.now() / 1_000),
 ) {
   const runtime = threadsEventRuntime(env);
-  if (!context || typeof context.waitUntil !== "function")
-    throw new Error("threads_schedule_not_configured");
-  const state = { githubStatus: "none", openAiStatus: "none", threadsStatus: "none" };
-  const promise = refreshStoredThreadsCredential(runtime.db,
-    threadsTokenInput(runtime, observedFetcher(fetcher, state), nowSeconds));
-  context.waitUntil(promise);
-  return promise;
+  return dispatchThreadsScheduled({
+    cron: "0 3 * * *", scheduledTime: nowSeconds * 1_000,
+  }, context, scheduledAdapters(runtime, fetcher));
 }
 
 /** @param {RuntimeEnv} env */
@@ -1276,11 +1242,11 @@ export default {
   },
   /** @param {{ cron?: string, scheduledTime?: number }} controller @param {RuntimeEnv} env @param {{ waitUntil(promise: Promise<unknown>): void }} context */
   scheduled(controller, env, context) {
-    if (controller?.cron !== THREADS_DAILY_CRON)
-      throw new Error("threads_schedule_not_configured");
-    const nowSeconds = Number.isFinite(controller.scheduledTime)
-      ? Math.floor(/** @type {number} */ (controller.scheduledTime) / 1_000)
-      : Math.floor(Date.now() / 1_000);
-    return handleThreadsScheduled(env, context, defaultEventFetcher(env), nowSeconds);
+    return dispatchThreadsScheduled(controller, context, {
+      refresh(nowSeconds) {
+        const runtime = threadsEventRuntime(env);
+        return scheduledAdapters(runtime, defaultEventFetcher(env)).refresh(nowSeconds);
+      },
+    });
   },
 };

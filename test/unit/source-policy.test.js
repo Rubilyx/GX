@@ -185,6 +185,24 @@ test("reports secret rules without disclosing secret values", async (context) =>
   assert.doesNotMatch(errors, new RegExp(`${openAi}|${github}|literal-value`));
 });
 
+test("Threads boundary source is scanned and logging stays fixed-field only", async (context) => {
+  const worker = await readFile(join(process.cwd(), "src/worker.js"), "utf8");
+  const boundary = await readFile(join(process.cwd(), "src/threads-worker.js"), "utf8");
+  const logCalls = [...`${worker}\n${boundary}`.matchAll(
+    /console\.(?:log|error|warn|info|debug)\([^;]*\);/g,
+  )].map((match) => match[0]);
+  assert.deepEqual(logCalls, ["console.log(record);"]);
+  assert.doesNotMatch(logCalls.join("\n"),
+    /token|state|code|text|cdn|provider|path|query|header|body|url/i);
+
+  const secret = ["sk", "12345678901234567890"].join("-");
+  const errors = await errorsFor(context, safeFiles({
+    "src/threads-worker.js": `const unsafe = "${secret}";`,
+  }));
+  assert.match(errors, /src\/threads-worker\.js: OpenAI secret/);
+  assert.doesNotMatch(errors, new RegExp(secret));
+});
+
 test("parses ASI imports and export-from edges into the preload graph", async (context) => {
   const root = await fixture(safeFiles({
     "public/modulepreload.json": "[\n  \"capture.js\",\n  \"dom.js\",\n  \"reexport.js\"\n]\n",

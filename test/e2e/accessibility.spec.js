@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, loginAndSeed, test } from "./fixtures.js";
+import { seedThreadsArchive } from "../support/harness.js";
 
 test.beforeEach(async ({ page }) => {
   test.skip(test.info().project.name === "chromium-no-js");
@@ -160,4 +161,44 @@ test("reduced motion leaves no nontrivial animation or transition", async ({ pag
     expect(Number.parseFloat(animation)).toBeLessThanOrEqual(0.01);
     expect(Number.parseFloat(transition)).toBeLessThanOrEqual(0.01);
   }
+});
+
+test("Threads empty, reconnect, collecting, ready, partial, detail, and delete dialog pass axe", async ({
+  page, harness,
+}) => {
+  await page.goto("/threads");
+  await expect(page.locator("[data-thread-empty]")).toBeVisible();
+  await expect(page.locator("[data-thread-connection]")).toContainText(
+    /Threads를 (?:다시 )?연결/,
+  );
+  await expectNoBlockingAxe(page);
+
+  const env = await harness.worker.getEnv();
+  const states = [
+    { id: "11111111-1111-4111-8111-111111111111", root: "21111111-1111-4111-8111-111111111111", shortcode: "CollectingA11y", status: "collecting", job: "collecting" },
+    { id: "12222222-2222-4222-8222-222222222222", root: "22222222-2222-4222-8222-222222222222", shortcode: "ReadyA11y", status: "ready", job: "ready" },
+    { id: "13333333-3333-4333-8333-333333333333", root: "23333333-3333-4333-8333-333333333333", shortcode: "PartialA11y", status: "partial", job: "partial" },
+  ];
+  for (const [index, state] of states.entries()) await seedThreadsArchive(env.PROD_DB, {
+    id: state.id, rootEntryId: state.root, shortcode: state.shortcode,
+    threadsMediaId: `a11y-root-${index}`, authorId: String(81000 + index),
+    username: `a11y${index}`, displayName: `A11y ${index}`,
+    submittedUrl: `https://www.threads.com/@a11y${index}/post/${state.shortcode}`,
+    canonicalUrl: `https://www.threads.com/@a11y${index}/post/${state.shortcode}`,
+    rootPermalink: `https://www.threads.com/@a11y${index}/post/${state.shortcode}`,
+    status: state.status, jobStatus: state.job,
+  });
+  await page.goto("/threads");
+  for (const state of ["collecting", "ready", "partial"])
+    await expect(page.locator(`[data-thread-status="${state}"]`)).toHaveCount(1);
+  await expectNoBlockingAxe(page);
+
+  await page.goto(`/threads/${states[1].id}`);
+  await expectNoBlockingAxe(page);
+  const opener = page.locator("[data-thread-delete] > summary");
+  await opener.click();
+  await expect(page.locator("[data-thread-delete-dialog]")).toBeVisible();
+  await expectNoBlockingAxe(page);
+  await page.keyboard.press("Escape");
+  await expect(opener).toBeFocused();
 });

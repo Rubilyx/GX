@@ -31,8 +31,14 @@ const vars = Object.freeze({
 
 /** @param {unknown} error */
 export function shouldRetryBrowserListen(error) {
-  return error instanceof TypeError && /bad port/i.test(`${error.message} ${
-    error.cause instanceof Error ? error.cause.message : ""}`);
+  const record = error && typeof error === "object" && !Array.isArray(error)
+    ? /** @type {Record<string, unknown>} */ (error) : null;
+  const cause = record?.cause && typeof record.cause === "object" &&
+    !Array.isArray(record.cause)
+    ? /** @type {Record<string, unknown>} */ (record.cause) : null;
+  return (error instanceof TypeError || record?.name === "TypeError") &&
+    /bad port/i.test(`${typeof record?.message === "string" ? record.message : ""} ${
+      typeof cause?.message === "string" ? cause.message : ""}`);
 }
 
 /** @param {unknown} error */
@@ -473,6 +479,15 @@ export async function startHarness() {
   const originalFetch = globalThis.fetch;
   /** @type {URL} */
   let url;
+  async function resetForBrowser() {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try { await server.reset(); return; }
+      catch (error) {
+        if (!shouldRetryBrowserListen(error)) throw error;
+      }
+    }
+    throw new Error("test_harness_unsafe_port");
+  }
   async function listenForBrowser() {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const listener = await server.listen();
@@ -481,7 +496,7 @@ export async function startHarness() {
         return listener.url;
       } catch (error) {
         if (shouldRetryBrowserListen(error)) {
-          await server.reset();
+          await resetForBrowser();
           continue;
         }
         if (shouldAcceptBrowserListen(error)) return listener.url;
@@ -492,7 +507,29 @@ export async function startHarness() {
   }
   url = await listenForBrowser();
   /** @type {import("wrangler").WorkerHandle<Env>} */
-  const remoteWorker = server.getWorker();
+  let remoteWorker = server.getWorker();
+  const configuredWorker = {
+    /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+    fetch(input, init) {
+      if (init?.body instanceof FormData) {
+        const body = new URLSearchParams();
+        for (const [name, value] of init.body) {
+          if (typeof value !== "string") throw new Error("test_configured_file_unsupported");
+          body.append(name, value);
+        }
+        const headers = new Headers(init.headers);
+        headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
+        return server.fetch(String(input), /** @type {any} */ ({
+          redirect: "manual", ...init, body, headers,
+        }));
+      }
+      return server.fetch(String(input), /** @type {any} */ ({
+        redirect: "manual", ...init,
+      }));
+    },
+  };
+  /** @type {{ origin: string, cookie: string, csrf: string } | undefined} */
+  let configuredSession;
   let providerMode = {};
   /** @type {Record<string, unknown>[]} */
   const captureMessages = [];
@@ -627,6 +664,30 @@ export async function startHarness() {
   };
   /** @param {any} options */
   async function setProviderMode(options) { providerMode = { ...options }; }
+  /** @param {string} id @param {string} expectedStatus @param {number} [timeoutMs] */
+  async function waitForThreadsArchive(id, expectedStatus, timeoutMs = 10_000) {
+    if (!configuredSession)
+      configuredSession = await login(configuredWorker, { origin: url.origin });
+    const deadline = Date.now() + timeoutMs;
+    let delayMs = 25;
+    do {
+      const { cookie } = configuredSession;
+      const response = await configuredWorker.fetch(
+        `${configuredSession.origin}/threads/${encodeURIComponent(id)}`,
+        { headers: { Accept: "application/json", Cookie: cookie } },
+      );
+      if (response.status === 200) {
+        const body = /** @type {any} */ (await response.json());
+        if (body?.archive?.status === expectedStatus) return body;
+      } else await response.body?.cancel();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remaining)));
+      delayMs = Math.min(delayMs * 2, 250);
+    } while (Date.now() <= deadline);
+    server.debug();
+    throw new Error(`test_threads_archive_timeout:${expectedStatus}`);
+  }
   /** @param {{ captureReject?: boolean, mediaReject?: boolean }} options */
   async function setQueueMode(options) {
     queueMode = {
@@ -706,9 +767,11 @@ export async function startHarness() {
       JSON.stringify(entry).match(/provider_fixture:[a-z_]+/g) ?? []);
   }
   async function reset() {
-    await server.reset();
+    await resetForBrowser();
     url = await listenForBrowser();
+    remoteWorker = server.getWorker();
     providerMode = {};
+    configuredSession = undefined;
     captureMessages.length = 0;
     mediaMessages.length = 0;
     queueMode = { captureReject: false, mediaReject: false };
@@ -727,9 +790,11 @@ export async function startHarness() {
   }
   return {
     get url() { return url; },
-    server, worker, captureQueue, mediaQueue, captureMessages, mediaMessages, mediaBucket,
+    get remoteWorker() { return remoteWorker; },
+    server, worker, configuredWorker, captureQueue, mediaQueue, captureMessages,
+    mediaMessages, mediaBucket,
     setProviderMode, setQueueMode, setR2Mode, setAssetMode,
-    drainCaptureQueue, drainMediaQueue, mediaObjects,
+    drainCaptureQueue, drainMediaQueue, mediaObjects, waitForThreadsArchive,
     providerCalls, reset, close,
   };
 }

@@ -166,6 +166,7 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     controller.close();
   } });
   let count = 0;
+  let sourceCompleted = false;
   /** @type {AppError | null} */
   let countedError = null;
   const counted = source.pipeThrough(new TransformStream({
@@ -182,16 +183,29 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
         throw countedError;
       }
     },
+    flush() { sourceCompleted = true; },
   }));
+  let stored = counted;
+  /** @type {Promise<void> | null} */
+  let fixedLengthCompletion = null;
+  if (declared !== null && typeof FixedLengthStream === "function") {
+    const fixed = new FixedLengthStream(declared);
+    fixedLengthCompletion = counted.pipeTo(fixed.writable);
+    stored = fixed.readable;
+  }
   let rawResult;
   try {
-    rawResult = await bucket.put(input.key, counted, {
+    rawResult = await bucket.put(input.key, stored, {
       httpMetadata: { contentType },
       onlyIf: { etagDoesNotMatch: "*" },
     });
+    await fixedLengthCompletion;
   } catch (error) {
-    cancelUnused(counted);
+    cancelUnused(stored);
+    await fixedLengthCompletion?.catch(() => {});
     if (countedError !== null) throw countedError;
+    if (sourceCompleted && declared !== null && count !== declared)
+      throw new AppError("media_byte_mismatch", 400);
     throw new ThreadsMediaPutUncertainError(input.key);
   }
   let result;

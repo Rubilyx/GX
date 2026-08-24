@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { AppError } from "../../src/domain.js";
 import {
   handleThreadsMediaMessage, parseSingleRange,
 } from "../../src/thread-media.js";
+import {
+  downloadThreadsMedia,
+} from "../../src/thread-media-download.js";
 
 const ACK = { action: "ack" };
 
@@ -87,6 +91,100 @@ function recordingBucket() {
     async delete(key) { deleted.push(key); objects.delete(key); },
   };
 }
+
+const knownLength = Symbol("knownLength");
+
+/** @param {() => Promise<void>} run */
+async function withFixedLengthStream(run) {
+  const globals = /** @type {any} */ (globalThis);
+  const previous = globals.FixedLengthStream;
+  globals.FixedLengthStream = class extends TransformStream {
+    /** @param {number} length */
+    constructor(length) {
+      let bytes = 0;
+      super({
+        transform(chunk, controller) {
+          bytes += chunk.byteLength;
+          if (bytes > length) throw new TypeError("fixed_length_exceeded");
+          controller.enqueue(chunk);
+        },
+        flush() {
+          if (bytes !== length) throw new TypeError("fixed_length_mismatch");
+        },
+      });
+      Object.defineProperty(this.readable, knownLength, { value: length });
+    }
+  };
+  try { await run(); }
+  finally {
+    if (previous === undefined) delete globals.FixedLengthStream;
+    else globals.FixedLengthStream = previous;
+  }
+}
+
+test("declared media keeps a known-length stream while R2 consumes it concurrently", async () => {
+  await withFixedLengthStream(async () => {
+    let stored = new Uint8Array();
+    const result = await downloadThreadsMedia({
+      /** @param {string} key @param {ReadableStream<Uint8Array>} body */
+      async put(key, body) {
+        assert.equal((/** @type {any} */ (body))[knownLength], 4);
+        stored = new Uint8Array(await new Response(body).arrayBuffer());
+        return { key, size: stored.byteLength, httpEtag: '"fixed"' };
+      },
+    }, async () => streamingResponse(new Uint8Array([1, 2, 3, 4]), { headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "4",
+    } }), {
+      url: "https://scontent.cdninstagram.com/object", key: "threads/fixed/image",
+      expected: new Set(["image/jpeg"]), maximumBytes: 16,
+    });
+    assert.deepEqual(stored, new Uint8Array([1, 2, 3, 4]));
+    assert.deepEqual(result, {
+      key: "threads/fixed/image", size: 4, httpEtag: '"fixed"',
+      contentType: "image/jpeg",
+    });
+  });
+});
+
+test("a short declared fixed-length stream remains a terminal byte mismatch", async () => {
+  await withFixedLengthStream(async () => {
+    await assert.rejects(downloadThreadsMedia({
+      /** @param {string} key @param {ReadableStream<Uint8Array>} body */
+      async put(key, body) {
+        await new Response(body).arrayBuffer();
+        return { key, size: 3, httpEtag: '"short"' };
+      },
+    }, async () => streamingResponse(new Uint8Array([1, 2, 3]), { headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "4",
+    } }), {
+      url: "https://scontent.cdninstagram.com/object", key: "threads/fixed/short",
+      expected: new Set(["image/jpeg"]), maximumBytes: 16,
+    }), (error) => error instanceof AppError &&
+      error.code === "media_byte_mismatch" && error.status === 400);
+  });
+});
+
+test("an early R2 failure aborts the fixed-length pump without hanging", async () => {
+  await withFixedLengthStream(async () => {
+    const operation = downloadThreadsMedia({
+      async put() { throw new Error("r2_unavailable"); },
+    }, async () => streamingResponse(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array([1, 2, 3, 4])); },
+    }), { headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "4",
+    } }), {
+      url: "https://scontent.cdninstagram.com/object", key: "threads/fixed/failure",
+      expected: new Set(["image/jpeg"]), maximumBytes: 16,
+    });
+    await assert.rejects(Promise.race([
+      operation,
+      new Promise((resolve, reject) => setTimeout(
+        () => reject(new Error("fixed_length_abort_timeout")), 250,
+      )),
+    ]), (error) => error instanceof AppError &&
+      error.code === "media_storage_unavailable");
+  });
+});
 
 /** @param {{ url?: string, contentType?: string, contentLength?: string | null,
  * body?: BodyInit, maximumBytes?: number, cdn?: (url: URL, call: number) => Response }} [options] */

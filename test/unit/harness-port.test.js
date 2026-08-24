@@ -7,6 +7,12 @@ test("retries only the native Fetch bad-port failure", () => {
   assert.equal(shouldRetryBrowserListen(new TypeError("fetch failed", {
     cause: new Error("bad port"),
   })), true);
+  const serialized = new Error("fetch failed", { cause: new Error("bad port") });
+  serialized.name = "TypeError";
+  assert.equal(shouldRetryBrowserListen(serialized), true);
+  assert.equal(shouldRetryBrowserListen({
+    name: "TypeError", message: "fetch failed", cause: { message: "bad port" },
+  }), true);
   assert.equal(shouldRetryBrowserListen(new Error("connection refused")), false);
 });
 

@@ -1,5 +1,5 @@
 import { expect, test } from "./fixtures.js";
-import { seedThreadsArchive } from "../support/harness.js";
+import { login as loginWorker, seedThreadsArchive } from "../support/harness.js";
 
 const POST_ID = "11111111-1111-1111-1111-111111111111";
 const ROOT_ID = "22222222-2222-2222-2222-222222222222";
@@ -10,6 +10,25 @@ async function login(page) {
   await page.goto("/login");
   await page.getByLabel("6자리 PIN").fill("123456");
   await page.getByRole("button", { name: "접속" }).click();
+  await expect(page).toHaveURL(/\/$/);
+}
+
+/** @param {any} harness */
+async function connectConfiguredThreads(harness) {
+  const session = await loginWorker(harness.worker);
+  const started = await harness.worker.fetch(`${session.origin}/threads/connect`, {
+    headers: { Cookie: session.cookie },
+  });
+  const location = started.headers.get("location");
+  const cookie = started.headers.get("set-cookie");
+  if (!location || !cookie)
+    throw new Error(`configured_oauth_setup_missing:${started.status}`);
+  const state = new URL(location).searchParams.get("state");
+  const callback = await harness.worker.fetch(
+    `${session.origin}/threads/oauth/callback?code=code-1&state=${state}`,
+    { headers: { Cookie: cookie } },
+  );
+  expect(callback.status).toBe(303);
 }
 
 /** @param {any} harness
@@ -98,6 +117,268 @@ function detail(id, status, replyTotal = 12) {
     },
   };
 }
+
+test("configured scheduled event refreshes the stored Threads credential", async ({ harness }) => {
+  await connectConfiguredThreads(harness);
+  const env = await harness.remoteWorker.getEnv();
+  await env.PROD_DB.prepare(
+    "UPDATE threads_oauth_credentials SET expires_at = ? WHERE singleton_id = 1",
+  ).bind(1_900_500_000).run();
+
+  await harness.remoteWorker.scheduled({
+    cron: "0 3 * * *", scheduledTime: new Date(1_900_000_000_000),
+  });
+
+  await expect.poll(() => env.PROD_DB.prepare(
+    "SELECT refreshed_at FROM threads_oauth_credentials WHERE singleton_id = 1",
+  ).first("refreshed_at")).toBe(1_900_000_000);
+});
+
+test("archive waiter polls authenticated configured JSON until the requested status", async ({ harness }) => {
+  const env = await harness.remoteWorker.getEnv();
+  await seedThreadsArchive(env.PROD_DB, {
+    id: POST_ID, rootEntryId: ROOT_ID, status: "ready", updatedAt: 1_787_500_000,
+  });
+
+  const result = await harness.waitForThreadsArchive(POST_ID, "ready", 1_000);
+
+  expect(result.archive.id).toBe(POST_ID);
+  expect(result.archive.status).toBe("ready");
+});
+
+test("archive waiter is bounded and dumps configured event diagnostics on timeout", async ({ harness }) => {
+  let debugCalls = 0;
+  const originalDebug = harness.server.debug;
+  harness.server.debug = () => { debugCalls += 1; };
+  const startedAt = Date.now();
+  try {
+    await expect(harness.waitForThreadsArchive(POST_ID, "partial", 50)).rejects
+      .toThrow("test_threads_archive_timeout:partial");
+  } finally {
+    harness.server.debug = originalDebug;
+  }
+  expect(Date.now() - startedAt).toBeLessThan(1_000);
+  expect(debugCalls).toBe(1);
+});
+
+test("configured fixture captures the canonical archive through real Queues and private R2", async ({
+  page, harness,
+}) => {
+  await connectConfiguredThreads(harness);
+  /** @type {string[]} */
+  const browserProviderRequests = [];
+  /** @type {Array<{ path: string, range: string }>} */
+  const browserMediaRanges = [];
+  page.on("request", (request) => {
+    const requested = new URL(request.url());
+    const host = requested.hostname;
+    if (host === "graph.threads.net" || host.endsWith(".cdninstagram.com") ||
+      host.endsWith(".fbcdn.net") || /(^|\.)threads\.(com|net)$/.test(host))
+      browserProviderRequests.push(request.url());
+    if (/^\/threads\/[0-9a-f-]{36}\/media\/[0-9a-f-]{36}$/.test(requested.pathname) &&
+      request.headers().range) browserMediaRanges.push({
+        path: requested.pathname, range: request.headers().range,
+      });
+  });
+  await login(page);
+  await page.goto("/threads");
+  const acceptedResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && new URL(response.url()).pathname === "/threads");
+  await page.getByLabel("Threads 게시물 URL").fill(
+    "https://www.threads.com/@meta/post/RootShort",
+  );
+  await page.getByRole("button", { name: "보관하기" }).click();
+  expect((await acceptedResponse).status()).toBe(200);
+  await expect(page).toHaveURL(/\/threads\/[0-9a-f-]{36}$/);
+  const postId = new URL(page.url()).pathname.split("/").pop();
+  if (!postId) throw new Error("canonical_post_id_missing");
+  await expect(page.locator("[data-thread-archive]")).toHaveAttribute(
+    "data-thread-status", /^(pending|collecting)$/,
+  );
+
+  const ready = await harness.waitForThreadsArchive(postId, "ready");
+  expect(ready.archive.mediaProgress).toEqual({
+    expected: 6, ready: 6, failed: 0, pending: 0,
+  });
+  const env = await harness.remoteWorker.getEnv();
+  const entries = await env.PROD_DB.prepare(
+    `SELECT kind, source_media_id, text, nested_quote_permalink
+     FROM threads_entries WHERE threads_post_id = ?
+     ORDER BY kind, source_media_id`,
+  ).bind(postId).all();
+  expect(entries.results.filter((entry) => entry.kind === "root")).toHaveLength(1);
+  expect(entries.results.filter((entry) => entry.kind === "author_reply")).toHaveLength(12);
+  expect(entries.results.some((entry) => String(entry.source_media_id).startsWith("other-reply")))
+    .toBe(false);
+  expect(entries.results.filter((entry) => entry.kind === "quote")).toEqual([
+    expect.objectContaining({
+      source_media_id: "shared-quote",
+      nested_quote_permalink: "https://www.threads.com/@meta/post/NestedQuote",
+    }),
+    expect.objectContaining({
+      source_media_id: "shared-quote",
+      nested_quote_permalink: "https://www.threads.com/@meta/post/NestedQuote",
+    }),
+  ]);
+  expect(await env.PROD_DB.prepare(
+    `SELECT url FROM threads_links link JOIN threads_entries entry ON entry.id = link.entry_id
+     WHERE entry.threads_post_id = ? ORDER BY url`,
+  ).bind(postId).all().then((result) => result.results.map((row) => row.url)))
+    .toEqual(["https://example.com/archive"]);
+
+  const media = await env.PROD_DB.prepare(
+    `SELECT item.id, item.source_media_id, item.kind, item.etag FROM threads_media item
+     JOIN threads_entries entry ON entry.id = item.entry_id
+     WHERE entry.threads_post_id = ? ORDER BY item.kind, item.id`,
+  ).bind(postId).all();
+  expect(media.results).toHaveLength(5);
+  expect(media.results.every((item) => item.etag)).toBe(true);
+  const objects = await env.THREADS_MEDIA.list({ prefix: "threads/" });
+  expect(objects.objects).toHaveLength(6);
+
+  await page.goto(`/threads/${postId}`);
+  await expect(page.locator("[data-thread-media] img")).toHaveCount(1);
+  const video = page.locator("[data-thread-media] video");
+  await expect(video).toHaveCount(1);
+  const videoId = media.results.find((item) => item.kind === "video")?.id;
+  const imageId = media.results.find((item) => item.source_media_id === "root-image")?.id;
+  if (!videoId) throw new Error("canonical_video_missing");
+  if (!imageId) throw new Error("canonical_image_missing");
+  const image = await page.request.get(`/threads/${postId}/media/${imageId}`);
+  expect(image.status()).toBe(200);
+  expect(await image.text()).toBe("fixture-image-bytes");
+  const profile = await page.request.get(`/threads/${postId}/media/12345`);
+  expect(profile.status()).toBe(200);
+  expect(await profile.text()).toBe("fixture-avatar-bytes");
+  await video.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) throw new Error("canonical_video_invalid");
+    element.load();
+  });
+  await expect.poll(() => browserMediaRanges.filter((request) =>
+    request.path.endsWith(`/media/${videoId}`)).length).toBeGreaterThan(0);
+  expect(browserMediaRanges.filter((request) => request.path.endsWith(`/media/${videoId}`))
+    .every((request) => /^bytes=\d+-\d*$/.test(request.range))).toBe(true);
+  const range = await page.request.get(`/threads/${postId}/media/${videoId}`, {
+    headers: { Range: "bytes=0-3" },
+  });
+  expect(range.status()).toBe(206);
+  expect(range.headers()["content-range"]).toMatch(/^bytes 0-3\/\d+$/);
+  expect((await range.body()).byteLength).toBe(4);
+
+  await page.goto("/threads");
+  const card = page.locator(`[data-thread-id="${postId}"]`);
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(3);
+  await card.locator("[data-thread-all-replies]").click();
+  await expect(card.locator("[data-thread-author-reply]")).toHaveCount(12);
+  expect(new Set(await card.locator("[data-thread-author-reply]").evaluateAll((nodes) =>
+    nodes.map((node) => node.getAttribute("data-thread-entry-id")))).size).toBe(12);
+  const initialMediaEtags = media.results.map((item) => ({
+    id: item.id, etag: item.etag,
+  }));
+  const syncResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" &&
+    new URL(response.url()).pathname === `/threads/${postId}/sync`);
+  await card.getByRole("button", { name: "동기화" }).click();
+  expect((await syncResponse).status()).toBe(200);
+  await expect.poll(async () => env.PROD_DB.prepare(
+    `SELECT status FROM threads_sync_jobs
+     WHERE threads_post_id = ? AND generation = 2`,
+  ).bind(postId).first("status"), { timeout: 10_000 }).toBe("ready");
+  expect(await env.PROD_DB.prepare(
+    `SELECT COUNT(*) AS count FROM threads_entries
+     WHERE threads_post_id = ? AND kind = 'author_reply'`,
+  ).bind(postId).first("count")).toBe(13);
+  expect(await env.PROD_DB.prepare(
+    `SELECT text FROM threads_entries
+     WHERE threads_post_id = ? AND kind = 'root'`,
+  ).bind(postId).first("text")).toBe("Fixture root https://example.com/archive");
+  expect(await env.PROD_DB.prepare(
+    `SELECT item.id, item.etag FROM threads_media item
+     JOIN threads_entries entry ON entry.id = item.entry_id
+     WHERE entry.threads_post_id = ? ORDER BY item.kind, item.id`,
+  ).bind(postId).all().then((result) => result.results.map((item) => ({
+    id: item.id, etag: item.etag,
+  })))).toEqual(initialMediaEtags);
+  await page.goto("/threads");
+  const syncedCard = page.locator(`[data-thread-id="${postId}"]`);
+  await syncedCard.locator("[data-thread-all-replies]").click();
+  await expect(syncedCard.locator("[data-thread-author-reply]")).toHaveCount(13);
+
+  const anonymous = await harness.configuredWorker.fetch(
+    `${harness.url.origin}/threads/${postId}/media/${imageId}`,
+    { headers: { Accept: "application/json" } },
+  );
+  expect(anonymous.status).toBe(401);
+  const otherPostId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  await seedThreadsArchive(env.PROD_DB, {
+    id: otherPostId, rootEntryId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    shortcode: "OtherScoped", threadsMediaId: "other-scoped-root",
+    submittedUrl: "https://www.threads.com/@meta/post/OtherScoped",
+    canonicalUrl: "https://www.threads.com/@meta/post/OtherScoped",
+    rootPermalink: "https://www.threads.com/@meta/post/OtherScoped",
+  });
+  expect((await page.request.get(
+    `/threads/${otherPostId}/media/${imageId}`,
+  )).status()).toBe(404);
+  expect(browserProviderRequests).toEqual([]);
+});
+
+test("configured corrupt media becomes partial, retries to ready, and deletes asynchronously", async ({
+  page, harness,
+}) => {
+  await connectConfiguredThreads(harness);
+  await login(page);
+  await page.goto("/threads");
+  await page.getByLabel("Threads 게시물 URL").fill(
+    "https://www.threads.com/@meta/post/CorruptImage",
+  );
+  await page.getByRole("button", { name: "보관하기" }).click();
+  await expect(page).toHaveURL(/\/threads\/[0-9a-f-]{36}$/);
+  const postId = new URL(page.url()).pathname.split("/").pop();
+  if (!postId) throw new Error("corrupt_post_id_missing");
+
+  const partial = await harness.waitForThreadsArchive(postId, "partial");
+  expect(partial.archive.root.text).toBe("Corrupt image with readable video");
+  expect(partial.archive.mediaProgress).toEqual({
+    expected: 4, ready: 3, failed: 1, pending: 0,
+  });
+  const failed = partial.archive.root.media.find(
+    (/** @type {any} */ item) => item.status === "error");
+  const video = partial.archive.root.media.find(
+    (/** @type {any} */ item) => item.kind === "video");
+  if (!failed || !video) throw new Error("corrupt_fixture_media_missing");
+  expect((await page.request.get(
+    `/threads/${postId}/media/${video.id}`,
+  )).status()).toBe(200);
+
+  await page.goto(`/threads/${postId}`);
+  await page.locator(`[data-thread-retry-form]`).getByRole(
+    "button", { name: "미디어 재시도" },
+  ).click();
+  const ready = await harness.waitForThreadsArchive(postId, "ready");
+  expect(ready.archive.mediaProgress).toEqual({
+    expected: 4, ready: 4, failed: 0, pending: 0,
+  });
+  expect((await page.request.get(
+    `/threads/${postId}/media/${failed.id}`,
+  )).status()).toBe(200);
+
+  await page.goto("/threads");
+  const card = page.locator(`[data-thread-id="${postId}"]`);
+  const opener = card.locator("[data-thread-delete] > summary");
+  await opener.click();
+  const dialog = page.locator("[data-thread-delete-dialog]");
+  await dialog.getByRole("button", { name: "취소" }).click();
+  await expect(opener).toBeFocused();
+  await opener.click();
+  await dialog.getByRole("button", { name: "보관 삭제", exact: true }).click();
+  const env = await harness.remoteWorker.getEnv();
+  await expect.poll(() => env.PROD_DB.prepare(
+    "SELECT COUNT(*) AS count FROM threads_posts WHERE id = ?",
+  ).bind(postId).first("count")).toBe(0);
+  const remaining = await env.THREADS_MEDIA.list({ prefix: `threads/posts/${postId}/` });
+  expect(remaining.objects).toHaveLength(0);
+});
 
 test("capture renders pending state, progresses through polling, and stops at ready", async ({ page }) => {
   await login(page);

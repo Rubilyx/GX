@@ -1,4 +1,5 @@
 import { expect, loginAndSeed, test } from "./fixtures.js";
+import { seedThreadsArchive } from "../support/harness.js";
 
 const cases = [
   { width: 320, columns: 4, gutter: 16, gap: 16, filter: 1, gallery: 1, max: 288 },
@@ -170,5 +171,70 @@ test("reference widths use the approved grid without horizontal overflow", async
       expect(layout.searchControlTop).toBeGreaterThanOrEqual(layout.headingBottom);
     if (scenario.width < 600) expect(layout.logoutTop).toBeGreaterThan(layout.headingBottom);
     else expect(Math.abs(layout.logoutTop - layout.headingTop)).toBeLessThanOrEqual(1);
+  }
+});
+
+test("Threads media and actions remain usable without overflow at 360px and 840px", async ({
+  page, harness,
+}) => {
+  test.skip(test.info().project.name !== "chromium", "canonical Threads geometry uses Chromium");
+  const env = await harness.remoteWorker.getEnv();
+  const postId = "31111111-1111-4111-8111-111111111111";
+  const rootId = "32222222-2222-4222-8222-222222222222";
+  await seedThreadsArchive(env.PROD_DB, {
+    id: postId, rootEntryId: rootId, authorId: "34567", username: "responsive",
+    displayName: "Responsive Author", shortcode: "ResponsiveMedia",
+    threadsMediaId: "responsive-root", rootMediaType: "CAROUSEL_ALBUM",
+    submittedUrl: "https://www.threads.com/@responsive/post/ResponsiveMedia",
+    canonicalUrl: "https://www.threads.com/@responsive/post/ResponsiveMedia",
+    rootPermalink: "https://www.threads.com/@responsive/post/ResponsiveMedia",
+  });
+  const media = [
+    { id: "33333333-3333-4333-8333-333333333333", source: "responsive-image", kind: "image", ordinal: 0, type: "image/jpeg", body: "image" },
+    { id: "34444444-4444-4444-8444-444444444444", source: "responsive-video", kind: "video", ordinal: 1, type: "video/mp4", body: "video" },
+    { id: "35555555-5555-4555-8555-555555555555", source: "responsive-video", kind: "video_thumbnail", ordinal: 1, type: "image/jpeg", body: "thumb" },
+  ];
+  for (const item of media) {
+    const key = `threads/responsive/${item.id}`;
+    const stored = await env.THREADS_MEDIA.put(key, new Blob([item.body]), {
+      httpMetadata: { contentType: item.type },
+    });
+    await env.PROD_DB.prepare(
+      `INSERT INTO threads_media
+         (id, entry_id, source_media_id, kind, ordinal, status, r2_key,
+          content_type, bytes, etag, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 1, 1)`,
+    ).bind(
+      item.id, rootId, item.source, item.kind, item.ordinal, key, item.type,
+      item.body.length, stored.httpEtag,
+    ).run();
+  }
+  await loginAndSeed(page);
+  await page.goto(`/threads/${postId}`);
+  for (const [width, columns] of [[360, 1], [840, 2]]) {
+    await page.setViewportSize({ width, height: 900 });
+    const geometry = await page.evaluate(() => {
+      const gallery = document.querySelector(".thread-media");
+      const video = document.querySelector("video");
+      const actions = [...document.querySelectorAll(
+        ".thread-actions button, [data-thread-delete] > summary",
+      )];
+      if (!(gallery instanceof HTMLElement) || !(video instanceof HTMLVideoElement) ||
+        actions.some((item) => !(item instanceof HTMLElement)))
+        throw new Error("threads_responsive_nodes_missing");
+      const videoBox = video.getBoundingClientRect();
+      return {
+        overflow: document.documentElement.scrollWidth > innerWidth,
+        columns: getComputedStyle(gallery).gridTemplateColumns.split(" ").length,
+        videoHeight: videoBox.height, videoLeft: videoBox.left, videoRight: videoBox.right,
+        minimumAction: Math.min(...actions.map((item) => item.getBoundingClientRect().height)),
+      };
+    });
+    expect(geometry.overflow).toBe(false);
+    expect(geometry.columns).toBe(columns);
+    expect(geometry.videoHeight).toBeGreaterThanOrEqual(44);
+    expect(geometry.videoLeft).toBeGreaterThanOrEqual(0);
+    expect(geometry.videoRight).toBeLessThanOrEqual(width);
+    expect(geometry.minimumAction).toBeGreaterThanOrEqual(44);
   }
 });

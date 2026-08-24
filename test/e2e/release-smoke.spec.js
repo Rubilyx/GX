@@ -39,6 +39,12 @@ test("release smoke", async ({ page }) => {
   await page.getByRole("button", { name: "접속" }).click();
   await expect(page).toHaveURL(release.base.href);
   await expect(page.getByRole("heading", { name: "Repo Atlas", exact: true })).toBeVisible();
+  const threadsLink = page.getByRole("link", { name: "Threads", exact: true });
+  await expect(threadsLink).toHaveAttribute("href", "/threads");
+  await threadsLink.click();
+  await expect(page).toHaveURL(new URL("/threads", release.base).href);
+  await expect(page.getByRole("heading", { name: "Threads", exact: true })).toBeVisible();
+  await page.goto(release.base.href);
 
   if (release.mode === "read-only") {
     const details = page.locator("[data-repository-link]");

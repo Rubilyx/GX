@@ -54,3 +54,91 @@ test("provider fixture debugger returns the full official metadata shape", async
     ],
   } });
 });
+
+test("provider fixture exposes the canonical paginated Threads archive scenario", async () => {
+  const projection = "id%2Cmedia_product_type%2Cmedia_type%2Cmedia_url%2Cpermalink%2Cowner%2Cusername%2Ctext%2Ctimestamp%2Cshortcode%2Cthumbnail_url%2Cchildren%2Cis_quote_post%2Cquoted_post%2Clink_attachment_url%2Calt_text%2Croot_post%2Creplied_to";
+  const authorization = { Authorization: "Bearer fixture-token" };
+  const profile = await fixture.fetch(new Request(
+    `https://graph.threads.net/v1.0/profile_posts?fields=${projection}&username=meta`,
+    { headers: authorization },
+  ));
+  const profileBody = /** @type {any} */ (await profile.json());
+  assert.equal(profileBody.data[0].id, "root-1");
+  assert.equal(profileBody.data[0].media_type, "CAROUSEL_ALBUM");
+  assert.equal(profileBody.data[0].link_attachment_url, "https://example.com/archive");
+  assert.deepEqual(profileBody.data[0].children.data.map(
+    (/** @type {any} */ item) => item.id), [
+    "root-image", "root-video",
+  ]);
+
+  const pages = [];
+  for (const after of [null, "conversation-2", "conversation-3"]) {
+    const suffix = after ? `&after=${after}` : "";
+    const response = await fixture.fetch(new Request(
+      `https://graph.threads.net/v1.0/root-1/conversation?fields=${projection}${suffix}`,
+      { headers: authorization },
+    ));
+    assert.equal(response.status, 200);
+    pages.push(/** @type {any} */ (await response.json()));
+  }
+  const replies = pages.flatMap((page) => page.data);
+  assert.equal(replies.filter((reply) => reply.owner.id === "12345").length, 12);
+  assert.deepEqual(replies.filter((reply) => reply.owner.id === "67890")
+    .map((reply) => reply.id), ["other-reply-1", "other-reply-2"]);
+  assert.deepEqual(pages.slice(0, 2).map((page) => page.paging.next), [
+    "https://graph.threads.net/v1.0/root-1/conversation?after=conversation-2",
+    "https://graph.threads.net/v1.0/root-1/conversation?after=conversation-3",
+  ]);
+
+  const quote = await fixture.fetch(new Request(
+    `https://graph.threads.net/v1.0/shared-quote?fields=${projection}`,
+    { headers: authorization },
+  )).then((response) => response.json());
+  assert.equal(quote.quoted_post.id, "nested-quote");
+  const video = await fixture.fetch(new Request(
+    `https://graph.threads.net/v1.0/root-video?fields=${projection}`,
+    { headers: authorization },
+  )).then((response) => response.json());
+  assert.equal(video.media_url, "https://scontent.cdninstagram.com/fixture-video");
+  assert.equal(video.thumbnail_url, "https://scontent.cdninstagram.com/fixture-thumbnail");
+
+  for (const [path, contentType] of [
+    ["fixture-avatar", "image/jpeg"], ["fixture-image", "image/jpeg"],
+    ["fixture-video", "video/mp4"], ["fixture-thumbnail", "image/jpeg"],
+  ]) {
+    const response = await fixture.fetch(new Request(
+      `https://scontent.cdninstagram.com/${path}`,
+    ));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), contentType);
+    assert.equal(Number(response.headers.get("content-length")),
+      (await response.arrayBuffer()).byteLength);
+  }
+});
+
+test("provider fixture exposes a deterministic corrupt image followed by a valid retry", async () => {
+  const projection = "id%2Cmedia_product_type%2Cmedia_type%2Cmedia_url%2Cpermalink%2Cowner%2Cusername%2Ctext%2Ctimestamp%2Cshortcode%2Cthumbnail_url%2Cchildren%2Cis_quote_post%2Cquoted_post%2Clink_attachment_url%2Calt_text%2Croot_post%2Creplied_to";
+  const headers = { Authorization: "Bearer fixture-token" };
+  const profile = await fixture.fetch(new Request(
+    `https://graph.threads.net/v1.0/profile_posts?fields=${projection}&username=meta`,
+    { headers },
+  )).then((response) => response.json());
+  assert.equal(profile.data.some(
+    (/** @type {any} */ item) => item.shortcode === "CorruptImage"), true);
+  const conversation = await fixture.fetch(new Request(
+    `https://graph.threads.net/v1.0/corrupt-root/conversation?fields=${projection}`,
+    { headers },
+  ));
+  assert.deepEqual(await conversation.json(), { data: [] });
+
+  const first = await fixture.fetch(new Request(
+    "https://scontent.cdninstagram.com/fixture-corrupt",
+  ));
+  assert.equal(first.headers.get("content-length"), "4");
+  assert.equal((await first.arrayBuffer()).byteLength, 3);
+  const second = await fixture.fetch(new Request(
+    "https://scontent.cdninstagram.com/fixture-corrupt",
+  ));
+  assert.equal(second.headers.get("content-length"), "4");
+  assert.equal((await second.arrayBuffer()).byteLength, 4);
+});

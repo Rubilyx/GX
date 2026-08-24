@@ -83,7 +83,8 @@ test("every callback response boundary clears only the OAuth cookie", async () =
   const env = await harness.worker.getEnv();
   const missingBindings = await handleRequest(new Request(
     `${session.origin}/threads/oauth/callback?code=code-1&state=state`,
-  ), env, { waitUntil() {} }, async () => { throw new Error("not reached"); });
+  ), { ...env, THREADS_MEDIA: undefined }, { waitUntil() {} },
+  async () => { throw new Error("not reached"); });
   assert.equal(missingBindings.status, 503);
   assert.equal(missingBindings.headers.get("set-cookie"), OAUTH_CLEAR);
 

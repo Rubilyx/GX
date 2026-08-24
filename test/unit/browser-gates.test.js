@@ -23,6 +23,9 @@ test("browser gate defines the required isolated engine matrix", () => {
   assert.match(String(noJavaScript?.testMatch), /native-no-js/);
   assert.equal((config.projects ?? []).filter(({ name }) => name !== "chromium-no-js")
     .every(({ testIgnore }) => /native-no-js/.test(String(testIgnore))), true);
+  assert.equal((config.projects ?? []).filter(({ name }) =>
+    name !== undefined && !["chromium", "chromium-no-js"].includes(name))
+    .every(({ grepInvert }) => /configured fixture captures/.test(String(grepInvert))), true);
 });
 
 test("local browser projects trust only the test harness certificate", async () => {

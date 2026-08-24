@@ -19,7 +19,7 @@ npx wrangler d1 migrations apply PROD_DB --local --env test
 npx wrangler dev --env test
 ```
 
-로그인 전에 ignored `.dev.vars.test`에 `test/support/harness.js`의 다섯 test-only secret 값을 넣습니다. 로컬 test 전용 PIN은 `123456`이며 배포 PIN과 무관합니다. standalone dev의 provider service는 보장하지 않으므로 저장/AI 흐름은 fixture를 함께 시작하는 `npm test`와 `npm run test:e2e`로 검증합니다. test 값을 운영에 사용하면 안 됩니다.
+로그인 전에 ignored `.dev.vars.test`에 `test/support/harness.js`의 일곱 test-only secret 값을 넣습니다. 로컬 test 전용 PIN은 `123456`이며 배포 PIN과 무관합니다. standalone dev의 provider service는 보장하지 않으므로 저장/AI 흐름은 fixture를 함께 시작하는 `npm test`와 `npm run test:e2e`로 검증합니다. test 값을 운영에 사용하면 안 됩니다.
 
 검증 명령:
 
@@ -30,6 +30,25 @@ npm run test:e2e
 ```
 
 `npm run check`는 타입, CSS, 소스 정책, 단위 검사를 묶습니다. `npm test`는 단위·Wrangler/D1 통합 검사를 실행하고, `npm run test:e2e`는 설치한 브라우저에서 접근성·JavaScript 비활성 흐름을 확인합니다.
+
+## Threads Archive
+
+`/threads`는 공개 Threads 루트 게시물, 루트 작성자의 모든 답글, 한 단계 인용, 링크와 작성자 정보를 D1에 보관하고 이미지·동영상·썸네일·프로필 바이너리를 private R2에 복사합니다. 브라우저는 Meta Graph/CDN이나 embed script에 직접 연결하지 않고, 인증된 same-origin 미디어 route만 사용합니다. 반복 제출과 동기화는 기존 본문·준비된 미디어를 바꾸지 않고 새 작성자 답글을 추가합니다.
+
+로컬·브라우저 검증은 `test/support/provider-fixture-worker.js`의 결정적 Meta Graph/CDN fixture와 test 환경에 설정된 D1, Queues/DLQ, private R2, scheduled event를 사용합니다. Fixture에는 페이지가 나뉜 작성자 답글, 제외할 다른 사용자 답글, carousel 이미지·동영상, 반복 인용, 손상 미디어 재시도가 포함됩니다. 실제 Meta access token이나 Meta 앱 연결은 필요하지 않습니다.
+
+운영 계약에 필요한 이름은 다음과 같습니다.
+
+- D1 binding: `PROD_DB`
+- private R2 binding: `THREADS_MEDIA`
+- Queue producer bindings: `THREADS_CAPTURE_QUEUE`, `THREADS_MEDIA_QUEUE`
+- Queue-name vars: `THREADS_CAPTURE_QUEUE_NAME`, `THREADS_MEDIA_QUEUE_NAME`, `THREADS_CAPTURE_DLQ_NAME`, `THREADS_MEDIA_DLQ_NAME`
+- Meta app var: `THREADS_APP_ID`
+- Worker secrets: `OPENAI_API_KEY`, `PROD_IP_HMAC_KEY`, `PROD_PIN_DIGEST`, `PROD_PIN_SALT`, `PROD_SESSION_KEY`, `THREADS_APP_SECRET`, `THREADS_TOKEN_KEY`
+- OAuth scopes: `threads_basic`, `threads_profile_discovery`, `threads_read_replies` exactly
+- Scheduled trigger: `0 3 * * *`, used only for token refresh
+
+로컬 D1은 위의 `npx wrangler d1 migrations apply PROD_DB --local --env test`로 `0004_threads_archive.sql`까지 적용합니다. Cloudflare resource 생성, 운영 secret 설정, remote migration, 배포·승격 명령은 README 범위가 아니며 보호된 [릴리스·복구 runbook](docs/operations/release.md)을 따릅니다.
 
 ## 구조
 

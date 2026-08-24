@@ -267,7 +267,11 @@ test("configured fixture captures the canonical archive through real Queues and 
   expect(objects.objects).toHaveLength(6);
 
   await page.goto(`/threads/${postId}`);
-  await expect(page.locator("[data-thread-media] img")).toHaveCount(1);
+  await expect(page.locator("[data-thread-media] img")).toHaveCount(3);
+  await expect(page.locator(
+    "[data-thread-archive] > [data-thread-root] [data-thread-media] img",
+  )).toHaveCount(1);
+  await expect(page.locator("[data-thread-quote] [data-thread-media] img")).toHaveCount(2);
   const video = page.locator("[data-thread-media] video");
   await expect(video).toHaveCount(1);
   const videoId = media.results.find((item) => item.kind === "video")?.id;
@@ -467,7 +471,7 @@ test("plain reply expansion loads complete quoted provenance while modified clic
   const link = page.locator("[data-thread-all-replies]");
   await expect(link).toHaveText("작성자 답글 12개 모두 보기");
   const popupPromise = context.waitForEvent("page");
-  await link.click({ modifiers: ["Control"] });
+  await link.click({ button: "middle" });
   const popup = await popupPromise;
   await popup.waitForLoadState();
   await expect(popup).toHaveURL(new RegExp(`/threads/${POST_ID}#author-replies$`));
@@ -534,7 +538,7 @@ test("retry preserves content, sync adds reply thirteen, and shared delete resto
   }));
   await card.getByRole("button", { name: "동기화" }).click();
   await expect(card).toHaveAttribute("data-thread-status", "ready", { timeout: 6_000 });
-  expect(detailPolls).toBe(1);
+  expect(detailPolls).toBe(2);
   await expect(card.locator("[data-thread-author-reply]")).toHaveCount(13, { timeout: 6_000 });
   await page.unroute(syncedDetail);
 

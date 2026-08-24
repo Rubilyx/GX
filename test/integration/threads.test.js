@@ -1654,6 +1654,33 @@ test("capture cursor ledger rejects A-B-A cycles and the explicit page ceiling w
   });
 });
 
+test("profile discovery root at the page ceiling terminalizes instead of re-enqueueing", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const sync = await createThreadsSync(
+    db, harness.captureQueue, "https://www.threads.com/@meta/post/ProfilePageCap", 4_170,
+  );
+  const message = harness.captureMessages.shift();
+  await db.prepare(
+    `UPDATE threads_sync_jobs SET profile_page_count = 10000
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).run();
+  assert.deepEqual(await handleThreadsCaptureMessage(message, {
+    db, captureQueue: harness.captureQueue, mediaQueue: harness.mediaQueue,
+    fetcher: providerFixture({ threadsProfilePages: [{ data: [rawThreadsMedia(
+      "profile-cap-root", "ProfilePageCap",
+    )] }] }),
+    getAccessToken: async () => ({ accessToken: "token" }), nowSeconds: 4_171,
+    deleteArchive: async () => ({ action: "ack" }),
+  }), { action: "ack" });
+  assert.equal(harness.captureMessages.length, 0);
+  assert.deepEqual(await db.prepare(
+    `SELECT status, error_code FROM threads_sync_jobs
+     WHERE threads_post_id = ? AND generation = 1`,
+  ).bind(sync.threadsPostId).first(), {
+    status: "error", error_code: "threads_provider_protocol_error",
+  });
+});
+
 test("capture persists content before optional profile and carousel enrichment failures", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const sync = await createThreadsSync(

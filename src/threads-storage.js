@@ -683,6 +683,23 @@ export async function saveResolvedThreadsRoot(db, input) {
     if (changes.some((count) => count > 1)) invalidStorage();
     if (changes[0] === 0) {
       if (changes.some((count) => count !== 0)) invalidStorage();
+      const pageState = await db.prepare(
+        `SELECT job.status, job.profile_completed, job.capture_lease,
+           job.profile_cursor, job.profile_page_count
+         FROM threads_sync_jobs job JOIN threads_posts post
+           ON post.id = job.threads_post_id
+         WHERE job.threads_post_id = ? AND job.generation = ?
+           AND post.sync_generation = job.generation AND post.status <> 'deleting'`,
+      ).bind(postId, generation).first();
+      if (pageState !== null) {
+        const row = exactRow(pageState, ["status", "profile_completed",
+          "capture_lease", "profile_cursor", "profile_page_count"]);
+        const pageCount = d1NonnegativeInteger(row.profile_page_count);
+        if (["queued", "resolving", "collecting"].includes(row.status) &&
+          row.profile_completed === 0 && row.capture_lease === null &&
+          row.profile_cursor === expectedCursor && pageCount >= MAX_CAPTURE_PAGES)
+          throw new AppError("threads_provider_protocol_error", 502);
+      }
       return { applied: false, quoteWork: [] };
     }
     const base = 1 + correction.length;

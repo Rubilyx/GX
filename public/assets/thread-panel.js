@@ -594,7 +594,7 @@ class ThreadPanel extends HTMLElement {
         this.applyCompleteArchive(state, result.archive, result.replies);
       else this.applyPolling(state.card, result.archive);
       state.delayIndex = Math.min(state.delayIndex + 1, POLL_DELAYS.length - 1);
-      if (!completed && !pollingStatus(result.archive.status) && state.expanded)
+      if (!pollingStatus(result.archive.status) && state.expanded)
         await this.loadReplies(state, true);
     } catch {
       if (!controller.signal.aborted && state.pollEpoch === epoch)

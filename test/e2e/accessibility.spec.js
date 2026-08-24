@@ -166,14 +166,24 @@ test("reduced motion leaves no nontrivial animation or transition", async ({ pag
 test("Threads empty, reconnect, collecting, ready, partial, detail, and delete dialog pass axe", async ({
   page, harness,
 }) => {
+  const env = await harness.worker.getEnv();
+  await env.PROD_DB.prepare(
+    `INSERT INTO threads_oauth_credentials
+       (singleton_id, provider_user_id, encrypted_access_token, token_nonce,
+        scopes_json, expires_at, refreshed_at, updated_at)
+     VALUES (1, 'reconnect-user', 'corrupt-token', 'corrupt-nonce', ?, ?, 1, 1)`,
+  ).bind(JSON.stringify([
+    "threads_basic", "threads_profile_discovery", "threads_read_replies",
+  ]), Math.floor(Date.now() / 1_000) + 86_400).run();
   await page.goto("/threads");
   await expect(page.locator("[data-thread-empty]")).toBeVisible();
-  await expect(page.locator("[data-thread-connection]")).toContainText(
-    /Threads를 (?:다시 )?연결/,
+  await expect(page.locator("[data-thread-connection]")).toHaveText(
+    "Threads를 다시 연결하세요. Threads 다시 연결하기",
   );
+  await expect(page.getByRole("link", { name: "Threads 다시 연결하기" }))
+    .toHaveAttribute("href", "/threads/connect");
   await expectNoBlockingAxe(page);
 
-  const env = await harness.worker.getEnv();
   const states = [
     { id: "11111111-1111-4111-8111-111111111111", root: "21111111-1111-4111-8111-111111111111", shortcode: "CollectingA11y", status: "collecting", job: "collecting" },
     { id: "12222222-2222-4222-8222-222222222222", root: "22222222-2222-4222-8222-222222222222", shortcode: "ReadyA11y", status: "ready", job: "ready" },

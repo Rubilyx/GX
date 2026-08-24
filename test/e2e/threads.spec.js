@@ -362,6 +362,13 @@ test("configured corrupt media becomes partial, retries to ready, and deletes as
   expect((await page.request.get(
     `/threads/${postId}/media/${failed.id}`,
   )).status()).toBe(200);
+  const env = await harness.remoteWorker.getEnv();
+  const profileKey = await env.PROD_DB.prepare(
+    `SELECT profile_r2_key FROM threads_authors
+     WHERE threads_user_id = '12345' AND profile_media_status = 'ready'`,
+  ).first("profile_r2_key");
+  if (typeof profileKey !== "string") throw new Error("configured_profile_key_missing");
+  expect(await env.THREADS_MEDIA.head(profileKey)).not.toBeNull();
 
   await page.goto("/threads");
   const card = page.locator(`[data-thread-id="${postId}"]`);
@@ -372,12 +379,17 @@ test("configured corrupt media becomes partial, retries to ready, and deletes as
   await expect(opener).toBeFocused();
   await opener.click();
   await dialog.getByRole("button", { name: "보관 삭제", exact: true }).click();
-  const env = await harness.remoteWorker.getEnv();
   await expect.poll(() => env.PROD_DB.prepare(
     "SELECT COUNT(*) AS count FROM threads_posts WHERE id = ?",
   ).bind(postId).first("count")).toBe(0);
+  await expect.poll(() => env.PROD_DB.prepare(
+    "SELECT COUNT(*) AS count FROM threads_authors WHERE threads_user_id = '12345'",
+  ).first("count")).toBe(0);
   const remaining = await env.THREADS_MEDIA.list({ prefix: `threads/posts/${postId}/` });
   expect(remaining.objects).toHaveLength(0);
+  expect(await env.THREADS_MEDIA.head(profileKey)).toBeNull();
+  const profileObjects = await env.THREADS_MEDIA.list({ prefix: "threads/authors/12345/" });
+  expect(profileObjects.objects).toHaveLength(0);
 });
 
 test("capture renders pending state, progresses through polling, and stops at ready", async ({ page }) => {

@@ -186,6 +186,56 @@ test("an early R2 failure aborts the fixed-length pump without hanging", async (
   });
 });
 
+test("R2 rejection after locking a fixed-length body aborts and cancels the provider source", async () => {
+  await withFixedLengthStream(async () => {
+    let cancellations = 0;
+    const source = new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array([1, 2, 3, 4])); },
+      cancel() { cancellations += 1; },
+    });
+    const operation = downloadThreadsMedia({
+      /** @param {string} key @param {ReadableStream<Uint8Array>} body */
+      async put(key, body) {
+        const reader = body.getReader();
+        const first = await reader.read();
+        assert.deepEqual(first, { done: false, value: new Uint8Array([1, 2, 3, 4]) });
+        throw new Error(`r2_rejected_after_lock:${key}`);
+      },
+    }, async () => streamingResponse(source, { headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "8",
+    } }), {
+      url: "https://scontent.cdninstagram.com/object", key: "threads/fixed/locked",
+      expected: new Set(["image/jpeg"]), maximumBytes: 16,
+    });
+    await assert.rejects(Promise.race([
+      operation,
+      new Promise((resolve, reject) => setTimeout(
+        () => reject(new Error("fixed_length_locked_abort_timeout")), 250,
+      )),
+    ]), (error) => error instanceof AppError &&
+      error.code === "media_storage_unavailable" && error.status === 503);
+    assert.equal(cancellations, 1);
+  });
+});
+
+test("an overlong declared fixed-length stream is a terminal byte mismatch", async () => {
+  await withFixedLengthStream(async () => {
+    await assert.rejects(downloadThreadsMedia({
+      /** @param {string} key @param {ReadableStream<Uint8Array>} body */
+      async put(key, body) {
+        await new Response(body).arrayBuffer();
+        return { key, size: 5, httpEtag: '"overlong"' };
+      },
+    }, async () => streamingResponse(new Uint8Array([1, 2, 3, 4, 5]), { headers: {
+      "Content-Type": "image/jpeg", "Content-Length": "4",
+    } }), {
+      url: "https://scontent.cdninstagram.com/object", key: "threads/fixed/overlong",
+      expected: new Set(["image/jpeg"]), maximumBytes: 16,
+    }), (error) => error instanceof AppError &&
+      error.code === "media_byte_mismatch" && error.status === 400);
+  });
+});
+
 /** @param {{ url?: string, contentType?: string, contentLength?: string | null,
  * body?: BodyInit, maximumBytes?: number, cdn?: (url: URL, call: number) => Response }} [options] */
 async function archiveEntry(options = {}) {

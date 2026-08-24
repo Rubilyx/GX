@@ -176,6 +176,8 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
           throw new AppError("invalid_media_stream", 400);
         count += chunk.byteLength;
         if (count > input.maximumBytes) throw new AppError("media_too_large", 413);
+        if (declared !== null && count > declared)
+          throw new AppError("media_byte_mismatch", 400);
         controller.enqueue(chunk);
       } catch (error) {
         countedError = error instanceof AppError ? error :
@@ -186,11 +188,17 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
     flush() { sourceCompleted = true; },
   }));
   let stored = counted;
-  /** @type {Promise<void> | null} */
-  let fixedLengthCompletion = null;
+  /** @type {AbortController | null} */
+  let fixedLengthAbort = null;
+  /** @type {Promise<{ ok: true } | { ok: false, error: unknown }> | null} */
+  let fixedLengthOutcome = null;
   if (declared !== null && typeof FixedLengthStream === "function") {
     const fixed = new FixedLengthStream(declared);
-    fixedLengthCompletion = counted.pipeTo(fixed.writable);
+    fixedLengthAbort = new AbortController();
+    fixedLengthOutcome = counted.pipeTo(fixed.writable, {
+      signal: fixedLengthAbort.signal,
+    }).then(() => ({ ok: /** @type {const} */ (true) }),
+      (error) => ({ ok: /** @type {const} */ (false), error }));
     stored = fixed.readable;
   }
   let rawResult;
@@ -199,10 +207,12 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
       httpMetadata: { contentType },
       onlyIf: { etagDoesNotMatch: "*" },
     });
-    await fixedLengthCompletion;
+    const pump = await fixedLengthOutcome;
+    if (pump && !pump.ok) throw pump.error;
   } catch (error) {
-    cancelUnused(stored);
-    await fixedLengthCompletion?.catch(() => {});
+    if (fixedLengthAbort) fixedLengthAbort.abort(error);
+    else cancelUnused(stored);
+    await fixedLengthOutcome;
     if (countedError !== null) throw countedError;
     if (sourceCompleted && declared !== null && count !== declared)
       throw new AppError("media_byte_mismatch", 400);

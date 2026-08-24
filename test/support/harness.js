@@ -48,6 +48,28 @@ export function shouldAcceptBrowserListen(error) {
   return cause?.code === "DEPTH_ZERO_SELF_SIGNED_CERT";
 }
 
+/**
+ * @param {{ reset(): Promise<void>, listen(): Promise<URL>,
+ * probe(url: URL): Promise<void>, getWorker(): any,
+ * migrate(worker: any): Promise<void>, initializeBinding(worker: any): Promise<void> }} operations
+ */
+export async function runBrowserResetTransaction(operations) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await operations.reset();
+      const url = await operations.listen();
+      await operations.probe(url);
+      const worker = operations.getWorker();
+      await operations.migrate(worker);
+      await operations.initializeBinding(worker);
+      return { url, worker };
+    } catch (error) {
+      if (!shouldRetryBrowserListen(error)) throw error;
+    }
+  }
+  throw new Error("test_harness_unsafe_port");
+}
+
 /** @type {Record<string, any>} */
 const metadataFixture = Object.freeze({
   id: 9007199254740000,
@@ -767,9 +789,25 @@ export async function startHarness() {
       JSON.stringify(entry).match(/provider_fixture:[a-z_]+/g) ?? []);
   }
   async function reset() {
-    await resetForBrowser();
-    url = await listenForBrowser();
-    remoteWorker = server.getWorker();
+    const initialized = await runBrowserResetTransaction({
+      reset: () => server.reset(),
+      listen: async () => (await server.listen()).url,
+      async probe(candidate) {
+        try { await originalFetch(new URL("/health", candidate)); }
+        catch (error) {
+          if (!shouldAcceptBrowserListen(error)) throw error;
+        }
+      },
+      getWorker: () => server.getWorker(),
+      migrate: (worker) => worker.applyD1Migrations("PROD_DB"),
+      async initializeBinding(worker) {
+        const env = await worker.getEnv();
+        // ponytail: reset recreates storage; retain ledgers if incremental migration tests are added.
+        await env.PROD_DB.exec("DROP TABLE d1_migrations");
+      },
+    });
+    url = initialized.url;
+    remoteWorker = initialized.worker;
     providerMode = {};
     configuredSession = undefined;
     captureMessages.length = 0;
@@ -778,10 +816,6 @@ export async function startHarness() {
     r2Objects.clear();
     r2Mode = { putReject: false, getReject: false, deleteReject: false };
     assetMode = {};
-    await remoteWorker.applyD1Migrations("PROD_DB");
-    const env = await worker.getEnv();
-    // ponytail: reset recreates storage; retain ledgers if incremental migration tests are added.
-    await env.PROD_DB.exec("DROP TABLE d1_migrations");
   }
   await reset();
   async function close() {

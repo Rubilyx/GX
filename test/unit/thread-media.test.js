@@ -140,11 +140,14 @@ test("streams allowlisted image media to one deterministic key without response 
   ]) {
     const archived = await archiveEntry({ url: `https://${host}/object` });
     assert.deepEqual(archived.result, ACK);
-    assert.deepEqual([...archived.bucket.objects], [[
-      "threads/posts/post-1/source-1/image-0",
-      { bytes: new Uint8Array([1, 2, 3, 4]), contentType: "image/jpeg",
-        etag: "unit-etag" },
-    ]]);
+    const entries = [...archived.bucket.objects];
+    assert.equal(entries.length, 1);
+    assert.match(entries[0][0],
+      /^threads\/posts\/post-1\/source-1\/image-0\/[0-9a-f-]{36}$/);
+    assert.deepEqual(entries[0][1], {
+      bytes: new Uint8Array([1, 2, 3, 4]), contentType: "image/jpeg",
+      etag: "unit-etag",
+    });
     assert.equal(archived.cdnCalls, 1);
   }
 });
@@ -268,8 +271,9 @@ test("deletes a just-written object when the provider stream is truncated", asyn
     contentLength: "4", body: new Uint8Array([1, 2, 3]),
   });
   assert.equal(archived.bucket.objects.size, 0);
-  assert.deepEqual(archived.bucket.deleted,
-    ["threads/posts/post-1/source-1/image-0"]);
+  assert.equal(archived.bucket.deleted.length, 1);
+  assert.match(archived.bucket.deleted[0],
+    /^threads\/posts\/post-1\/source-1\/image-0\/[0-9a-f-]{36}$/);
 });
 
 test("parses one closed, suffix, or open byte range and rejects invalid ranges", () => {

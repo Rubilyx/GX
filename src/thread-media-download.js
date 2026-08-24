@@ -169,14 +169,9 @@ export async function downloadThreadsMedia(bucket, fetcher, input) {
   }));
   let result;
   try {
-    const current = await bucket.head(input.key);
-    if (!(current === null || current && typeof current === "object" &&
-      typeof current.etag === "string" && current.etag))
-      throw new AppError("media_storage_unavailable", 503);
     result = putResult(await bucket.put(input.key, counted, {
       httpMetadata: { contentType },
-      onlyIf: current === null ? { etagDoesNotMatch: "*" } :
-        { etagMatches: current.etag },
+      onlyIf: { etagDoesNotMatch: "*" },
     }));
   } catch (error) {
     cancelUnused(counted);

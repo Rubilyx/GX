@@ -21,14 +21,60 @@ const PROFILE_KEYS = [
   "error_code", "attempt_count", "upload_lease", "upload_started_at", "cleanup_lease",
   "cleanup_started_at",
 ];
+const CONSERVATIVE_ID = /^[A-Za-z0-9_-]+$/;
+const LEASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+/** @param {string} value */
+function conservativeId(value) {
+  if (typeof value !== "string" || !CONSERVATIVE_ID.test(value))
+    throw new AppError("storage_unavailable", 503);
+  return value;
+}
+
+/** @param {string} value */
+function uploadLease(value) {
+  if (typeof value !== "string" || !LEASE_UUID.test(value))
+    throw new AppError("storage_unavailable", 503);
+  return value;
+}
 
 /** @param {{ postId: string, sourceMediaId: string, kind: string, ordinal: number }} input */
-export function entryKey(input) {
-  return `threads/posts/${input.postId}/${input.sourceMediaId}/${input.kind}-${input.ordinal}`;
+function entryPrefix(input) {
+  if (!["image", "video", "video_thumbnail"].includes(input.kind) ||
+    !Number.isSafeInteger(input.ordinal) || input.ordinal < 0)
+    throw new AppError("storage_unavailable", 503);
+  return `threads/posts/${conservativeId(input.postId)}/${
+    conservativeId(input.sourceMediaId)}/${input.kind}-${input.ordinal}`;
 }
+
+/** @param {{ postId: string, sourceMediaId: string, kind: string, ordinal: number }} input
+ * @param {string} lease */
+export function entryKey(input, lease) { return `${entryPrefix(input)}/${uploadLease(lease)}`; }
+
+/** @param {string} key
+ * @param {{ postId: string, sourceMediaId: string, kind: string, ordinal: number }} input */
+export function validEntryKey(key, input) {
+  const prefix = `${entryPrefix(input)}/`;
+  return typeof key === "string" && key.startsWith(prefix) &&
+    LEASE_UUID.test(key.slice(prefix.length));
+}
+
 /** @param {string} authorId */
-export function profileKey(authorId) { return `threads/authors/${authorId}/profile`; }
+function profilePrefix(authorId) {
+  return `threads/authors/${conservativeId(authorId)}/profile`;
+}
+
+/** @param {string} authorId @param {string} lease */
+export function profileKey(authorId, lease) {
+  return `${profilePrefix(authorId)}/${uploadLease(lease)}`;
+}
+
+/** @param {string} key @param {string} authorId */
+export function validProfileKey(key, authorId) {
+  const prefix = `${profilePrefix(authorId)}/`;
+  return typeof key === "string" && key.startsWith(prefix) &&
+    LEASE_UUID.test(key.slice(prefix.length));
+}
 
 /** @param {unknown} value */
 function nullable(value) {
@@ -87,7 +133,7 @@ function profileRow(value) {
     row.status === "deleting" && !nullable(row.upload_lease))
     throw new AppError("storage_unavailable", 503);
   if (row.status === "ready") {
-    if (row.r2_key !== profileKey(row.author_id))
+    if (typeof row.r2_key !== "string" || !validProfileKey(row.r2_key, row.author_id))
       throw new AppError("storage_unavailable", 503);
     validateStoredContentType(row.content_type); d1NonnegativeInteger(row.bytes);
     validateStoredEtag(row.etag);
@@ -388,83 +434,12 @@ export async function ownsProfileUpload(db, message, row) {
 
 /** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
  * @param {number} now */
-export async function canDeleteFailedEntryUpload(db, message, row, now) {
-  const owned = mutationChanges(await db.prepare(
-    `UPDATE threads_media SET upload_started_at = ?, updated_at = ?
-     WHERE id = ? AND entry_id = ? AND status = 'pending' AND upload_lease = ?
-       AND EXISTS (
-         SELECT 1 FROM threads_entries entry JOIN threads_posts post
-           ON post.id = entry.threads_post_id
-         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
-           AND job.generation = post.sync_generation
-         WHERE entry.id = threads_media.entry_id AND entry.threads_post_id = ?
-           AND post.sync_generation = ? AND post.status <> 'deleting'
-       )`,
-  ).bind(now, now, row.media_id, row.entry_id, row.upload_lease,
-    message.postId, message.generation).run());
-  if (owned > 1) throw new AppError("storage_unavailable", 503);
-  if (owned === 1) return true;
-  const state = await db.prepare(
-    `SELECT post.status AS post_status, media.status AS media_status,
-       media.upload_lease
-     FROM threads_media media
-     JOIN threads_entries entry ON entry.id = media.entry_id
-     JOIN threads_posts post ON post.id = entry.threads_post_id
-     WHERE media.id = ? AND media.entry_id = ? AND entry.threads_post_id = ?`,
-  ).bind(row.media_id, row.entry_id, message.postId).first();
-  if (state === null) return true;
-  const current = exactRow(state, ["post_status", "media_status", "upload_lease"]);
-  if (!["pending", "collecting", "ready", "partial", "error", "deleting"]
-    .includes(current.post_status) || !["pending", "ready", "error"].includes(current.media_status) ||
-    !(current.upload_lease === null || typeof current.upload_lease === "string" &&
-      current.upload_lease)) throw new AppError("storage_unavailable", 503);
-  if (current.media_status === "ready" || current.upload_lease !== null &&
-    current.upload_lease !== row.upload_lease) return false;
-  return current.post_status === "deleting";
-}
-
-/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
- * @param {number} now */
-export async function canDeleteFailedProfileUpload(db, message, row, now) {
-  const owned = mutationChanges(await db.prepare(
-    `UPDATE threads_authors SET profile_upload_started_at = ?, updated_at = ?
-     WHERE threads_user_id = ? AND profile_media_status = 'pending'
-       AND profile_upload_lease = ? AND profile_cleanup_lease IS NULL AND EXISTS (
-         SELECT 1 FROM threads_entries entry JOIN threads_posts post
-           ON post.id = entry.threads_post_id
-         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
-           AND job.generation = post.sync_generation
-         WHERE entry.author_id = threads_authors.threads_user_id
-           AND entry.threads_post_id = ? AND post.sync_generation = ?
-           AND post.status <> 'deleting'
-       )`,
-  ).bind(now, now, row.author_id, row.upload_lease,
-    message.postId, message.generation).run());
-  if (owned > 1) throw new AppError("storage_unavailable", 503);
-  if (owned === 1) return true;
-  const value = await db.prepare(
-    `SELECT profile_media_status AS status, profile_upload_lease AS upload_lease
-     FROM threads_authors WHERE threads_user_id = ?`,
-  ).bind(row.author_id).first();
-  if (value === null) return true;
-  const current = exactRow(value, ["status", "upload_lease"]);
-  if (!["pending", "ready", "error", "deleting"].includes(current.status) ||
-    !(current.upload_lease === null || typeof current.upload_lease === "string" &&
-      current.upload_lease)) throw new AppError("storage_unavailable", 503);
-  if (current.status === "ready" || current.upload_lease !== null &&
-    current.upload_lease !== row.upload_lease) return false;
-  return !await hasLiveAuthorReference(db, row.author_id);
-}
-
-/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
- * @param {number} now */
-export async function clearEntryUploadForRetry(db, message, row, now) {
+export async function claimEntryUploadRecovery(db, message, row, now) {
   if (row.upload_lease === null) return true;
   const cutoff = now - UPLOAD_STALE_SECONDS;
   if (row.upload_started_at > cutoff) return false;
   const changes = mutationChanges(await db.prepare(
-    `UPDATE threads_media SET upload_lease = NULL, upload_started_at = NULL,
-       status = 'pending', updated_at = ?
+    `UPDATE threads_media SET upload_started_at = ?, updated_at = ?
      WHERE id = ? AND entry_id = ? AND upload_lease = ? AND upload_started_at = ?
        AND upload_started_at <= ?
        AND status IN ('pending','error') AND EXISTS (
@@ -475,11 +450,100 @@ export async function clearEntryUploadForRetry(db, message, row, now) {
          WHERE entry.id = threads_media.entry_id AND entry.threads_post_id = ?
            AND post.sync_generation = ? AND post.status <> 'deleting'
        )`,
-  ).bind(now, row.media_id, row.entry_id, row.upload_lease,
+  ).bind(now, now, row.media_id, row.entry_id, row.upload_lease,
     row.upload_started_at, cutoff,
     message.postId, message.generation).run());
   if (changes > 1) throw new AppError("storage_unavailable", 503);
   return changes === 1;
+}
+
+/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
+ * @param {number} recoveryStarted @param {number} priorStarted */
+export async function restoreEntryUploadRecovery(db, message, row, recoveryStarted,
+  priorStarted) {
+  const changes = mutationChanges(await db.prepare(
+    `UPDATE threads_media SET upload_started_at = ?, updated_at = ?
+     WHERE id = ? AND entry_id = ? AND status IN ('pending','error')
+       AND upload_lease = ? AND upload_started_at = ? AND EXISTS (
+         SELECT 1 FROM threads_entries entry JOIN threads_posts post
+           ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.id = threads_media.entry_id AND entry.threads_post_id = ?
+           AND post.sync_generation = ? AND post.status <> 'deleting'
+       )`,
+  ).bind(priorStarted, recoveryStarted, row.media_id, row.entry_id,
+    row.upload_lease, recoveryStarted, message.postId, message.generation).run());
+  if (changes > 1) throw new AppError("storage_unavailable", 503);
+}
+
+/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
+ * @param {number} recoveryStarted */
+export async function finishEntryUploadRecovery(db, message, row, recoveryStarted) {
+  const changes = mutationChanges(await db.prepare(
+    `UPDATE threads_media SET upload_lease = NULL, upload_started_at = NULL,
+       status = 'pending', updated_at = ?
+     WHERE id = ? AND entry_id = ? AND status IN ('pending','error')
+       AND upload_lease = ? AND upload_started_at = ? AND EXISTS (
+         SELECT 1 FROM threads_entries entry JOIN threads_posts post
+           ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.id = threads_media.entry_id AND entry.threads_post_id = ?
+           AND post.sync_generation = ? AND post.status <> 'deleting'
+       )`,
+  ).bind(recoveryStarted, row.media_id, row.entry_id, row.upload_lease,
+    recoveryStarted, message.postId, message.generation).run());
+  if (changes > 1) throw new AppError("storage_unavailable", 503);
+  return changes === 1;
+}
+
+/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
+ * @param {number} now */
+export async function claimProfileUploadRecovery(db, message, row, now) {
+  if (row.upload_lease === null) return true;
+  const cutoff = now - UPLOAD_STALE_SECONDS;
+  if (row.upload_started_at > cutoff) return false;
+  const changes = mutationChanges(await db.prepare(
+    `UPDATE threads_authors SET profile_upload_started_at = ?, updated_at = ?
+     WHERE threads_user_id = ? AND profile_media_status IN ('pending','error')
+       AND profile_upload_lease = ? AND profile_upload_started_at = ?
+       AND profile_upload_started_at <= ? AND profile_cleanup_lease IS NULL
+       AND EXISTS (
+         SELECT 1 FROM threads_entries entry JOIN threads_posts post
+           ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.author_id = threads_authors.threads_user_id
+           AND entry.threads_post_id = ? AND post.sync_generation = ?
+           AND post.status <> 'deleting'
+       )`,
+  ).bind(now, now, row.author_id, row.upload_lease, row.upload_started_at, cutoff,
+    message.postId, message.generation).run());
+  if (changes > 1) throw new AppError("storage_unavailable", 503);
+  return changes === 1;
+}
+
+/** @param {any} db @param {Record<string, any>} message @param {Record<string, any>} row
+ * @param {number} recoveryStarted @param {number} priorStarted */
+export async function restoreProfileUploadRecovery(db, message, row, recoveryStarted,
+  priorStarted) {
+  const changes = mutationChanges(await db.prepare(
+    `UPDATE threads_authors SET profile_upload_started_at = ?, updated_at = ?
+     WHERE threads_user_id = ? AND profile_media_status IN ('pending','error')
+       AND profile_upload_lease = ? AND profile_upload_started_at = ?
+       AND profile_cleanup_lease IS NULL AND EXISTS (
+         SELECT 1 FROM threads_entries entry JOIN threads_posts post
+           ON post.id = entry.threads_post_id
+         JOIN threads_sync_jobs job ON job.threads_post_id = post.id
+           AND job.generation = post.sync_generation
+         WHERE entry.author_id = threads_authors.threads_user_id
+           AND entry.threads_post_id = ? AND post.sync_generation = ?
+           AND post.status <> 'deleting'
+       )`,
+  ).bind(priorStarted, recoveryStarted, row.author_id, row.upload_lease,
+    recoveryStarted, message.postId, message.generation).run());
+  if (changes > 1) throw new AppError("storage_unavailable", 503);
 }
 
 /** @param {any} bucket @param {string} key */
@@ -488,26 +552,15 @@ export async function deleteUncommittedUpload(bucket, key) {
   catch { throw new AppError("media_storage_unavailable", 503); }
 }
 
-/** @param {any} db @param {string} authorId */
-export async function hasLiveAuthorReference(db, authorId) {
-  const value = await db.prepare(
-    `SELECT COUNT(*) AS count FROM threads_entries entry
-     JOIN threads_posts post ON post.id = entry.threads_post_id
-     WHERE entry.author_id = ? AND post.status <> 'deleting'`,
-  ).bind(authorId).first();
-  const row = exactRow(value, ["count"]);
-  return d1NonnegativeInteger(row.count) > 0;
-}
-
-
-
-/** @param {Record<string, any>} message @param {any} dependencies */
-export async function terminalizeEntryDeadLetter(message, dependencies) {
-  const row = await readEntryMedia(dependencies.db, message);
+/** @param {Record<string, any>} message @param {any} dependencies
+ * @param {Record<string, any> | null} [recoveredRow] */
+export async function terminalizeEntryDeadLetter(message, dependencies,
+  recoveredRow = null) {
+  const row = recoveredRow ?? await readEntryMedia(dependencies.db, message);
   if (!row || row.status === "ready") return;
   const now = inputTimestamp(dependencies.nowSeconds);
   const cutoff = now - UPLOAD_STALE_SECONDS;
-  if (row.upload_lease !== null && row.upload_started_at > cutoff)
+  if (recoveredRow === null && row.upload_lease !== null && row.upload_started_at > cutoff)
     throw new AppError("media_upload_in_progress", 503);
   const entry = message.type === "retry-media" ? null : message.entryId;
   const changes = mutationChanges(await dependencies.db.prepare(
@@ -526,19 +579,22 @@ export async function terminalizeEntryDeadLetter(message, dependencies) {
            AND post.sync_generation = ? AND post.status <> 'deleting'
        )`,
   ).bind(now, row.media_id, row.entry_id,
-    row.upload_lease, row.upload_lease, row.upload_started_at, cutoff, entry, entry,
+    row.upload_lease, row.upload_lease, row.upload_started_at,
+    recoveredRow === null ? cutoff : now, entry, entry,
     message.postId, message.generation).run());
   if (changes > 1) throw new AppError("storage_unavailable", 503);
   if (changes === 1) await recalculateMediaStatus(dependencies, message);
 }
 
-/** @param {Record<string, any>} message @param {any} dependencies */
-export async function terminalizeProfileDeadLetter(message, dependencies) {
-  const row = await readProfileMedia(dependencies.db, message);
+/** @param {Record<string, any>} message @param {any} dependencies
+ * @param {Record<string, any> | null} [recoveredRow] */
+export async function terminalizeProfileDeadLetter(message, dependencies,
+  recoveredRow = null) {
+  const row = recoveredRow ?? await readProfileMedia(dependencies.db, message);
   if (!row || row.status === "ready" || row.status === "deleting") return;
   const now = inputTimestamp(dependencies.nowSeconds);
   const cutoff = now - UPLOAD_STALE_SECONDS;
-  if (row.upload_lease !== null && row.upload_started_at > cutoff)
+  if (recoveredRow === null && row.upload_lease !== null && row.upload_started_at > cutoff)
     throw new AppError("media_upload_in_progress", 503);
   const changes = mutationChanges(await dependencies.db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'error',
@@ -560,7 +616,8 @@ export async function terminalizeProfileDeadLetter(message, dependencies) {
            AND post.status <> 'deleting'
        )`,
   ).bind(now, row.author_id,
-    row.upload_lease, row.upload_lease, row.upload_started_at, cutoff,
+    row.upload_lease, row.upload_lease, row.upload_started_at,
+    recoveredRow === null ? cutoff : now,
     message.postId, message.generation).run());
   if (changes > 1) throw new AppError("storage_unavailable", 503);
   if (changes === 1) await recalculateMediaStatus(dependencies, message);

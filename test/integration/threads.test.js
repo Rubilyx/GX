@@ -449,6 +449,16 @@ const rawThreadsMedia = (id, shortcode, ownerId = "author-1", overrides = {}) =>
 /** @param {string} entrySourceMediaId @param {string} sourceMediaId @param {"image" | "video" | "video_thumbnail"} [kind] @param {number} [ordinal] @param {string | null} [altText] */
 const mediaDescriptor = (entrySourceMediaId, sourceMediaId, kind = "image", ordinal = 0,
   altText = null) => ({ entrySourceMediaId, sourceMediaId, kind, ordinal, altText });
+const TEST_UPLOAD_LEASE_A = "00000000-0000-4000-8000-000000000001";
+const TEST_UPLOAD_LEASE_B = "00000000-0000-4000-8000-000000000002";
+const TEST_UPLOAD_LEASE_C = "00000000-0000-4000-8000-000000000003";
+/** @param {string} postId @param {string} sourceId @param {string} kind
+ * @param {number} ordinal @param {string} lease */
+const testEntryVersionKey = (postId, sourceId, kind, ordinal, lease) =>
+  `threads/posts/${postId}/${sourceId}/${kind}-${ordinal}/${lease}`;
+/** @param {string} authorId @param {string} lease */
+const testProfileVersionKey = (authorId, lease) =>
+  `threads/authors/${authorId}/profile/${lease}`;
 const SAVED_NO_QUOTES = Object.freeze({ applied: true, quoteWork: [] });
 const NOT_SAVED = Object.freeze({ applied: false, quoteWork: [] });
 
@@ -2445,27 +2455,34 @@ test("Threads media streams entry and profile objects before marking D1 ready an
     authorId: "author-1",
   }, dependencies), { action: "ack" });
   assert.equal(observedPending, true);
-  assert.deepEqual(await db.prepare(
+  const storedRows = await db.prepare(
     `SELECT id, status, r2_key, content_type, bytes, etag, attempt_count
      FROM threads_media ORDER BY ordinal`,
-  ).all().then((result) => result.results), [
-    { id: "local-image", status: "ready",
-      r2_key: "threads/posts/media-post-1/source-image/image-0",
-      content_type: "image/jpeg", bytes: 5, etag: '"r2-5"', attempt_count: 1 },
-    { id: "local-video", status: "ready",
-      r2_key: "threads/posts/media-post-1/source-video/video-1",
-      content_type: "video/mp4", bytes: 5, etag: '"r2-5"', attempt_count: 1 },
-    { id: "local-thumb", status: "ready",
-      r2_key: "threads/posts/media-post-1/source-video/video_thumbnail-2",
-      content_type: "image/webp", bytes: 5, etag: '"r2-5"', attempt_count: 1 },
+  ).all().then((result) => result.results);
+  assert.deepEqual(storedRows.map(({ r2_key: unused, ...row }) => row), [
+    { id: "local-image", status: "ready", content_type: "image/jpeg",
+      bytes: 5, etag: '"r2-5"', attempt_count: 1 },
+    { id: "local-video", status: "ready", content_type: "video/mp4",
+      bytes: 5, etag: '"r2-5"', attempt_count: 1 },
+    { id: "local-thumb", status: "ready", content_type: "image/webp",
+      bytes: 5, etag: '"r2-5"', attempt_count: 1 },
   ]);
-  assert.deepEqual(await db.prepare(
+  for (const [index, prefix] of [
+    "threads/posts/media-post-1/source-image/image-0/",
+    "threads/posts/media-post-1/source-video/video-1/",
+    "threads/posts/media-post-1/source-video/video_thumbnail-2/",
+  ].entries()) assert.match(String(storedRows[index].r2_key),
+    new RegExp(`^${prefix}[0-9a-f-]{36}$`));
+  const storedProfile = await db.prepare(
     `SELECT profile_media_status, profile_r2_key, profile_content_type,
        profile_bytes, profile_etag FROM threads_authors WHERE threads_user_id = 'author-1'`,
-  ).first(), {
-    profile_media_status: "ready", profile_r2_key: "threads/authors/author-1/profile",
+  ).first();
+  assert.deepEqual({ ...storedProfile, profile_r2_key: undefined }, {
+    profile_media_status: "ready", profile_r2_key: undefined,
     profile_content_type: "image/png", profile_bytes: 6, profile_etag: '"r2-6"',
   });
+  assert.match(String(storedProfile?.profile_r2_key),
+    /^threads\/authors\/author-1\/profile\/[0-9a-f-]{36}$/);
   assert.equal(await db.prepare(
     "SELECT status FROM threads_sync_jobs WHERE threads_post_id = ?",
   ).bind(seeded.postId).first("status"), "ready");
@@ -2535,7 +2552,7 @@ test("ready shared profiles recalculate every addressed archive without provider
     postId: "ready-profile-post-b", shortcode: "ReadyProfileB",
     entryId: "ready-profile-entry-b", media: [],
   });
-  const key = "threads/authors/author-1/profile";
+  const key = testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A);
   const object = await harness.mediaBucket.put(
     key, new Blob(["profile"], { type: "image/png" }).stream(),
     { httpMetadata: { contentType: "image/png" } },
@@ -2577,10 +2594,10 @@ test("ready entry redelivery recovers a prior recalculation failure without redo
   ] });
   await db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'ready',
-       profile_r2_key = 'threads/authors/author-1/profile',
+       profile_r2_key = ?,
        profile_content_type = 'image/png', profile_bytes = 1, profile_etag = '"profile"'
      WHERE threads_user_id = 'author-1'`,
-  ).run();
+  ).bind(testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A)).run();
   /** @type {Array<{ method: string, path: string }>} */
   const calls = [];
   const fetcher = providerFixture({ calls, threadsMedia: {
@@ -2761,6 +2778,76 @@ test("concurrent shared-profile delivery has one upload owner and recalculates b
   ]);
 });
 
+test("delayed stale profile upload cannot affect the post-DLQ winner version", async () => {
+  const db = (await harness.worker.getEnv()).PROD_DB;
+  const seeded = await seedPendingMedia(db, { media: [] });
+  let graphCalls = 0;
+  let cdnCalls = 0;
+  /** @param {RequestInfo | URL} input @param {RequestInit} [init] */
+  const fetcher = async (input, init = {}) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://graph.threads.net") {
+      graphCalls += 1;
+      return Response.json({ id: "author-1", username: "meta", name: "Meta",
+        threads_profile_picture_url: graphCalls === 1 ?
+          "https://scontent.cdninstagram.com/stale-profile-upload" :
+          "https://scontent.cdninstagram.com/winner-profile-upload" });
+    }
+    cdnCalls += 1;
+    return new Response(new Blob([
+      url.pathname === "/stale-profile-upload" ? "stale-profile" : "winner-profile",
+    ], { type: "image/png" }));
+  };
+  const staleWritten = deferred();
+  const releaseStale = deferred();
+  let puts = 0;
+  const bucket = {
+    ...harness.mediaBucket,
+    /** @param {string} key @param {ReadableStream<Uint8Array>} body
+     * @param {Record<string, any>} options */
+    async put(key, body, options) {
+      puts += 1;
+      const result = await harness.mediaBucket.put(key, body, options);
+      if (puts === 1) { staleWritten.resolve(); await releaseStale.promise; }
+      return result;
+    },
+  };
+  const message = {
+    version: 1, type: "archive-profile", postId: seeded.postId, generation: 1,
+    authorId: "author-1",
+  };
+  const stale = handleThreadsMediaMessage(message,
+    mediaDependencies(db, fetcher, { bucket, nowSeconds: 0 }));
+  await staleWritten.promise;
+  const staleLease = await db.prepare(
+    "SELECT profile_upload_lease FROM threads_authors WHERE threads_user_id = 'author-1'",
+  ).first("profile_upload_lease");
+  const staleKey = testProfileVersionKey("author-1", String(staleLease));
+  assert.deepEqual(await handleThreadsMediaDeadLetter(message,
+    mediaDependencies(db, fetcher, { bucket, nowSeconds: 960 })), { action: "ack" });
+  assert.equal(harness.mediaObjects().some((object) => object.key === staleKey), false);
+  assert.deepEqual(await handleThreadsMediaMessage(message,
+    mediaDependencies(db, fetcher, { bucket, nowSeconds: 961 })), { action: "ack" });
+  releaseStale.resolve();
+  assert.deepEqual(await stale, { action: "ack" });
+  const author = await db.prepare(
+    `SELECT profile_media_status, profile_r2_key, profile_bytes, profile_etag,
+       profile_attempt_count FROM threads_authors WHERE threads_user_id = 'author-1'`,
+  ).first();
+  const objects = harness.mediaObjects();
+  assert.equal(objects.length, 1);
+  assert.notEqual(author?.profile_r2_key, staleKey);
+  assert.equal(objects[0].key, author?.profile_r2_key);
+  assert.equal(objects[0].size, author?.profile_bytes);
+  assert.equal(objects[0].httpEtag, author?.profile_etag);
+  assert.equal(new TextDecoder().decode(objects[0].bytes), "winner-profile");
+  assert.deepEqual({ status: author?.profile_media_status,
+    attempts: author?.profile_attempt_count }, { status: "ready", attempts: 2 });
+  assert.equal(graphCalls, 2);
+  assert.equal(cdnCalls, 2);
+});
+
 test("a delayed stale upload owner cannot overwrite the manual-retry winner", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
   const seeded = await seedPendingMedia(db, { media: [
@@ -2813,7 +2900,7 @@ test("a delayed stale upload owner cannot overwrite the manual-retry winner", as
     mediaId: "fenced-media",
   }, mediaDependencies(db, fetcher, { bucket, nowSeconds: 960 })), { action: "ack" });
   releaseStalePut.resolve();
-  assert.deepEqual(await stale, { action: "retry", delaySeconds: 1 });
+  assert.deepEqual(await stale, { action: "ack" });
   const row = await db.prepare(
     `SELECT status, bytes, etag, upload_lease, upload_started_at
      FROM threads_media WHERE id = 'fenced-media'`,
@@ -2824,6 +2911,7 @@ test("a delayed stale upload owner cannot overwrite the manual-retry winner", as
   assert.equal(object?.size, row?.bytes);
   assert.equal(object?.httpEtag, row?.etag);
   assert.equal(new TextDecoder().decode(object?.bytes), "winner-bytes");
+  assert.equal(harness.mediaObjects().length, 1);
 });
 
 test("a stale mismatched upload cannot delete the manual-retry winner", async () => {
@@ -2965,7 +3053,8 @@ test("a winner replacing after a stale write observation remains intact without 
   assert.equal(object?.size, row?.bytes);
   assert.equal(object?.httpEtag, row?.etag);
   assert.equal(new TextDecoder().decode(object?.bytes), "observed-winner");
-  assert.equal(heads, 2);
+  assert.equal(harness.mediaObjects().length, 1);
+  assert.equal(heads, 0);
 });
 
 test("manual retry and DLQ recover crash-held entry and profile upload leases", async () => {
@@ -2976,15 +3065,24 @@ test("manual retry and DLQ recover crash-held entry and profile upload leases", 
   ] });
   await db.prepare(
     `UPDATE threads_media SET upload_lease = CASE id
-         WHEN 'crash-retry-media' THEN 'crash-retry-lease' ELSE 'crash-dlq-lease' END,
+         WHEN 'crash-retry-media' THEN ? ELSE ? END,
        upload_started_at = 4000, attempt_count = 1
      WHERE id IN ('crash-retry-media','crash-dlq-media')`,
-  ).run();
+  ).bind(TEST_UPLOAD_LEASE_A, TEST_UPLOAD_LEASE_B).run();
   await db.prepare(
-    `UPDATE threads_authors SET profile_upload_lease = 'profile-crash-lease',
+    `UPDATE threads_authors SET profile_upload_lease = ?,
        profile_upload_started_at = 4000, profile_attempt_count = 1
      WHERE threads_user_id = 'author-1'`,
-  ).run();
+  ).bind(TEST_UPLOAD_LEASE_C).run();
+  for (const [key, body] of [
+    [testEntryVersionKey(seeded.postId, "crash-retry-source", "image", 0,
+      TEST_UPLOAD_LEASE_A), "old-retry"],
+    [testEntryVersionKey(seeded.postId, "crash-dlq-source", "image", 1,
+      TEST_UPLOAD_LEASE_B), "old-dlq"],
+    [testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_C), "old-profile"],
+  ]) await harness.mediaBucket.put(key,
+    new Blob([body], { type: "image/jpeg" }).stream(),
+    { httpMetadata: { contentType: "image/jpeg" } });
   /** @type {Array<{ method: string, path: string }>} */
   const calls = [];
   const fetcher = providerFixture({ calls, threadsMedia: {
@@ -3034,6 +3132,8 @@ test("manual retry and DLQ recover crash-held entry and profile upload leases", 
   ).first(), { profile_media_status: "error",
     profile_error_code: "media_retries_exhausted", profile_attempt_count: 1,
     profile_upload_lease: null, profile_upload_started_at: null });
+  assert.equal(harness.mediaObjects().length, 1);
+  assert.equal(new TextDecoder().decode(harness.mediaObjects()[0].bytes), "recovered");
 });
 
 test("manual retry leaves a 959-second owner live and recovers it at 960 seconds", async () => {
@@ -3042,9 +3142,9 @@ test("manual retry leaves a 959-second owner live and recovers it at 960 seconds
     { id: "age-retry-media", sourceId: "age-retry-source", kind: "image", ordinal: 0 },
   ] });
   await db.prepare(
-    `UPDATE threads_media SET upload_lease = 'age-retry-lease',
+    `UPDATE threads_media SET upload_lease = ?,
        upload_started_at = 1000, attempt_count = 1 WHERE id = 'age-retry-media'`,
-  ).run();
+  ).bind(TEST_UPLOAD_LEASE_A).run();
   await db.prepare(
     "UPDATE threads_authors SET profile_media_status = 'error' WHERE threads_user_id = 'author-1'",
   ).run();
@@ -3068,7 +3168,7 @@ test("manual retry leaves a 959-second owner live and recovers it at 960 seconds
     `SELECT status, attempt_count, upload_lease, upload_started_at
      FROM threads_media WHERE id = 'age-retry-media'`,
   ).first(), { status: "pending", attempt_count: 1,
-    upload_lease: "age-retry-lease", upload_started_at: 1_000 });
+    upload_lease: TEST_UPLOAD_LEASE_A, upload_started_at: 1_000 });
 
   assert.deepEqual(await handleThreadsMediaMessage(message,
     mediaDependencies(db, fetcher, { nowSeconds: 1_960 })), { action: "ack" });
@@ -3085,14 +3185,14 @@ test("DLQ leaves newer entry and profile owners live but terminalizes stale owne
     { id: "age-dlq-media", sourceId: "age-dlq-source", kind: "image", ordinal: 0 },
   ] });
   await db.prepare(
-    `UPDATE threads_media SET upload_lease = 'age-dlq-lease',
+    `UPDATE threads_media SET upload_lease = ?,
        upload_started_at = 1000, attempt_count = 1 WHERE id = 'age-dlq-media'`,
-  ).run();
+  ).bind(TEST_UPLOAD_LEASE_A).run();
   await db.prepare(
-    `UPDATE threads_authors SET profile_upload_lease = 'age-profile-lease',
+    `UPDATE threads_authors SET profile_upload_lease = ?,
        profile_upload_started_at = 1000, profile_attempt_count = 1
      WHERE threads_user_id = 'author-1'`,
-  ).run();
+  ).bind(TEST_UPLOAD_LEASE_B).run();
   const entryMessage = {
     version: 1, type: "archive-entry-media", postId: seeded.postId, generation: 1,
     entryId: seeded.entryId, mediaId: "age-dlq-media",
@@ -3111,11 +3211,11 @@ test("DLQ leaves newer entry and profile owners live but terminalizes stale owne
   assert.deepEqual(await db.prepare(
     `SELECT upload_lease, upload_started_at FROM threads_media
      WHERE id = 'age-dlq-media'`,
-  ).first(), { upload_lease: "age-dlq-lease", upload_started_at: 1_000 });
+  ).first(), { upload_lease: TEST_UPLOAD_LEASE_A, upload_started_at: 1_000 });
   assert.deepEqual(await db.prepare(
     `SELECT profile_upload_lease, profile_upload_started_at FROM threads_authors
      WHERE threads_user_id = 'author-1'`,
-  ).first(), { profile_upload_lease: "age-profile-lease",
+  ).first(), { profile_upload_lease: TEST_UPLOAD_LEASE_B,
     profile_upload_started_at: 1_000 });
 
   assert.deepEqual(await handleThreadsMediaDeadLetter(entryMessage,
@@ -3143,9 +3243,9 @@ test("Threads media retry reacquires a fresh provider URL and terminal corruptio
   ] });
   await db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'ready',
-       profile_r2_key = 'threads/authors/author-1/profile', profile_content_type = 'image/png',
+       profile_r2_key = ?, profile_content_type = 'image/png',
        profile_bytes = 1, profile_etag = '"profile"' WHERE threads_user_id = 'author-1'`,
-  ).run();
+  ).bind(testProfileVersionKey("author-1", TEST_UPLOAD_LEASE_A)).run();
   let detailCalls = 0;
   /** @type {string[]} */
   const cdnCalls = [];
@@ -3224,6 +3324,12 @@ test("Threads media retry reacquires a fresh provider URL and terminal corruptio
   ).bind(seeded.postId).first(), {
     status: "ready", ready_media_count: 3, failed_media_count: 0,
   });
+  const readyKeys = await db.prepare(
+    "SELECT r2_key FROM threads_media WHERE status = 'ready' ORDER BY id",
+  ).all().then((result) => result.results.map((row) => row.r2_key));
+  assert.deepEqual(harness.mediaObjects().map((object) => object.key).sort(),
+    readyKeys.sort());
+  assert.equal(readyKeys.length, 2);
 });
 
 test("profile media failure and media DLQ terminalize current pending items but preserve ready objects", async () => {
@@ -3233,7 +3339,8 @@ test("profile media failure and media DLQ terminalize current pending items but 
     { id: "dlq-pending", sourceId: "pending-source", kind: "image", ordinal: 1 },
   ] });
   const ready = await harness.mediaBucket.put(
-    "threads/posts/media-post-1/ready-source/image-0",
+    testEntryVersionKey("media-post-1", "ready-source", "image", 0,
+      TEST_UPLOAD_LEASE_A),
     new Blob(["ready"], { type: "image/jpeg" }).stream(),
     { httpMetadata: { contentType: "image/jpeg" } },
   );
@@ -3284,7 +3391,8 @@ test("Threads media serves archive-scoped full HEAD and one exact range with pri
     { id: "serve-media", sourceId: "serve-source", kind: "video", ordinal: 0 },
   ] });
   const object = await harness.mediaBucket.put(
-    "threads/posts/media-post-1/serve-source/video-0",
+    testEntryVersionKey("media-post-1", "serve-source", "video", 0,
+      TEST_UPLOAD_LEASE_A),
     new Blob(["0123456789"], { type: "video/mp4" }).stream(),
     { httpMetadata: { contentType: "video/mp4" } },
   );
@@ -3361,11 +3469,11 @@ async function seedDeletingArchive(db, id, entryId, key) {
 
 /** @param {string} postId */
 const deletingEntryKey = (postId) =>
-  `threads/posts/${postId}/${postId}-source/image-0`;
+  testEntryVersionKey(postId, `${postId}-source`, "image", 0, TEST_UPLOAD_LEASE_A);
 
 test("Threads deletion keeps shared profiles until unreferenced and concurrent archive order converges", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
-  const profileKey = "threads/authors/shared-delete-author/profile";
+  const profileKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_A);
   await seedDeletingArchive(db, "delete-a", "delete-entry-a", deletingEntryKey("delete-a"));
   await seedDeletingArchive(db, "delete-b", "delete-entry-b", deletingEntryKey("delete-b"));
   await db.prepare(
@@ -3458,7 +3566,7 @@ test("Threads deletion leaves tombstones on object failure and retries a deletin
   ).first("status"), "deleting");
   await harness.setR2Mode({});
 
-  const profileKey = "threads/authors/shared-delete-author/profile";
+  const profileKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_A);
   await harness.mediaBucket.put(
     profileKey, new Blob(["p"], { type: "image/jpeg" }).stream(),
     { httpMetadata: { contentType: "image/jpeg" } },
@@ -3504,7 +3612,7 @@ test("Threads deletion leaves tombstones on object failure and retries a deletin
 
 test("failed profile cleanup reactivates safely when a new archive references the author", async () => {
   const db = (await harness.worker.getEnv()).PROD_DB;
-  const oldKey = "threads/authors/shared-delete-author/profile";
+  const oldKey = testProfileVersionKey("shared-delete-author", TEST_UPLOAD_LEASE_A);
   const entryKey = deletingEntryKey("cleanup-reuse-delete");
   await seedDeletingArchive(db, "cleanup-reuse-delete", "cleanup-reuse-entry", entryKey);
   await db.prepare(
@@ -3568,10 +3676,15 @@ test("failed profile cleanup reactivates safely when a new archive references th
        profile_upload_lease, profile_cleanup_lease FROM threads_authors
      WHERE threads_user_id = 'shared-delete-author'`,
   ).first();
-  const object = harness.mediaObjects().find((item) => item.key === oldKey);
-  assert.deepEqual(author, { profile_media_status: "ready", profile_r2_key: oldKey,
+  const object = harness.mediaObjects().find((item) => item.key === author?.profile_r2_key);
+  assert.notEqual(author?.profile_r2_key, oldKey);
+  assert.match(String(author?.profile_r2_key),
+    /^threads\/authors\/shared-delete-author\/profile\/[0-9a-f-]{36}$/);
+  assert.deepEqual({ ...author, profile_r2_key: undefined }, {
+    profile_media_status: "ready", profile_r2_key: undefined,
     profile_bytes: 11, profile_etag: '"r2-11"', profile_upload_lease: null,
     profile_cleanup_lease: null });
+  assert.equal(harness.mediaObjects().some((item) => item.key === oldKey), false);
   assert.equal(object?.size, author?.profile_bytes);
   assert.equal(object?.httpEtag, author?.profile_etag);
   assert.equal(new TextDecoder().decode(object?.bytes), "new-profile");
@@ -3594,7 +3707,7 @@ test("one cleanup lease fences a delayed sweep before profile reactivation and u
        expected_entry_count = 1, expected_media_count = 1
      WHERE threads_post_id = 'cleanup-fence-post'`,
   ).run();
-  const key = "threads/authors/cleanup-fence-author/profile";
+  const key = testProfileVersionKey("cleanup-fence-author", TEST_UPLOAD_LEASE_A);
   await db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'deleting', profile_r2_key = ?,
        profile_content_type = 'image/jpeg', profile_bytes = 3, profile_etag = '"old"'
@@ -3657,17 +3770,23 @@ test("one cleanup lease fences a delayed sweep before profile reactivation and u
     authorId: "cleanup-fence-author",
   }, mediaDependencies(db, fetcher, { bucket })), { action: "ack" });
   assert.equal(oldDeletes, 1);
-  const object = harness.mediaObjects().find((item) => item.key === key);
   const author = await db.prepare(
-    `SELECT profile_media_status, profile_bytes, profile_etag,
+    `SELECT profile_media_status, profile_r2_key, profile_bytes, profile_etag,
        profile_upload_lease, profile_cleanup_lease FROM threads_authors
      WHERE threads_user_id = 'cleanup-fence-author'`,
   ).first();
-  assert.deepEqual(author, { profile_media_status: "ready", profile_bytes: 10,
+  const object = harness.mediaObjects().find((item) => item.key === author?.profile_r2_key);
+  assert.notEqual(author?.profile_r2_key, key);
+  assert.deepEqual({ ...author, profile_r2_key: undefined }, {
+    profile_media_status: "ready", profile_r2_key: undefined, profile_bytes: 10,
     profile_etag: '"r2-10"', profile_upload_lease: null, profile_cleanup_lease: null });
+  assert.equal(harness.mediaObjects().some((item) => item.key === key), false);
   assert.equal(object?.size, author?.profile_bytes);
   assert.equal(object?.httpEtag, author?.profile_etag);
   assert.equal(new TextDecoder().decode(object?.bytes), "fenced-new");
+  await harness.mediaBucket.delete(key);
+  assert.equal(harness.mediaObjects().some((item) =>
+    item.key === author?.profile_r2_key), true);
 });
 
 test("profile delivery reclaims dead cleanup at 960 seconds and cannot remain deleting", async () => {
@@ -3684,7 +3803,7 @@ test("profile delivery reclaims dead cleanup at 960 seconds and cannot remain de
        expected_entry_count = 1, expected_media_count = 1
      WHERE threads_post_id = 'cleanup-death-post'`,
   ).run();
-  const key = "threads/authors/cleanup-death-author/profile";
+  const key = testProfileVersionKey("cleanup-death-author", TEST_UPLOAD_LEASE_A);
   await db.prepare(
     `UPDATE threads_authors SET profile_media_status = 'deleting', profile_r2_key = ?,
        profile_content_type = 'image/jpeg', profile_bytes = 3, profile_etag = '"old"',
@@ -3728,16 +3847,19 @@ test("profile delivery reclaims dead cleanup at 960 seconds and cannot remain de
     mediaDependencies(db, fetcher, { nowSeconds: 1_961 })), { action: "ack" });
   assert.equal(calls, afterRecoveryCalls);
   const author = await db.prepare(
-    `SELECT profile_media_status, profile_bytes, profile_etag,
+    `SELECT profile_media_status, profile_r2_key, profile_bytes, profile_etag,
        profile_cleanup_lease, profile_cleanup_started_at,
        profile_upload_lease, profile_upload_started_at FROM threads_authors
      WHERE threads_user_id = 'cleanup-death-author'`,
   ).first();
-  const object = harness.mediaObjects().find((item) => item.key === key);
-  assert.deepEqual(author, { profile_media_status: "ready", profile_bytes: 17,
+  const object = harness.mediaObjects().find((item) => item.key === author?.profile_r2_key);
+  assert.notEqual(author?.profile_r2_key, key);
+  assert.deepEqual({ ...author, profile_r2_key: undefined }, {
+    profile_media_status: "ready", profile_r2_key: undefined, profile_bytes: 17,
     profile_etag: '"r2-17"', profile_cleanup_lease: null,
     profile_cleanup_started_at: null, profile_upload_lease: null,
     profile_upload_started_at: null });
+  assert.equal(harness.mediaObjects().some((item) => item.key === key), false);
   assert.equal(object?.size, author?.profile_bytes);
   assert.equal(object?.httpEtag, author?.profile_etag);
   assert.equal(new TextDecoder().decode(object?.bytes), "cleanup-death-new");
@@ -3751,7 +3873,8 @@ test("delete-object removes only an exact D1-referenced key and media drain is b
   const seeded = await seedPendingMedia(db, { media: [
     { id: "object-media", sourceId: "object-source", kind: "image", ordinal: 0 },
   ] });
-  const referenced = "threads/posts/media-post-1/object-source/image-0";
+  const referenced = testEntryVersionKey("media-post-1", "object-source", "image", 0,
+    TEST_UPLOAD_LEASE_A);
   const unreferenced = "threads/unreferenced";
   for (const key of [referenced, unreferenced]) await harness.mediaBucket.put(
     key, new Blob(["x"], { type: "image/jpeg" }).stream(),

@@ -5,12 +5,14 @@ import {
   mediaMaximumBytes,
 } from "./thread-media-download.js";
 import {
-  MEDIA_ACK, canDeleteFailedEntryUpload, canDeleteFailedProfileUpload,
-  claimEntryUpload, claimProfileUpload, clearEntryUploadForRetry,
+  MEDIA_ACK, claimEntryUpload, claimEntryUploadRecovery, claimProfileUpload,
+  claimProfileUploadRecovery,
   deleteUncommittedUpload, entryKey, failEntryUpload, failProfileUpload,
-  hasLiveAuthorReference, mediaRetryResult, ownsEntryUpload, ownsProfileUpload,
+  finishEntryUploadRecovery,
+  mediaRetryResult, ownsEntryUpload, ownsProfileUpload,
   profileKey, readEntryMedia, readProfileMedia, readyEntryUpload, readyProfileUpload,
   recalculateMediaStatus, releaseEntryUpload, releaseProfileUpload,
+  restoreEntryUploadRecovery, restoreProfileUploadRecovery,
   terminalMediaCode, terminalizeEntryDeadLetter, terminalizeProfileDeadLetter,
 } from "./thread-media-store.js";
 import { fetchThreadsMedia, fetchThreadsProfile } from "./threads-api.js";
@@ -46,7 +48,18 @@ async function archiveEntry(message, dependencies) {
   if (row.upload_lease !== null) {
     if (message.type !== "retry-media")
       throw new AppError("media_upload_in_progress", 503);
-    if (!await clearEntryUploadForRetry(dependencies.db, message, row, now))
+    const priorStarted = row.upload_started_at;
+    if (!await claimEntryUploadRecovery(dependencies.db, message, row, now))
+      throw new AppError("media_upload_in_progress", 503);
+    const oldKey = entryKey({ postId: message.postId,
+      sourceMediaId: row.source_media_id, kind: row.kind, ordinal: row.ordinal },
+    row.upload_lease);
+    try { await deleteUncommittedUpload(dependencies.bucket, oldKey); }
+    catch (error) {
+      await restoreEntryUploadRecovery(dependencies.db, message, row, now, priorStarted);
+      throw error;
+    }
+    if (!await finishEntryUploadRecovery(dependencies.db, message, row, now))
       throw new AppError("media_upload_in_progress", 503);
     row = await readEntryMedia(dependencies.db, message);
     if (!row || row.status === "ready") {
@@ -80,19 +93,17 @@ async function archiveEntry(message, dependencies) {
     if (!url) throw new AppError("threads_media_unavailable", 404);
     if (!await ownsEntryUpload(dependencies.db, message, row)) return;
     const key = entryKey({ postId: message.postId,
-      sourceMediaId: row.source_media_id, kind: row.kind, ordinal: row.ordinal });
+      sourceMediaId: row.source_media_id, kind: row.kind, ordinal: row.ordinal },
+    row.upload_lease);
     const object = await downloadThreadsMedia(dependencies.bucket, dependencies.fetcher, {
       url, key, expected, maximumBytes: mediaMaximumBytes(dependencies.maximumBytes),
       signal: dependencies.signal,
     });
     if (await readyEntryUpload(dependencies.db, message, row, object, now)) {
       await recalculateMediaStatus(dependencies, message);
-    } else if (!await readEntryMedia(dependencies.db, message)) {
-      await deleteUncommittedUpload(dependencies.bucket, object.key);
-    }
+    } else await deleteUncommittedUpload(dependencies.bucket, object.key);
   } catch (error) {
-    if (error instanceof ThreadsMediaWriteError &&
-      await canDeleteFailedEntryUpload(dependencies.db, message, row, now))
+    if (error instanceof ThreadsMediaWriteError)
       await deleteFailedWrite(dependencies.bucket, error.written.key);
     const retry = mediaRetryResult(error);
     if (retry) {
@@ -140,17 +151,15 @@ async function archiveProfile(message, dependencies) {
     if (!profile.profilePictureUrl) throw new AppError("threads_media_unavailable", 404);
     if (!await ownsProfileUpload(dependencies.db, message, row)) return;
     const object = await downloadThreadsMedia(dependencies.bucket, dependencies.fetcher, {
-      url: profile.profilePictureUrl, key: profileKey(row.author_id), expected: IMAGE_TYPES,
+      url: profile.profilePictureUrl, key: profileKey(row.author_id, row.upload_lease),
+      expected: IMAGE_TYPES,
       maximumBytes: mediaMaximumBytes(dependencies.maximumBytes), signal: dependencies.signal,
     });
     if (await readyProfileUpload(dependencies.db, message, row, object, now)) {
       await recalculateMediaStatus(dependencies, message);
-    } else if (!await hasLiveAuthorReference(dependencies.db, row.author_id)) {
-      await deleteUncommittedUpload(dependencies.bucket, object.key);
-    }
+    } else await deleteUncommittedUpload(dependencies.bucket, object.key);
   } catch (error) {
-    if (error instanceof ThreadsMediaWriteError &&
-      await canDeleteFailedProfileUpload(dependencies.db, message, row, now))
+    if (error instanceof ThreadsMediaWriteError)
       await deleteFailedWrite(dependencies.bucket, error.written.key);
     const retry = mediaRetryResult(error);
     if (retry) {
@@ -176,6 +185,49 @@ export async function handleThreadsMediaMessage(rawMessage, dependencies) {
   } catch (error) { return mediaRetryResult(error) ?? MEDIA_ACK; }
 }
 
+/** @param {Record<string, any>} message @param {any} dependencies */
+async function deadEntry(message, dependencies) {
+  const row = await readEntryMedia(dependencies.db, message);
+  if (!row || row.status === "ready" || row.upload_lease === null) {
+    await terminalizeEntryDeadLetter(message, dependencies); return;
+  }
+  const now = inputTimestamp(dependencies.nowSeconds);
+  const priorStarted = row.upload_started_at;
+  if (!await claimEntryUploadRecovery(dependencies.db, message, row, now))
+    throw new AppError("media_upload_in_progress", 503);
+  const oldKey = entryKey({ postId: message.postId,
+    sourceMediaId: row.source_media_id, kind: row.kind, ordinal: row.ordinal },
+  row.upload_lease);
+  try { await deleteUncommittedUpload(dependencies.bucket, oldKey); }
+  catch (error) {
+    await restoreEntryUploadRecovery(dependencies.db, message, row, now, priorStarted);
+    throw error;
+  }
+  await terminalizeEntryDeadLetter(message, dependencies,
+    { ...row, upload_started_at: now });
+}
+
+/** @param {Record<string, any>} message @param {any} dependencies */
+async function deadProfile(message, dependencies) {
+  const row = await readProfileMedia(dependencies.db, message);
+  if (!row || row.status === "ready" || row.status === "deleting" ||
+    row.upload_lease === null) {
+    await terminalizeProfileDeadLetter(message, dependencies); return;
+  }
+  const now = inputTimestamp(dependencies.nowSeconds);
+  const priorStarted = row.upload_started_at;
+  if (!await claimProfileUploadRecovery(dependencies.db, message, row, now))
+    throw new AppError("media_upload_in_progress", 503);
+  const oldKey = profileKey(row.author_id, row.upload_lease);
+  try { await deleteUncommittedUpload(dependencies.bucket, oldKey); }
+  catch (error) {
+    await restoreProfileUploadRecovery(dependencies.db, message, row, now, priorStarted);
+    throw error;
+  }
+  await terminalizeProfileDeadLetter(message, dependencies,
+    { ...row, upload_started_at: now });
+}
+
 /** @param {unknown} rawMessage @param {any} dependencies */
 export async function handleThreadsMediaDeadLetter(rawMessage, dependencies) {
   let message;
@@ -183,9 +235,8 @@ export async function handleThreadsMediaDeadLetter(rawMessage, dependencies) {
   catch { return MEDIA_ACK; }
   if (message.type === "delete-object") return MEDIA_ACK;
   try {
-    if (message.type === "archive-profile")
-      await terminalizeProfileDeadLetter(message, dependencies);
-    else await terminalizeEntryDeadLetter(message, dependencies);
+    if (message.type === "archive-profile") await deadProfile(message, dependencies);
+    else await deadEntry(message, dependencies);
     return MEDIA_ACK;
   } catch (error) { return mediaRetryResult(error) ?? MEDIA_ACK; }
 }

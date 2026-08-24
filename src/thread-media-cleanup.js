@@ -1,6 +1,7 @@
 import { AppError } from "./domain.js";
 import {
-  MEDIA_ACK, MEDIA_RETRY, UPLOAD_STALE_SECONDS, entryKey, mediaRetryResult, profileKey,
+  MEDIA_ACK, MEDIA_RETRY, UPLOAD_STALE_SECONDS, mediaRetryResult, validEntryKey,
+  validProfileKey,
 } from "./thread-media-store.js";
 import { validateCaptureMessage } from "./threads-domain.js";
 import {
@@ -30,13 +31,13 @@ async function referencedObject(db, key) {
   if (typeof row.owner_id !== "string" || !row.owner_id || row.r2_key !== key)
     throw new AppError("storage_unavailable", 503);
   if (row.object_type === "profile") {
-    if (key !== profileKey(row.owner_id) || row.source_media_id !== null ||
+    if (!validProfileKey(key, row.owner_id) || row.source_media_id !== null ||
       row.kind !== null || row.ordinal !== null)
       throw new AppError("storage_unavailable", 503);
   } else if (row.object_type === "entry") {
     if (typeof row.source_media_id !== "string" || !row.source_media_id ||
       !["image", "video", "video_thumbnail"].includes(row.kind) ||
-      !Number.isSafeInteger(row.ordinal) || row.ordinal < 0 || key !== entryKey({
+      !Number.isSafeInteger(row.ordinal) || row.ordinal < 0 || !validEntryKey(key, {
         postId: row.owner_id, sourceMediaId: row.source_media_id,
         kind: row.kind, ordinal: row.ordinal,
       })) throw new AppError("storage_unavailable", 503);
@@ -76,7 +77,7 @@ async function deletionRows(db, postId) {
     if (typeof row.source_media_id !== "string" || !row.source_media_id ||
       !["image", "video", "video_thumbnail"].includes(row.kind) ||
       !Number.isSafeInteger(row.ordinal) || row.ordinal < 0 ||
-      row.r2_key !== entryKey({ postId, sourceMediaId: row.source_media_id,
+      !validEntryKey(row.r2_key, { postId, sourceMediaId: row.source_media_id,
         kind: row.kind, ordinal: row.ordinal }))
       throw new AppError("storage_unavailable", 503);
   }
@@ -164,7 +165,7 @@ export async function cleanupDeletingProfile(db, bucket, row, now, retryBusy = t
     if (retryBusy) throw new AppError("media_upload_in_progress", 503);
     return "busy";
   }
-  if (row.r2_key !== null && row.r2_key !== profileKey(row.author_id))
+  if (row.r2_key !== null && !validProfileKey(row.r2_key, row.author_id))
     throw new AppError("storage_unavailable", 503);
   const lease = crypto.randomUUID();
   if (!await claimProfileCleanup(db, row.author_id, row.r2_key,
